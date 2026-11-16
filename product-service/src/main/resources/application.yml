@@ -28,7 +28,7 @@ spring:
       properties:
         enable.idempotence: true
         request.timeout.ms: 1000
-        delivery.timeout.ms: 3000
+        delivery.timeout.ms: 10000   # 관리자 응답과 무관한 비동기 발행이라 0단계 공통값(3000)보다 길게 (phase-2 3.0)
         max.block.ms: 1000         # send() 호출 자체의 블로킹 상한 (기본 60초)
     consumer:
       group-id: ${spring.application.name}
