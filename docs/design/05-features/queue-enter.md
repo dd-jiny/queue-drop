@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-QUEUE-01 ~ 06 |
 | v1.1 | 2026-11-16 | 진입을 `enqueue.lua` 원자 처리로, 입장 Lua 에 잔여 정원 확인 포함, 스케줄러 미해제 게이트, 활성 드로우 인덱스, `nextPollAfterMs`, 잔여 정원 키 없음 정책, 상태 우선순위 추가 | phase-3 구현 상세 6장 |
+| v1.2 | 2026-11-16 | 에러 코드를 0단계 규칙(`QUEUE_*`)으로 표기, 마감 드로우 queue 키 정리(`closeAt + 1일` 만료, 기본안), 마감 후 별도 CLOSED 상태 없음(기본안) | phase-3 구현 상세 v1.2 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-QUEUE-01: 드로우별 대기열
@@ -53,6 +54,13 @@
 | POST | `/api/queue/drops/{dropId}` | 대기열 진입 → 상태 + 순번 |
 | GET | `/api/queue/drops/{dropId}` | 내 상태 조회 (WAITING 이면 `ZRANK` 로 "앞에 N명") |
 
+- 실패 응답: 404 `QUEUE_DROP_NOT_FOUND`(queue meta 없음), 409 `QUEUE_NOT_OPEN` / `QUEUE_CLOSED` / `QUEUE_SOLD_OUT`(진입만), 400 `COMMON_MISSING_USER_HEADER`
+- 상태 조회는 마감 후에도 별도 `CLOSED` 상태를 두지 않는다. 마감 여부는 드로우 상세(product)로 판단한다
+
+### 키 정리
+- `queue:{dropId}:meta`·`waiting`·`seq` 는 `closeAt + 1일` 에 만료된다 (`PEXPIREAT`). meta 는 `drop.created` 처리 시, waiting·seq 는 `enqueue.lua` 의 신규 등록 시 건다
+- 토큰 키는 자체 TTL(5분), `queue:active-drops` 의 마감 드로우는 스케줄러가 매 주기 제거한다
+
 ## 4. 설계 결정
 | 결정점 | 선택 | 이유 / 포기한 것 |
 |--------|------|------------------|
@@ -96,7 +104,7 @@ sequenceDiagram
     QS->>R: HGET queue:{id}:meta (openAt, closeAt)
     QS->>R: GET entry:{id}:remaining (없으면 진입 허용)
     alt 오픈 전/마감 후 또는 잔여 0
-        QS-->>U: 409 NOT_OPEN / CLOSED / SOLD_OUT
+        QS-->>U: 409 QUEUE_NOT_OPEN / QUEUE_CLOSED / QUEUE_SOLD_OUT
     else 진입
         QS->>R: EVALSHA enqueue.lua
         Note over R: 토큰 보유 → ADMITTED<br/>대기 중 → 현재 순번<br/>신규 → INCR seq + ZADD NX
