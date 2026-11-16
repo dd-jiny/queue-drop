@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 단계별 구현 상세 문서(`phases/`) 추가 및 링크 |
 | v1.2 | 2026-11-16 | 확정 사항 반영: Flyway, 커밋 후 발행 방식(afterCommit), 동기 발행 정책(애플리케이션 재시도 없음), DLT, 관리자 계정 생성, 저장 전 Redis 확인(응모·쿠폰). 미결정 표 갱신 |
 | v1.3 | 2026-11-16 | 0단계 완료: 진행 현황·체크리스트 갱신. 에러 계약 결정(X-User-* 누락 400, `{SERVICE}_{REASON}`, 응답 메시지 고정) 4장 표에 추가 |
+| v1.4 | 2026-11-16 | 1단계 완료: 진행 현황·체크리스트 갱신 |
 
 ---
 
@@ -79,7 +80,7 @@ flowchart LR
 | 단계 | 브랜치 | 구현 상세 | 상태 |
 |------|--------|-----------|------|
 | 0. 공통 기반 | `chore/phase-0-foundation` | [phase-0-foundation.md](phases/phase-0-foundation.md) | ✅ 완료 (2026-11-16) |
-| 1. 인증 | `feat/phase-1-auth` | [phase-1-auth.md](phases/phase-1-auth.md) | ⬜ 대기 |
+| 1. 인증 | `feat/phase-1-auth` | [phase-1-auth.md](phases/phase-1-auth.md) | ✅ 완료 (2026-11-16) |
 | 2. 드로우 | `feat/phase-2-drop` | [phase-2-drop.md](phases/phase-2-drop.md) | ⬜ 대기 |
 | 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ⬜ 대기 |
 | 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ⬜ 대기 |
@@ -131,22 +132,22 @@ flowchart LR
 
 **작업**
 - user-service
-  - [ ] domain: `User`, `Email`(값 객체, 형식 검증), `Role`, `UserRepository`(I)
-  - [ ] application: `UserService`(signup, login), Command/Result, 포트 `PasswordEncoder`, `TokenIssuer`, `UserEventPublisher`, 에러 코드
-  - [ ] infrastructure: `UserJpaEntity`, `UserMapper`, `UserRepositoryImpl`, BCrypt 어댑터, JWT 발급기, `user.registered` Kafka 발행
-  - [ ] presentation: `UserController`(signup, login), Request/Response
-  - [ ] 관리자 계정 초기화: 기동 시 `ADMIN_EMAIL` / `ADMIN_PASSWORD` 가 있으면 ADMIN 계정을 없을 때만 생성 (확정, 2026-11-16)
+  - [x] domain: `User`, `Email`(값 객체, 형식 검증), `Role`, `UserRepository`(I)
+  - [x] application: `UserService`(signup, login), Command/Result, 포트 `PasswordEncoder`, `TokenIssuer`, `UserEventPublisher`, 에러 코드
+  - [x] infrastructure: `UserJpaEntity`, `UserMapper`, `UserRepositoryImpl`, BCrypt 어댑터, JWT 발급기, `user.registered` Kafka 발행
+  - [x] presentation: `UserController`(signup, login), Request/Response
+  - [x] 관리자 계정 초기화: 기동 시 `ADMIN_EMAIL` / `ADMIN_PASSWORD` 가 있으면 ADMIN 계정을 없을 때만 생성 (확정, 2026-11-16)
 - gateway
-  - [ ] 클라이언트가 보낸 `X-User-*` 헤더 제거 필터
-  - [ ] JWT 검증 필터 → `X-User-Id`, `X-User-Role` 주입
-  - [ ] 인증 제외 경로 설정 (가입, 로그인, 드로우 조회, 랭킹 조회)
-  - [ ] JWT 비밀키를 환경변수(`JWT_SECRET`)로 user-service 와 공유
+  - [x] 클라이언트가 보낸 `X-User-*` 헤더 제거 필터
+  - [x] JWT 검증 필터 → `X-User-Id`, `X-User-Role` 주입
+  - [x] 인증 제외 경로 설정 (가입, 로그인, 드로우 조회, 랭킹 조회)
+  - [x] JWT 비밀키를 환경변수(`JWT_SECRET`)로 user-service 와 공유
 
 **완료 조건**
-- [ ] 단위: `Email` 형식 검증, 중복 이메일 가입 거부, 비밀번호 불일치 로그인 실패
-- [ ] 통합: 가입 → DB 저장 + `user.registered` 발행 확인 (Testcontainers)
-- [ ] gateway: 토큰 없음/만료/위조 → 401, 정상 토큰 → 헤더 주입, **클라이언트가 보낸 `X-User-Id` 가 제거됨**
-- [ ] 관리자: 환경변수로 기동 → ADMIN 로그인 토큰의 role = ADMIN, 재기동해도 1계정
+- [x] 단위: `Email` 형식 검증, 중복 이메일 가입 거부, 비밀번호 불일치 로그인 실패
+- [x] 통합: 가입 → DB 저장 + `user.registered` 발행 확인 (Testcontainers)
+- [x] gateway: 토큰 없음/만료/위조 → 401, 정상 토큰 → 헤더 주입, **클라이언트가 보낸 `X-User-Id` 가 제거됨**
+- [x] 관리자: 환경변수로 기동 → ADMIN 로그인 토큰의 role = ADMIN, 재기동해도 1계정
 
 ---
 
