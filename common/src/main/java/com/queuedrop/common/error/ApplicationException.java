@@ -1,6 +1,6 @@
 package com.queuedrop.common.error;
 
-/** application 계층이 던지는 유일한 비즈니스 예외 타입. presentation 이 HTTP 로 매핑한다. */
+/** application 예외의 공통 부모. 서비스별 예외(EntryApplyException 등)는 이를 상속한다. presentation 이 HTTP 로 매핑한다. */
 public class ApplicationException extends RuntimeException {
     private final ErrorCode errorCode;
 

@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 클래스 다이어그램을 4계층 구조로 이관 (class-diagram.md 참고) | layered-architecture.md |
 | v1.2 | 2026-11-16 | entrySeq 발급을 잔여 정원 계산에서 별도 INCR 카운터로 변경 (보상 후 번호 재사용으로 인한 응모 누락 방지) | NFR-03 |
 | v1.3 | 2026-11-16 | 발행 재시도를 producer 내부 멱등 재시도로 변경, 저장 전 Redis 확인 확정, 저장 방식(ON CONFLICT)·DLT, 조회 보완 범위(단건만), 에러 코드 추가, meta 없음 → CLOSED | phase-4 구현 상세 6장 |
+| v1.4 | 2026-11-16 | 에러 코드 표를 명명 규칙 `{SERVICE}_{REASON}` 에 맞춤 (`ENTRY_*`, `COMMON_MISSING_USER_HEADER`). 판정 결과 `ApplyOutcome` 값 이름은 그대로 | layered-architecture.md 4.5 v1.3 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-ENTRY-01: 입장 토큰으로 응모
@@ -68,13 +69,13 @@
 ### 에러 코드
 | 코드 | HTTP | 발생 |
 |------|------|------|
-| `CLOSED` | 409 | 오픈 전·마감 후·드로우 정보 미수신 |
-| `NO_TOKEN` | 409 | 입장 토큰 없음·만료 |
-| `DUPLICATE` | 409 | 이미 응모함 |
-| `SOLD_OUT` | 409 | 정원 소진 |
-| `TEMPORARILY_FAILED` | 503 | 이벤트 발행 실패 → 보상 완료, 재시도 가능 |
+| `ENTRY_CLOSED` | 409 | 오픈 전·마감 후·드로우 정보 미수신 |
+| `ENTRY_NO_TOKEN` | 409 | 입장 토큰 없음·만료 |
+| `ENTRY_DUPLICATE` | 409 | 이미 응모함 |
+| `ENTRY_SOLD_OUT` | 409 | 정원 소진 |
+| `ENTRY_TEMPORARILY_FAILED` | 503 | 이벤트 발행 실패 → 보상 완료, 재시도 가능 |
 | `ENTRY_NOT_FOUND` | 404 | 단건 조회 시 DB·Redis 모두 없음 |
-| `MISSING_USER_HEADER` | 400 | `X-User-Id` 누락 (Gateway 우회 등) |
+| `COMMON_MISSING_USER_HEADER` | 400 | `X-User-Id` 누락 (Gateway 우회 등) |
 
 - `drop.created` 의 데이터가 도메인 불변식을 어기면(예: M < K) application 이 `InvalidDropSnapshotException` 으로 바꿔 던지고, 리스너 재시도 후 `drop.created.DLT` 로 간다.
 
