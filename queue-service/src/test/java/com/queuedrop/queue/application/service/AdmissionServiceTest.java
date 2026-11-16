@@ -69,14 +69,14 @@ class AdmissionServiceTest {
     }
 
     @Test
-    @DisplayName("[T3-10] 게이트는 이름 \"admission\", window = intervalMs 로 요청한다")
-    void gateRequestedWithNameAndInterval() {
+    @DisplayName("[T3-10] 게이트는 이름 \"admission\", window = gateWindowMs(interval 1000 → 900ms) 로 요청한다 (E-31: 지터로 주기를 건너뛰지 않도록 주기보다 짧게)")
+    void gateRequestedWithNameAndWindow() {
         // When
         admissionService.admit();
 
         // Then
         assertThat(schedulerGate.requests())
-                .containsExactly(new FakeSchedulerGate.Pass("admission", Duration.ofMillis(INTERVAL_MS)));
+                .containsExactly(new FakeSchedulerGate.Pass("admission", Duration.ofMillis(900)));
     }
 
     @Test
@@ -117,6 +117,44 @@ class AdmissionServiceTest {
         assertThat(admitted).isEqualTo(3);
         assertThat(queueRepository.tokenHolders(OPEN_DROP)).containsExactlyInAnyOrder(100L, 101L);
         assertThat(queueRepository.tokenHolders(OTHER_OPEN_DROP)).containsExactly(300L);
+    }
+
+    @Test
+    @DisplayName("[T3-11] 한 드로우의 admit 이 예외를 던져도 다음 드로우를 계속 처리하고, 성공한 드로우의 입장 합을 반환한다")
+    void admitFailureIsIsolatedPerDrop() {
+        // Given — 실패하는 드로우를 먼저 등록해 루프 앞쪽에 둔다
+        queueRepository.givenMeta(meta(OPEN_DROP, "2026-11-16T10:00:00Z", "2026-11-16T12:00:00Z"));
+        queueRepository.givenMeta(meta(OTHER_OPEN_DROP, "2026-11-16T10:00:00Z", "2026-11-16T11:00:00Z"));
+        queueRepository.givenWaiting(OPEN_DROP, 100L);
+        queueRepository.givenWaiting(OTHER_OPEN_DROP, 300L, 301L);
+        queueRepository.failAdmitFor(OPEN_DROP);
+
+        // When
+        int admitted = admissionService.admit();
+
+        // Then
+        assertThat(admitted).isEqualTo(2);
+        assertThat(queueRepository.tokenHolders(OTHER_OPEN_DROP)).containsExactlyInAnyOrder(300L, 301L);
+        assertThat(queueRepository.waitingUsers(OPEN_DROP)).containsExactly(100L);
+    }
+
+    @Test
+    @DisplayName("[T3-11] 한 드로우의 findMeta 가 예외를 던져도 다음 드로우를 계속 처리한다")
+    void findMetaFailureIsIsolatedPerDrop() {
+        // Given
+        queueRepository.givenMeta(meta(OPEN_DROP, "2026-11-16T10:00:00Z", "2026-11-16T12:00:00Z"));
+        queueRepository.givenMeta(meta(OTHER_OPEN_DROP, "2026-11-16T10:00:00Z", "2026-11-16T11:00:00Z"));
+        queueRepository.givenWaiting(OPEN_DROP, 100L);
+        queueRepository.givenWaiting(OTHER_OPEN_DROP, 300L);
+        queueRepository.failFindMetaFor(OPEN_DROP);
+
+        // When
+        int admitted = admissionService.admit();
+
+        // Then
+        assertThat(admitted).isEqualTo(1);
+        assertThat(queueRepository.tokenHolders(OTHER_OPEN_DROP)).containsExactly(300L);
+        assertThat(queueRepository.tokenHolders(OPEN_DROP)).isEmpty();
     }
 
     @Test

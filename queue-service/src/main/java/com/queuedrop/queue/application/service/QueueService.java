@@ -36,13 +36,19 @@ public class QueueService {
         return r.admitted() ? QueueStatusResult.admitted() : waiting(r.rank());
     }
 
-    /** 우선순위 SOLD_OUT > ADMITTED > WAITING > NOT_IN_QUEUE */
+    /**
+     * 우선순위 SOLD_OUT > ADMITTED > WAITING > NOT_IN_QUEUE.
+     * 토큰 보유와 대기는 서로 배타(admit.lua 가 ZPOPMIN 과 토큰 발급을 함께 한다)라 대기 → 토큰 순으로 조회해도 결과가 같다.
+     * 이 순서여야 두 조회 사이에 입장 처리가 끼어도 ADMITTED 를 NOT_IN_QUEUE 로 잘못 알리지 않는다.
+     */
     public QueueStatusResult status(QueueStatusQuery q) {
         findMeta(q.dropId());
         if (isSoldOut(q.dropId())) return QueueStatusResult.soldOut();
-        if (queueRepository.hasToken(q.dropId(), q.userId())) return QueueStatusResult.admitted();
         OptionalLong rank = queueRepository.rank(q.dropId(), q.userId());
-        return rank.isPresent() ? waiting(rank.getAsLong()) : QueueStatusResult.notInQueue();
+        if (rank.isPresent()) return waiting(rank.getAsLong());
+        return queueRepository.hasToken(q.dropId(), q.userId())
+                ? QueueStatusResult.admitted()
+                : QueueStatusResult.notInQueue();
     }
 
     private QueueMeta findMeta(Long dropId) {

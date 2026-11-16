@@ -16,6 +16,11 @@ public class RedisScriptConfig {
     }
 
     @Bean
+    RedisScript<Long> saveMetaScript() {
+        return RedisScript.of(new ClassPathResource("scripts/save_meta.lua"), Long.class);
+    }
+
+    @Bean
     @SuppressWarnings("rawtypes")
     RedisScript<List> admitScript() {
         return RedisScript.of(new ClassPathResource("scripts/admit.lua"), List.class);

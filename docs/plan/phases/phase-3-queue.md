@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 0단계 에러 계약에 정렬: `QueueErrorCode implements ErrorCode`(코드 `QUEUE_*`), 별도 `QueueException`·`QueueExceptionHandler` 제거(`ApplicationException` + 0단계 `GlobalExceptionHandler`), 헤더 누락은 `COMMON_MISSING_USER_HEADER`(400). 도메인 불변식 위반은 `DomainException`, 잘못된 `drop.created` 는 로그·스킵. Kafka 설정은 0단계 공통 블록 유지(ErrorHandlingDeserializer). 스케줄러 on/off 속성 추가. 결정 필요 2건 기본안 확정(CLOSED 상태 없음, 키 정리 `closeAt + 1일` 구현). 커밋 계획을 테스트 포함 기능 커밋 단위로 재편 |
+| v1.3 | 2026-11-16 | 단계 검증 반영: 게이트 window = 주기의 90%(지터로 주기를 건너뛰던 문제, E-31), 입장 루프 드로우별 예외 격리, 상태 조회를 대기 → 토큰 순으로(입장 경합 시 NOT_IN_QUEUE 오표시 제거), 리스너 실패 정책을 설계(architecture.md 4장·D4)대로 1초 간격 3회 재시도 후 로그·스킵(`KafkaConsumerConfig`), `saveMeta` 를 `save_meta.lua` 로 원자화(E-36) |
 
 ---
 
@@ -75,6 +76,7 @@ queue-service/
     │   │   │   └── config
     │   │   │       ├── ClockConfig.java
     │   │   │       ├── RedisScriptConfig.java
+    │   │   │       ├── KafkaConsumerConfig.java             # v1.3 리스너 재시도 정책
     │   │   │       └── SchedulingConfig.java
     │   │   └── presentation
     │   │       ├── api
@@ -89,6 +91,7 @@ queue-service/
     │       ├── application.yml                          # (수정) 입장 설정, consumer 역직렬화
     │       └── scripts
     │           ├── enqueue.lua
+    │           ├── save_meta.lua                         # v1.3
     │           └── admit.lua
     └── test/java/com/queuedrop/queue
         ├── ArchitectureTest.java
@@ -319,11 +322,10 @@ public class QueueService {
         queueRepository.findMeta(q.dropId())
                 .orElseThrow(() -> new ApplicationException(QueueErrorCode.DROP_NOT_FOUND));
         if (isSoldOut(q.dropId())) return QueueStatusResult.soldOut();          // 1순위
-        if (queueRepository.hasToken(q.dropId(), q.userId())) return QueueStatusResult.admitted();
+        // v1.3: 대기 → 토큰 순. 토큰·대기는 서로 배타라 결과는 같고, 두 조회 사이에 입장이 끼어도 ADMITTED 를 NOT_IN_QUEUE 로 알리지 않는다
         OptionalLong rank = queueRepository.rank(q.dropId(), q.userId());
-        return rank.isPresent()
-                ? QueueStatusResult.waiting(rank.getAsLong(), pollPolicy.nextPollAfterMs(rank.getAsLong()))
-                : QueueStatusResult.notInQueue();
+        if (rank.isPresent()) return QueueStatusResult.waiting(rank.getAsLong(), pollPolicy.nextPollAfterMs(rank.getAsLong()));
+        return queueRepository.hasToken(q.dropId(), q.userId()) ? QueueStatusResult.admitted() : QueueStatusResult.notInQueue();
     }
 
     private boolean isSoldOut(Long dropId) {
@@ -351,11 +353,12 @@ public class AdmissionService {
 
     /** @return 이번 주기에 입장한 총 인원 (게이트 미통과 시 0) */
     public int admit() {
-        if (!schedulerGate.tryPass(GATE_NAME, Duration.ofMillis(props.intervalMs()))) return 0;
+        if (!schedulerGate.tryPass(GATE_NAME, Duration.ofMillis(props.gateWindowMs()))) return 0;   // v1.3
         Instant now = clock.instant();
         queueRepository.removeExpiredDrops(now);
         int total = 0;
         for (Long dropId : queueRepository.findActiveDropIds(now)) {
+            // v1.3: 드로우마다 try/catch — 한 드로우의 실패(Redis 일시 오류, entry 키 형식 오류)가 다른 드로우 입장을 막지 않게 한다 (log.error, 스택 없음)
             QueueMeta meta = queueRepository.findMeta(dropId).orElse(null);
             if (meta == null || !meta.isOpen(now)) continue;
             List<Long> admitted = queueRepository.admit(dropId, props.batchSize(),
@@ -373,7 +376,10 @@ public class AdmissionService {
 #### `AdmissionProperties`
 ```java
 /** application 계층 설정 값 객체. 바인딩(@ConfigurationProperties)은 infrastructure/config 에서 수행 */
-public record AdmissionProperties(long intervalMs, int batchSize, long tokenTtlSeconds) {}
+public record AdmissionProperties(long intervalMs, int batchSize, long tokenTtlSeconds) {
+    /** v1.3: 게이트 유지 시간 = 주기의 90% (최소 1ms). 3.3 게이트 설명 참고 */
+    public long gateWindowMs() { return Math.max(1, intervalMs * 9 / 10); }
+}
 ```
 > `@ConfigurationProperties` 는 Spring Boot 어노테이션이므로 application 에 두지 않는다. infrastructure 의 설정 클래스가 `queue.admission.*` 을 읽어 이 record 를 Bean 으로 등록. **(구현 결정)**
 
@@ -397,7 +403,7 @@ public class QueueMetaRegisterService {
     }
 }
 ```
-- queue 는 저장 컨슈머가 아니므로 DLT 를 쓰지 않는다 (phase-0 DLT 정책: 저장 컨슈머 entry·coupon 만). Redis 장애로 `saveMeta` 가 실패하면 예외를 올려 Spring Kafka 기본 `DefaultErrorHandler` 재시도에 맡긴다. 역직렬화 실패는 0단계 `ErrorHandlingDeserializer` 가 로그·스킵한다.
+- queue 는 저장 컨슈머가 아니므로 DLT 를 쓰지 않는다 (phase-0 DLT 정책: 저장 컨슈머 entry·coupon 만). Redis 장애로 `saveMeta` 가 실패하면 예외를 올리고, `KafkaConsumerConfig` 의 `DefaultErrorHandler(FixedBackOff(1000ms, 3회))` 가 재시도 후 로그·스킵한다 (v1.3, architecture.md 4장·D4 "Redis 만 쓰는 컨슈머는 1초 간격 3회 재시도 후 로그"). 스킵된 드로우는 product 재발행 API 로 복구한다. 역직렬화 실패는 0단계 `ErrorHandlingDeserializer` 가 로그·스킵한다.
 
 ---
 
@@ -508,13 +514,11 @@ public class RedisWaitingQueueRepository implements WaitingQueueRepository {
 
     @Override
     public void saveMeta(QueueMeta meta) {
-        String key = QueueKeys.meta(meta.dropId());
-        redis.opsForHash().putAll(key, Map.of(
-                "openAt", String.valueOf(meta.openAt().toEpochMilli()),
-                "closeAt", String.valueOf(meta.closeAt().toEpochMilli())));
-        redis.expireAt(key, meta.closeAt().plus(RETENTION_AFTER_CLOSE));   // PEXPIREAT. 이미 지났으면 즉시 삭제
-        redis.opsForZSet().add(QueueKeys.ACTIVE_DROPS, String.valueOf(meta.dropId()),
-                meta.closeAt().toEpochMilli());
+        // v1.3: HSET + PEXPIREAT(closeAt + 1일, 지났으면 즉시 삭제) + ZADD active-drops 를 save_meta.lua 하나로 (중간 실패로 어긋나지 않게)
+        redis.execute(saveMetaScript, List.of(QueueKeys.meta(meta.dropId()), QueueKeys.ACTIVE_DROPS),
+                String.valueOf(meta.dropId()), String.valueOf(meta.openAt().toEpochMilli()),
+                String.valueOf(meta.closeAt().toEpochMilli()),
+                String.valueOf(meta.closeAt().plus(RETENTION_AFTER_CLOSE).toEpochMilli()));
     }
 
     @Override
@@ -593,7 +597,7 @@ public class RedisSchedulerGate implements SchedulerGate {
     private final StringRedisTemplate redis;
     private final String instanceId = UUID.randomUUID().toString();
 
-    /** SET queue:{name}:gate {instanceId} NX PX {window}. 해제하지 않고 만료에 맡긴다. */
+    /** SET queue:{name}:gate {instanceId} NX PX {window}. 해제하지 않고 만료에 맡긴다. window = 주기의 90% (v1.3) */
     @Override
     public boolean tryPass(String name, Duration window) {
         return Boolean.TRUE.equals(redis.opsForValue()
@@ -603,6 +607,7 @@ public class RedisSchedulerGate implements SchedulerGate {
 ```
 > **락을 해제(DEL)하지 않는 이유 (구현 결정)**: 일반 분산 락처럼 작업 후 해제하면, A 가 50ms 만에 끝내고 해제한 직후 B 의 주기가 와서 다시 실행 → 1초에 2N 명이 입장한다. 게이트를 **주기 길이(1초) 동안 유지**하면 인스턴스 수와 무관하게 "전체에서 1초당 1회"가 보장된다. 즉 락이 아니라 **전역 레이트 게이트**다.
 > 결과적으로 키 이름은 `queue:admission:gate` (3.0.1 표).
+> **window 를 주기보다 짧게 두는 이유 (v1.3, 단계 검증·E-31)**: Redis 는 `now > expireAt` 일 때만 키를 만료로 본다. window = 주기면 같은 인스턴스의 다음 틱이 지난번보다 1ms 라도 일찍 도착할 때 게이트가 남아 있어 그 주기를 건너뛴다 — 측정상 단일 인스턴스에서 주기의 약 40% 손실. window 를 주기의 90% 로 두면 단일 인스턴스는 매 주기 통과하고, 다중 인스턴스 상한은 "0.9 × 주기당 1회"(초당 최대 약 1.11N명)가 된다.
 
 #### 설정 클래스
 ```java
@@ -784,7 +789,9 @@ public class EntryRemainingFixture {
 |------|------|
 | 진입 처리 | `enqueue.lua` 하나로 토큰 확인 + 대기 확인 + seq 발급 + ZADD (원자) |
 | 활성 드로우 조회 | `queue:active-drops` ZSet (score=closeAt). `KEYS`/`SCAN` 미사용 |
-| 스케줄러 중복 방지 | `queue:admission:gate` `SET NX PX {interval}` **미해제** 전역 레이트 게이트 |
+| 스케줄러 중복 방지 | `queue:admission:gate` `SET NX PX {0.9 × interval}` **미해제** 전역 레이트 게이트 (v1.3) |
+| 입장 루프 실패 (v1.3) | 드로우별 격리, 실패 드로우만 이번 주기 건너뜀 |
+| 리스너 실패 (v1.3) | 1초 간격 3회 재시도 후 로그·스킵 (DLT 없음), meta 저장은 `save_meta.lua` 원자 처리 |
 | 잔여 정원 키 없음 | 진입 허용, 입장 보류 |
 | 잔여 정원 확인 위치 | `admit.lua` 안 (원자) + 진입·상태 조회 시 `RemainingCapacityReader` |
 | 상태 우선순위 | SOLD_OUT > ADMITTED > WAITING > NOT_IN_QUEUE |
@@ -807,7 +814,7 @@ public class EntryRemainingFixture {
 
 ### 리스크
 - **Redis Cluster 비호환**: `admit.lua` 가 토큰 키를 스크립트 안에서 조합하고, entry 소유 키를 함께 다룬다. 단일 Redis 전제이며, Cluster 전환 시 해시 태그(`{drop:1}`)로 키 재설계 필요.
-- **게이트 시간 오차**: 게이트 TTL(1초)과 `fixedRate` 주기가 인스턴스별로 어긋나면 실제 입장 간격이 1~2초 사이로 흔들릴 수 있다. 처리량이 "초당 N명 이하"로만 보장된다는 점을 8단계 리포트에 기록.
+- **게이트 시간 오차**: (v1.3) window 를 주기의 90% 로 두어 단일 인스턴스의 주기 손실은 없앴다. 다중 인스턴스에서는 실행 위상에 따라 실제 입장 간격이 0.9~2초 사이로 흔들릴 수 있고, 상한은 초당 약 1.11N명이다. 8단계 리포트에 실측 입장 속도를 기록.
 - **입장 후 미응모**: 토큰 TTL(5분) 동안 응모하지 않는 사용자만큼 입장 슬롯이 낭비된다. 정원이 남아 있는 한 스케줄러가 계속 입장시키므로 정원은 결국 채워지지만, 오픈 직후 응모 속도는 느려질 수 있다.
 - **잔여 정원 키 공유**: entry 가 키 이름·형식을 바꾸면 queue 가 조용히 "키 없음"으로 판단해 입장이 멈춘다. 4단계에서 두 서비스가 같은 키를 쓰는지 통합 테스트로 고정한다.
 - **폴링 부하**: 대기자 × (1/폴링 간격) 만큼 GET 요청. `nextPollAfterMs` 를 클라이언트가 지키지 않으면 효과 없음 → 8단계 부하 테스트 시나리오가 이 값을 따르도록 작성.

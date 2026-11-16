@@ -211,19 +211,30 @@ class RedisWaitingQueueRepositoryTest {
         }
 
         @Test
-        @DisplayName("[T3-16] 토큰 TTL 1초로 입장 → 만료 후 hasToken=false, rank 없음 (NOT_IN_QUEUE)")
+        @DisplayName("[T3-16] 토큰 TTL 1초로 입장 → 만료 후 hasToken=false, rank 없음 (NOT_IN_QUEUE). 다시 진입하면 남은 대기자 뒤로 붙는다")
         void tokenExpires() {
-            // Given
+            // Given — 7, 8, 9 순서로 대기, 7 만 TTL 1초로 입장
             repository.saveMeta(openMeta(DROP_ID));
             entryRemaining.initialize(DROP_ID, 10);
-            repository.enqueue(DROP_ID, 7L);
-            repository.admit(DROP_ID, 10, Duration.ofSeconds(1), base);
+            enqueueAll(DROP_ID, List.of(7L, 8L, 9L));
+            repository.admit(DROP_ID, 1, Duration.ofSeconds(1), base);
             assertThat(repository.hasToken(DROP_ID, 7L)).isTrue();
 
-            // When / Then — 1.5초 안팎에 만료 (Awaitility, 최대 3초)
+            // When — 1.5초 안팎에 만료 (Awaitility, 최대 3초)
             await().atMost(Duration.ofSeconds(3)).pollInterval(Duration.ofMillis(100))
                     .until(() -> !repository.hasToken(DROP_ID, 7L));
+
+            // Then — 만료 직후에는 대기열에도 없다
             assertThat(repository.rank(DROP_ID, 7L)).isEmpty();
+
+            // When — 재진입
+            EnqueueResult again = repository.enqueue(DROP_ID, 7L);
+
+            // Then — 새 seq(4)로 남은 대기자 8, 9 뒤에 선다 (원래 순번을 되찾지 않는다)
+            assertThat(again).isEqualTo(EnqueueResult.waiting(2));
+            assertThat(repository.rank(DROP_ID, 8L)).hasValue(0);
+            assertThat(repository.rank(DROP_ID, 7L)).hasValue(2);
+            assertThat(redis.opsForValue().get(seqKey(DROP_ID))).isEqualTo("4");
         }
 
         @Test
@@ -408,7 +419,9 @@ class RedisWaitingQueueRepositoryTest {
         @Test
         @DisplayName("[T3-25] meta 가 없을 때 enqueue 하면 waiting·seq 에 만료가 걸리지 않는다 (-1)")
         void noExpiryWithoutMeta() {
-            // Given — meta 없음
+            // Given — meta 없음.
+            // 저장소 단위의 방어 동작 확인이다. 실제 enter 경로에서는 QueueService 가 meta 없음을 먼저
+            // 404(QUEUE_DROP_NOT_FOUND)로 막으므로 이 상태로 enqueue.lua 에 도달하지 않는다.
 
             // When
             repository.enqueue(DROP_ID, 7L);

@@ -34,6 +34,11 @@ public class FakeWaitingQueueRepository implements WaitingQueueRepository {
     private final Map<Long, List<Long>> waiting = new HashMap<>();
     private final Map<Long, Set<Long>> tokens = new HashMap<>();
     private final List<AdmitCall> admitCalls = new ArrayList<>();
+    private final Set<Long> failingFindMeta = new HashSet<>();
+    private final Set<Long> failingAdmit = new HashSet<>();
+    private final List<String> calls = new ArrayList<>();
+    private Long raceDropId;
+    private Long raceUserId;
     private int saveMetaCount;
     private int invocationCount;
 
@@ -48,6 +53,9 @@ public class FakeWaitingQueueRepository implements WaitingQueueRepository {
     @Override
     public Optional<QueueMeta> findMeta(Long dropId) {
         invocationCount++;
+        if (failingFindMeta.contains(dropId)) {
+            throw new IllegalStateException("findMeta 실패 (테스트 주입): dropId=" + dropId);
+        }
         return Optional.ofNullable(metas.get(dropId));
     }
 
@@ -69,19 +77,27 @@ public class FakeWaitingQueueRepository implements WaitingQueueRepository {
     @Override
     public boolean hasToken(Long dropId, Long userId) {
         invocationCount++;
-        return tokensOf(dropId).contains(userId);
+        calls.add("hasToken");
+        boolean result = tokensOf(dropId).contains(userId);
+        admitIfRacing(dropId, userId);
+        return result;
     }
 
     @Override
     public OptionalLong rank(Long dropId, Long userId) {
         invocationCount++;
+        calls.add("rank");
         int index = waitingOf(dropId).indexOf(userId);
+        admitIfRacing(dropId, userId);
         return index < 0 ? OptionalLong.empty() : OptionalLong.of(index);
     }
 
     @Override
     public List<Long> admit(Long dropId, int n, Duration tokenTtl, Instant now) {
         invocationCount++;
+        if (failingAdmit.contains(dropId)) {
+            throw new IllegalStateException("admit 실패 (테스트 주입): dropId=" + dropId);
+        }
         admitCalls.add(new AdmitCall(dropId, n, tokenTtl, now));
         List<Long> line = waitingOf(dropId);
         List<Long> admitted = new ArrayList<>();
@@ -127,6 +143,34 @@ public class FakeWaitingQueueRepository implements WaitingQueueRepository {
         tokensOf(dropId).add(userId);
     }
 
+    /** 해당 드로우의 findMeta 가 RuntimeException 을 던지게 한다 (Redis 장애 등 흉내) */
+    public void failFindMetaFor(Long dropId) {
+        failingFindMeta.add(dropId);
+    }
+
+    /** 해당 드로우의 admit 이 RuntimeException 을 던지게 한다 */
+    public void failAdmitFor(Long dropId) {
+        failingAdmit.add(dropId);
+    }
+
+    /**
+     * 입장 스케줄러와의 경합 흉내: 이 사용자에 대해 hasToken 또는 rank 중 처음 불린 조회가 값을 읽은 "직후"
+     * 사용자를 대기열에서 빼고 토큰을 준다 (admit.lua 의 ZPOPMIN + SET token 이 두 조회 사이에 끼어든 상황).
+     */
+    public void admitRightAfterFirstRead(Long dropId, Long userId) {
+        this.raceDropId = dropId;
+        this.raceUserId = userId;
+    }
+
+    private void admitIfRacing(Long dropId, Long userId) {
+        if (dropId.equals(raceDropId) && userId.equals(raceUserId)) {
+            raceDropId = null;
+            raceUserId = null;
+            waitingOf(dropId).remove(userId);
+            tokensOf(dropId).add(userId);
+        }
+    }
+
     // ---- 결과 상태 조회 (호출 횟수에 포함하지 않음) ----
 
     public List<Long> waitingUsers(Long dropId) {
@@ -147,6 +191,11 @@ public class FakeWaitingQueueRepository implements WaitingQueueRepository {
 
     public List<AdmitCall> admitCalls() {
         return List.copyOf(admitCalls);
+    }
+
+    /** hasToken / rank 호출 순서 */
+    public List<String> readCalls() {
+        return List.copyOf(calls);
     }
 
     public int saveMetaCount() {

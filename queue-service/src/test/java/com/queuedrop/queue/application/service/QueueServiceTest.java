@@ -368,6 +368,43 @@ class QueueServiceTest {
         }
 
         @Test
+        @DisplayName("[T3-08] 상태 조회 중 입장 처리가 끼어들어도 NOT_IN_QUEUE 로 잘못 보이지 않는다 (rank 를 hasToken 보다 먼저 조회)")
+        void admissionRaceIsNotReportedAsNotInQueue() {
+            // Given — 대기 중인 사용자. 첫 조회 직후 입장 처리가 끼어든다
+            givenOpenDrop();
+            remainingReader.set(DROP_ID, 100);
+            queueRepository.givenWaiting(DROP_ID, USER_ID);
+            queueRepository.admitRightAfterFirstRead(DROP_ID, USER_ID);
+            QueueService service = serviceAt(NOW);
+
+            // When
+            QueueStatusResult result = service.status(status(USER_ID));
+
+            // Then — rank 를 먼저 읽었으므로 WAITING (다음 폴링에서 ADMITTED). hasToken 을 먼저 읽으면 NOT_IN_QUEUE 가 된다
+            assertThat(result.state()).isEqualTo("WAITING");
+            assertThat(queueRepository.readCalls()).first().isEqualTo("rank");
+        }
+
+        @Test
+        @DisplayName("[T3-08] 대기 중이면 hasToken 을 조회하지 않고, 대기에 없을 때만 hasToken 을 조회한다")
+        void hasTokenOnlyWhenNotWaiting() {
+            // Given
+            givenOpenDrop();
+            remainingReader.set(DROP_ID, 100);
+            queueRepository.givenWaiting(DROP_ID, USER_ID);
+            queueRepository.givenToken(DROP_ID, 8L);
+            QueueService service = serviceAt(NOW);
+
+            // When
+            service.status(status(USER_ID));
+            QueueStatusResult admitted = service.status(status(8L));
+
+            // Then
+            assertThat(admitted.state()).isEqualTo("ADMITTED");
+            assertThat(queueRepository.readCalls()).containsExactly("rank", "rank", "hasToken");
+        }
+
+        @Test
         @DisplayName("[T3-06] 잔여 정원 키가 없으면 품절로 보지 않고 대기 상태를 그대로 판정한다")
         void remainingKeyMissingIsNotSoldOut() {
             // Given — remainingReader 에 값 없음

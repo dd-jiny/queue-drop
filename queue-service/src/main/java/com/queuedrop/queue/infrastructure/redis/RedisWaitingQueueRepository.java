@@ -29,16 +29,17 @@ public class RedisWaitingQueueRepository implements WaitingQueueRepository {
     private final RedisScript<Long> enqueueScript;
     @SuppressWarnings("rawtypes")
     private final RedisScript<List> admitScript;
+    private final RedisScript<Long> saveMetaScript;
 
+    /** HSET + PEXPIREAT + ZADD active-drops 를 save_meta.lua 하나로 (중간 실패로 meta 와 인덱스가 어긋나지 않게) */
     @Override
     public void saveMeta(QueueMeta meta) {
-        String key = QueueKeys.meta(meta.dropId());
-        redis.opsForHash().putAll(key, Map.of(
-                OPEN_AT, String.valueOf(meta.openAt().toEpochMilli()),
-                CLOSE_AT, String.valueOf(meta.closeAt().toEpochMilli())));
-        redis.expireAt(key, meta.closeAt().plus(RETENTION_AFTER_CLOSE));   // 이미 지났으면 즉시 삭제
-        redis.opsForZSet().add(QueueKeys.ACTIVE_DROPS, String.valueOf(meta.dropId()),
-                meta.closeAt().toEpochMilli());
+        redis.execute(saveMetaScript,
+                List.of(QueueKeys.meta(meta.dropId()), QueueKeys.ACTIVE_DROPS),
+                String.valueOf(meta.dropId()),
+                String.valueOf(meta.openAt().toEpochMilli()),
+                String.valueOf(meta.closeAt().toEpochMilli()),
+                String.valueOf(meta.closeAt().plus(RETENTION_AFTER_CLOSE).toEpochMilli()));
     }
 
     @Override
