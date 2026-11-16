@@ -680,8 +680,8 @@ public record ProductCreateRequest(
 
 public record DropRegisterRequest(
         @NotBlank @Size(max = 100) String title,
-        @Positive int entryCapacity,
-        @Positive int winnerCount,
+        @NotNull @Positive Integer entryCapacity,   // v1.2: Integer — 누락을 0(양수 위반)이 아닌 필수 누락으로 구분
+        @NotNull @Positive Integer winnerCount,
         @NotNull Instant openAt,     // ISO-8601, 예: 2026-12-01T10:00:00+09:00
         @NotNull Instant closeAt) {
     public DropRegisterCommand toCommand(Requester r, Long productId) { /* ... */ }
