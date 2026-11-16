@@ -85,4 +85,33 @@ class UserTest {
         assertThat(user.getPasswordHash()).isEqualTo(HASH);
         assertThat(user.getCreatedAt()).isEqualTo(NOW);
     }
+
+    @Test
+    @DisplayName("[T1-27] User.registerAdmin 으로 만든 회원은 role=ADMIN, id=null 이다")
+    void registerAdminCreatesAdminRole() {
+        // Given
+        Email email = email();
+
+        // When
+        User admin = User.registerAdmin(email, HASH, " admin ", NOW);
+
+        // Then
+        assertThat(admin.getRole()).isEqualTo(Role.ADMIN);
+        assertThat(admin.getId()).isNull();
+        assertThat(admin.getEmail()).isEqualTo(email);
+        assertThat(admin.getPasswordHash()).isEqualTo(HASH);
+        assertThat(admin.getNickname()).isEqualTo("admin");
+        assertThat(admin.getCreatedAt()).isEqualTo(NOW);
+    }
+
+    @ParameterizedTest(name = "[T1-27] 닉네임 {0}")
+    @ValueSource(strings = {"a", "abcdefghijklmnopqrstu", "   "})
+    @DisplayName("[T1-27] registerAdmin 에도 닉네임 규칙(2~20자)이 똑같이 적용된다")
+    void registerAdminRejectsInvalidNickname(String nickname) {
+        // Given: nickname
+
+        // When / Then
+        assertThatThrownBy(() -> User.registerAdmin(email(), HASH, nickname, NOW))
+                .isInstanceOf(InvalidNicknameException.class);
+    }
 }

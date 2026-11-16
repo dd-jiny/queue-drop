@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
 import com.queuedrop.common.error.ApplicationException;
+import com.queuedrop.user.application.dto.CreateAdminCommand;
 import com.queuedrop.user.application.dto.LoginCommand;
 import com.queuedrop.user.application.dto.LoginResult;
 import com.queuedrop.user.application.dto.SignupCommand;
@@ -16,6 +17,7 @@ import com.queuedrop.user.application.service.fake.FakeTokenIssuer;
 import com.queuedrop.user.application.service.fake.InMemoryUserRepository;
 import com.queuedrop.user.application.service.fake.RecordingUserEventPublisher;
 import com.queuedrop.user.domain.model.Email;
+import com.queuedrop.user.domain.model.Role;
 import com.queuedrop.user.domain.model.User;
 import java.time.Clock;
 import java.time.Instant;
@@ -142,5 +144,62 @@ class UserServiceTest {
                 .isThrownBy(() -> userService.login(new LoginCommand(email, rawPassword)))
                 .satisfies(e -> assertThat(e.errorCode()).isEqualTo(UserErrorCode.INVALID_CREDENTIALS));
         assertThat(tokenIssuer.issuedSubjects()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T1-28] 빈 저장소에 createAdminIfAbsent 를 두 번 호출하면 1회차 true(ADMIN 1건, 해시 저장), 2회차 false, 이벤트 0건")
+    void createAdminIfAbsentIsIdempotent() {
+        // Given: 빈 저장소
+        CreateAdminCommand command = new CreateAdminCommand("admin@example.com", "adminPassword1", "admin");
+
+        // When
+        boolean first = userService.createAdminIfAbsent(command);
+        boolean second = userService.createAdminIfAbsent(command);
+
+        // Then
+        assertThat(first).isTrue();
+        assertThat(second).isFalse();
+        assertThat(userRepository.findAll()).singleElement().satisfies(admin -> {
+            assertThat(admin.getRole()).isEqualTo(Role.ADMIN);
+            assertThat(admin.getEmail()).isEqualTo(new Email("admin@example.com"));
+            assertThat(admin.getPasswordHash()).isNotEqualTo("adminPassword1");
+            assertThat(passwordEncoder.matches("adminPassword1", admin.getPasswordHash())).isTrue();
+            assertThat(admin.getCreatedAt()).isEqualTo(NOW);
+        });
+        assertThat(eventPublisher.registered()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T1-28] exists 확인 후 저장 시점에 DuplicateEmailException 이 나면(여러 인스턴스 동시 기동) 예외 없이 false")
+    void createAdminIfAbsentReturnsFalseOnConcurrentDuplicate() {
+        // Given
+        userRepository.throwDuplicateOnSave();
+
+        // When
+        boolean created = userService.createAdminIfAbsent(
+                new CreateAdminCommand("admin@example.com", "adminPassword1", "admin"));
+
+        // Then
+        assertThat(created).isFalse();
+        assertThat(eventPublisher.registered()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T1-29] 같은 이메일(대소문자만 다름)의 USER 계정이 있으면 false 이고 기존 계정은 USER 로 유지된다 (승격 없음)")
+    void createAdminIfAbsentDoesNotPromoteExistingUser() {
+        // Given
+        User existing = givenRegisteredUser(EMAIL, PASSWORD);
+
+        // When
+        boolean created = userService.createAdminIfAbsent(
+                new CreateAdminCommand("USER@example.com", "adminPassword1", "admin"));
+
+        // Then
+        assertThat(created).isFalse();
+        assertThat(userRepository.findAll()).singleElement().satisfies(user -> {
+            assertThat(user.getId()).isEqualTo(existing.getId());
+            assertThat(user.getRole()).isEqualTo(Role.USER);
+            assertThat(user.getPasswordHash()).isEqualTo(existing.getPasswordHash());
+        });
     }
 }

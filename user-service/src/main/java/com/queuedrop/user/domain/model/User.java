@@ -34,6 +34,11 @@ public class User {
         return new User(null, email, passwordHash, nickname, Role.USER, now);
     }
 
+    /** 관리자 계정 생성. 기동 시 초기화에서만 사용 (일반 가입 경로로는 ADMIN 을 만들 수 없다) */
+    public static User registerAdmin(Email email, String passwordHash, String nickname, Instant now) {
+        return new User(null, email, passwordHash, nickname, Role.ADMIN, now);
+    }
+
     /** 영속 데이터로부터 복원 (Mapper 전용) */
     public static User reconstitute(Long id, Email email, String passwordHash,
                                     String nickname, Role role, Instant createdAt) {
