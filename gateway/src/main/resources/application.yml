@@ -1,0 +1,35 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: gateway
+  cloud:
+    gateway:
+      server:
+        webflux:
+          routes:
+            - id: user-service
+              uri: ${USER_SERVICE_URL:http://localhost:8081}
+              predicates:
+                - Path=/api/users/**
+            - id: product-service
+              uri: ${PRODUCT_SERVICE_URL:http://localhost:8082}
+              predicates:
+                - Path=/api/products/**
+            - id: queue-service
+              uri: ${QUEUE_SERVICE_URL:http://localhost:8083}
+              predicates:
+                - Path=/api/queue/**
+            - id: coupon-service
+              uri: ${COUPON_SERVICE_URL:http://localhost:8084}
+              predicates:
+                - Path=/api/coupons/**
+            - id: entry-service
+              uri: ${ENTRY_SERVICE_URL:http://localhost:8085}
+              predicates:
+                - Path=/api/entries/**
+            - id: ranking-service
+              uri: ${RANKING_SERVICE_URL:http://localhost:8086}
+              predicates:
+                - Path=/api/rankings/**
