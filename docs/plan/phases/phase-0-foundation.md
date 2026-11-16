@@ -5,6 +5,10 @@
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | Flyway 확정, 공통 producer 설정을 4단계 기준(request 1000 / delivery 3000)으로 통일, DLT 토픽 3종 추가, 설계 반영 완료 표시 |
+| v1.2 | 2026-11-16 | 라이브러리 확인 결과 반영: ArchUnit 1.5.1, Testcontainers 2.0.5 (`testcontainers-{module}` 아티팩트명 확인) |
+| v1.3 | 2026-11-16 | 3.4 `LayerRules`: R1 에 `lombok..` 허용(설계 v1.2), `isDomainModel` 오탐 방지(`domain.modeling` 제외), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가(설계 v1.2). 규칙 자체 검증 테스트 `LayerRulesTest` 추가 (T0-02a). 3.5: Testcontainers 2.x 패키지(`org.testcontainers.postgresql`, `org.testcontainers.kafka`) 확인 |
+| v1.4 | 2026-11-16 | 에러 계약 결정 반영(설계 layered-architecture v1.3): `CommonErrorCode` 에 `MISSING_USER_HEADER`(400)·`METHOD_NOT_ALLOWED`(405) 추가, 헤더 누락 401 → 400, `ApplicationException` javadoc "공통 부모", 3.8 핸들러에 Spring MVC 표준 예외 매핑 표와 처리 추가(400/404/405/415, `HandlerMethodValidationException`, `ErrorResponse` 4xx 정규화), 4xx `ApplicationException` warn 로그, `UNSUPPORTED_MEDIA_TYPE`(415) 추가, T0-05 시나리오 확장 |
+| v1.5 | 2026-11-16 | 0단계 종료 분석 반영: producer `max.block.ms=1000` 추가(E-02), DLT 파티션 수를 원본과 일치(`entry.created.DLT`·`coupon.issued.DLT` 6, E-01), T0-04 확장 |
 
 ---
 
@@ -48,12 +52,15 @@ queue-drop/
 │       │       ├── CommonErrorCode.java
 │       │       ├── ApplicationException.java
 │       │       └── ErrorResponse.java
-│       └── testFixtures/java/com/queuedrop/common/test/
-│           ├── archunit/LayerRules.java
-│           └── container/
-│               ├── PostgresContainerConfig.java
-│               ├── RedisContainerConfig.java
-│               └── KafkaContainerConfig.java
+│       ├── testFixtures/java/com/queuedrop/common/test/
+│       │   ├── archunit/LayerRules.java
+│       │   └── container/
+│       │       ├── PostgresContainerConfig.java
+│       │       ├── RedisContainerConfig.java
+│       │       └── KafkaContainerConfig.java
+│       └── test/java/com/queuedrop/common/test/archunit/
+│           ├── LayerRulesTest.java                # T0-02a: 규칙별 위반/준수 샘플로 R1~R7 자체 검증
+│           └── sample/**                          # 검증용 샘플 클래스
 └── {user,product,queue,entry,coupon,ranking}-service/
     ├── build.gradle                               # 수정: (JPA 서비스) Flyway
     └── src/
@@ -86,7 +93,7 @@ plugins {
 
 ext {
     set('springCloudVersion', '2025.1.4')
-    set('archunitVersion', '1.3.0')   // 구현 시 최신 버전 확인
+    set('archunitVersion', '1.5.1')
 }
 
 allprojects {
@@ -161,9 +168,14 @@ dependencies {
 
     testFixturesApi 'org.springframework.boot:spring-boot-testcontainers'
     testFixturesApi 'org.springframework.boot:spring-boot-test'
-    testFixturesApi 'org.testcontainers:testcontainers-junit-jupiter'   // Testcontainers 2.x 아티팩트명, 구현 시 확인
+    testFixturesApi 'org.testcontainers:testcontainers-junit-jupiter'
     testFixturesApi 'org.testcontainers:testcontainers-postgresql'
     testFixturesApi 'org.testcontainers:testcontainers-kafka'
+
+    // common 자체 테스트(LayerRulesTest)용. ArchUnit·spring-context 는 testFixturesApi 로 이미 보인다.
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'org.assertj:assertj-core'
+    testImplementation 'jakarta.persistence:jakarta.persistence-api'
 }
 ```
 
@@ -287,6 +299,9 @@ public enum CommonErrorCode implements ErrorCode {
     UNAUTHORIZED("COMMON_UNAUTHORIZED", 401, "인증이 필요합니다."),
     FORBIDDEN("COMMON_FORBIDDEN", 403, "권한이 없습니다."),
     NOT_FOUND("COMMON_NOT_FOUND", 404, "대상을 찾을 수 없습니다."),
+    METHOD_NOT_ALLOWED("COMMON_METHOD_NOT_ALLOWED", 405, "지원하지 않는 요청 메서드입니다."),
+    UNSUPPORTED_MEDIA_TYPE("COMMON_UNSUPPORTED_MEDIA_TYPE", 415, "지원하지 않는 콘텐츠 형식입니다."),
+    MISSING_USER_HEADER("COMMON_MISSING_USER_HEADER", 400, "사용자 식별 헤더가 없습니다."),
     INTERNAL_ERROR("COMMON_INTERNAL_ERROR", 500, "일시적인 오류가 발생했습니다.");
 
     private final String code;
@@ -308,7 +323,7 @@ public enum CommonErrorCode implements ErrorCode {
 ```java
 package com.queuedrop.common.error;
 
-/** application 계층이 던지는 유일한 비즈니스 예외 타입. presentation 이 HTTP 로 매핑한다. */
+/** application 예외의 공통 부모. 서비스별 예외(EntryApplyException 등)는 이를 상속한다. presentation 이 HTTP 로 매핑한다. */
 public class ApplicationException extends RuntimeException {
     private final ErrorCode errorCode;
 
@@ -379,6 +394,9 @@ import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
  * 분석 범위는 각 서비스의 @AnalyzeClasses(packages = "com.queuedrop.{svc}") 로 제한된다.
  *
  * allowEmptyShould(true): 0단계처럼 계층 패키지가 비어 있어도 규칙이 실패하지 않게 한다.
+ *
+ * R1 의 "lombok.." 허용: Lombok 이 생성한 메서드에는 CLASS 보존 어노테이션 @lombok.Generated 가 남아
+ * 바이트코드 의존으로 잡힌다. 설계 6장 각주(컴파일 타임 Lombok 허용)에 맞추기 위해 허용한다.
  */
 public final class LayerRules {
 
@@ -395,9 +413,9 @@ public final class LayerRules {
     @ArchTest
     public static final ArchRule R1_domain_depends_only_on_domain_and_java =
             classes().that().resideInAPackage(DOMAIN)
-                    .should().onlyDependOnClassesThat().resideInAnyPackage(DOMAIN, "java..")
+                    .should().onlyDependOnClassesThat().resideInAnyPackage(DOMAIN, "java..", "lombok..")
                     .allowEmptyShould(true)
-                    .as("R1: domain 은 domain 과 java.* 외에 의존하지 않는다 (Spring·JPA 금지)");
+                    .as("R1: domain 은 domain 과 java.* 외에 의존하지 않는다 (Spring·JPA 금지, Lombok 허용)");
 
     @ArchTest
     public static final ArchRule R2_application_does_not_depend_on_outer_layers =
@@ -414,9 +432,13 @@ public final class LayerRules {
                             "org.springframework.data..",
                             "org.springframework.kafka..",
                             "org.springframework.web..",
+                            "org.hibernate..",
+                            "org.apache.kafka..",
+                            "io.lettuce..",
+                            "redis.clients..",
                             "com.queuedrop.common.event..")
                     .allowEmptyShould(true)
-                    .as("R3: application 은 JPA·Spring Data·Kafka·Web·이벤트 메시지에 의존하지 않는다");
+                    .as("R3: application 은 JPA·Hibernate·Spring Data·Kafka·Redis 클라이언트·Web·이벤트 메시지에 의존하지 않는다");
 
     @ArchTest
     public static final ArchRule R4_presentation_does_not_see_domain =
@@ -463,7 +485,8 @@ public final class LayerRules {
     }
 
     private static boolean isDomainModel(JavaClass type) {
-        return type.getPackageName().contains(DOMAIN_MODEL);
+        String pkg = type.getPackageName();
+        return pkg.endsWith(DOMAIN_MODEL) || pkg.contains(DOMAIN_MODEL + ".");
     }
 }
 ```
@@ -480,7 +503,7 @@ package com.queuedrop.common.test.container;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
-import org.testcontainers.postgresql.PostgreSQLContainer;   // Testcontainers 2.x 패키지, 구현 시 확인
+import org.testcontainers.postgresql.PostgreSQLContainer;   // Testcontainers 2.x 패키지 (구 org.testcontainers.containers 는 deprecated)
 
 @TestConfiguration(proxyBeanMethods = false)
 public class PostgresContainerConfig {
@@ -488,7 +511,7 @@ public class PostgresContainerConfig {
     @Bean
     @ServiceConnection
     PostgreSQLContainer postgres() {
-        return new PostgreSQLContainer("postgres:17");
+        return new PostgreSQLContainer("postgres:17");   // docker-compose 와 같은 이미지
     }
 }
 ```
@@ -507,7 +530,7 @@ public class RedisContainerConfig {
     @Bean
     @ServiceConnection(name = "redis")
     GenericContainer<?> redis() {
-        return new GenericContainer<>("redis:7.4").withExposedPorts(6379);
+        return new GenericContainer<>("redis:7.4").withExposedPorts(6379);   // docker-compose 와 같은 이미지
     }
 }
 ```
@@ -617,10 +640,17 @@ import com.queuedrop.common.error.ErrorCode;
 import com.queuedrop.common.error.ErrorResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.List;
 
@@ -628,15 +658,21 @@ import java.util.List;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
+    /** 서비스 예외는 모두 ApplicationException 을 상속한다. 응답 message 는 ErrorCode.message() 고정. */
     @ExceptionHandler(ApplicationException.class)
     public ResponseEntity<ErrorResponse> handleApplication(ApplicationException e) {
         ErrorCode code = e.errorCode();
         if (code.status() >= 500) {
             log.error("application error: {}", code.code(), e);
+        } else {
+            // 도메인 예외 등 원인의 상세 메시지는 응답에 싣지 않고 여기서만 남긴다 (layered-architecture.md 4.5)
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            log.warn("application error: {} - {}", code.code(), cause.getMessage());
         }
-        return ResponseEntity.status(code.status()).body(ErrorResponse.of(code));
+        return toResponse(code);
     }
 
+    /** @RequestBody @Valid 검증 실패 */
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException e) {
         List<ErrorResponse.FieldError> fields = e.getBindingResult().getFieldErrors().stream()
@@ -645,19 +681,91 @@ public class GlobalExceptionHandler {
         return ResponseEntity.badRequest().body(ErrorResponse.of(CommonErrorCode.INVALID_INPUT, fields));
     }
 
-    /** Gateway 를 거치지 않아 X-User-Id 가 없는 요청 */
-    @ExceptionHandler(MissingRequestHeaderException.class)
-    public ResponseEntity<ErrorResponse> handleMissingHeader(MissingRequestHeaderException e) {
-        return ResponseEntity.status(401).body(ErrorResponse.of(CommonErrorCode.UNAUTHORIZED));
+    /** 컨트롤러 파라미터에 직접 붙은 제약(@RequestParam @Min 등) 위반 — Spring 7 내장 메서드 검증 */
+    @ExceptionHandler(HandlerMethodValidationException.class)
+    public ResponseEntity<ErrorResponse> handleMethodValidation(HandlerMethodValidationException e) {
+        List<ErrorResponse.FieldError> fields = e.getParameterValidationResults().stream()
+                .flatMap(r -> r.getResolvableErrors().stream()
+                        .map(err -> new ErrorResponse.FieldError(
+                                r.getMethodParameter().getParameterName(), err.getDefaultMessage())))
+                .toList();
+        return ResponseEntity.badRequest().body(ErrorResponse.of(CommonErrorCode.INVALID_INPUT, fields));
     }
 
+    /** Gateway 를 거치지 않아 X-User-* 헤더가 없는 요청 (layered-architecture.md 4.5). 그 밖의 필수 헤더 누락은 400 INVALID_INPUT */
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    public ResponseEntity<ErrorResponse> handleMissingHeader(MissingRequestHeaderException e) {
+        boolean userHeader = e.getHeaderName().regionMatches(true, 0, "X-User-", 0, "X-User-".length());
+        return toResponse(userHeader ? CommonErrorCode.MISSING_USER_HEADER : CommonErrorCode.INVALID_INPUT);
+    }
+
+    /** 본문 파싱 실패, 경로·쿼리 타입 불일치, 필수 쿼리 누락 → 400 (catch-all 이 500 으로 바꾸지 않게) */
+    @ExceptionHandler({HttpMessageNotReadableException.class,
+            MethodArgumentTypeMismatchException.class,
+            MissingServletRequestParameterException.class})
+    public ResponseEntity<ErrorResponse> handleBadRequest(Exception e) {
+        return toResponse(CommonErrorCode.INVALID_INPUT);
+    }
+
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<ErrorResponse> handleNoResource(NoResourceFoundException e) {
+        return toResponse(CommonErrorCode.NOT_FOUND);
+    }
+
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<ErrorResponse> handleMethodNotAllowed(HttpRequestMethodNotSupportedException e) {
+        return toResponse(CommonErrorCode.METHOD_NOT_ALLOWED);
+    }
+
+    @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+    public ResponseEntity<ErrorResponse> handleUnsupportedMediaType(HttpMediaTypeNotSupportedException e) {
+        return toResponse(CommonErrorCode.UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /**
+     * 그 밖의 예외. Spring MVC 표준 예외(org.springframework.web.ErrorResponse 구현체: ResponseStatusException,
+     * ServletRequestBindingException 계열 등)가 4xx 를 뜻하면 상태별 공통 코드로 바꾸고 error 로그를 남기지 않는다.
+     */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception e) {
+        if (e instanceof org.springframework.web.ErrorResponse er && er.getStatusCode().is4xxClientError()) {
+            log.warn("client error: {} - {}", er.getStatusCode().value(), e.getMessage());
+            return toResponse(commonCodeFor(er.getStatusCode().value()));
+        }
         log.error("unexpected error", e);
-        return ResponseEntity.internalServerError().body(ErrorResponse.of(CommonErrorCode.INTERNAL_ERROR));
+        return toResponse(CommonErrorCode.INTERNAL_ERROR);
+    }
+
+    private static CommonErrorCode commonCodeFor(int status) {
+        return switch (status) {
+            case 401 -> CommonErrorCode.UNAUTHORIZED;
+            case 403 -> CommonErrorCode.FORBIDDEN;
+            case 404 -> CommonErrorCode.NOT_FOUND;
+            case 405 -> CommonErrorCode.METHOD_NOT_ALLOWED;
+            case 415 -> CommonErrorCode.UNSUPPORTED_MEDIA_TYPE;
+            default -> CommonErrorCode.INVALID_INPUT;   // 그 밖의 4xx 는 400 으로 정규화
+        };
+    }
+
+    private static ResponseEntity<ErrorResponse> toResponse(ErrorCode code) {
+        return ResponseEntity.status(code.status()).body(ErrorResponse.of(code));
     }
 }
 ```
+
+**Spring MVC 표준 예외 매핑**
+
+| 예외 | HTTP | code | 로그 |
+|------|------|------|------|
+| `ApplicationException` (서비스 예외 전부) | `ErrorCode.status()` | `ErrorCode.code()` | 5xx: error + 스택 / 4xx: warn + 원인 메시지 |
+| `MethodArgumentNotValidException`, `HandlerMethodValidationException` | 400 | `COMMON_INVALID_INPUT` + fieldErrors | 없음 |
+| `MissingRequestHeaderException` (`X-User-*`) | 400 | `COMMON_MISSING_USER_HEADER` | 없음 |
+| `MissingRequestHeaderException` (그 밖의 헤더), `HttpMessageNotReadableException`, `MethodArgumentTypeMismatchException`, `MissingServletRequestParameterException` | 400 | `COMMON_INVALID_INPUT` | 없음 |
+| `NoResourceFoundException` | 404 | `COMMON_NOT_FOUND` | 없음 |
+| `HttpRequestMethodNotSupportedException` | 405 | `COMMON_METHOD_NOT_ALLOWED` | 없음 |
+| `HttpMediaTypeNotSupportedException` | 415 | `COMMON_UNSUPPORTED_MEDIA_TYPE` | 없음 |
+| 그 밖의 `org.springframework.web.ErrorResponse` 4xx | 401/403/404/405/415 는 해당 코드, 나머지는 400 | 상태별 `COMMON_*` | warn |
+| 그 밖의 모든 예외 | 500 | `COMMON_INTERNAL_ERROR` (메시지 고정) | error + 스택 |
 
 ### 3.9 서비스 공통 — application.yml
 
@@ -683,6 +791,8 @@ spring:
     baseline-on-migrate: false
 ```
 product / entry / coupon 은 포트·이름·DB 명만 다르다 (기존 값 유지).
+- 마이그레이션 SQL 은 **DB 이름·role 에 독립적으로** 작성한다 (`user_db`, `GRANT ... TO queuedrop` 등 금지). 통합 테스트의 `PostgreSQLContainer` 는 DB·사용자 이름이 `test` 이고, Flyway·Hibernate 는 schema(`public`) 단위로 동작하므로 이 규칙만 지키면 결과가 같다.
+- T0-03 은 Postgres 만 Import 한다. 기동 시 Redis(Lettuce 지연 연결)·Kafka(Listener·NewTopic 없음)에 접속하지 않기 때문. Listener 가 생기는 단계부터 해당 서비스 테스트에 `KafkaContainerConfig` 를 추가한다.
 
 #### Kafka 서비스 (product, queue, entry, coupon, ranking) — `spring.kafka` 공통 블록
 ```yaml
@@ -691,13 +801,14 @@ spring:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3), 구현 시 확인
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3)
       acks: all
       retries: 2147483647          # 횟수가 아니라 delivery.timeout.ms 로 전체 시간을 제한
       properties:
         enable.idempotence: true
         request.timeout.ms: 1000
         delivery.timeout.ms: 3000
+        max.block.ms: 1000         # send() 호출 자체의 블로킹(메타데이터·버퍼 대기) 상한. 기본 60초면 get(3.5s) 전제가 깨진다
     consumer:
       group-id: ${spring.application.name}
       auto-offset-reset: earliest
@@ -824,15 +935,16 @@ create draw.completed  1
 create entry.created  6 --config retention.ms=2592000000
 create coupon.issued  6
 
-# DLT: 저장 컨슈머(entry, coupon)가 3회 재시도 후 보내는 토픽. 재처리용이라 파티션 1 (구현 결정)
+# DLT: 저장 컨슈머(entry, coupon)가 3회 재시도 후 보내는 토픽.
+# DeadLetterPublishingRecoverer 기본 동작은 원본과 같은 파티션 번호로 보내므로 파티션 수를 원본과 맞춘다.
 create drop.created.DLT  1
-create entry.created.DLT 1
-create coupon.issued.DLT 1
+create entry.created.DLT 6
+create coupon.issued.DLT 6
 
 "$TOPICS_BIN" --bootstrap-server "$BOOTSTRAP" --list
 ```
 
-(구현 결정) 파티션 수: 피크 토픽 6, 저빈도 토픽 1. 근거는 8단계 부하 테스트에서 검증하고 조정한다.
+(구현 결정) 파티션 수: 피크 토픽 6, 저빈도 토픽 1. 근거는 8단계 부하 테스트에서 검증하고 조정한다. DLT 파티션 수는 원본과 같게 둔다 (enhancement-backlog E-01).
 
 ---
 
@@ -841,10 +953,11 @@ create coupon.issued.DLT 1
 | ID | 계층/종류 | 테스트 클래스 | 시나리오 (Given / When / Then) | 관련 REQ |
 |----|-----------|---------------|--------------------------------|----------|
 | T0-01 | 아키텍처 | `{svc}.ArchitectureTest` ×6 | Given 4계층 골격만 있는 서비스 / When ArchUnit 실행 / Then R1~R7 모두 통과 (빈 패키지 허용) | - |
+| T0-02a | 아키텍처 (자동) | common `LayerRulesTest` | Given 규칙별 위반/준수 샘플 클래스 / When R1~R7 check / Then 위반 샘플은 실패, 준수 샘플은 `allowEmptyShould(false)` 로도 통과. R3 위반 샘플은 `jakarta.persistence`·`common.event` 만 (Spring Data·Kafka·Web·Hibernate·Kafka/Redis 클라이언트는 common 에 의존성이 없어 범위 밖). 서비스 패키지 오타는 잡지 못하므로 T0-02 는 계속 필요 | - |
 | T0-02 | 아키텍처 (수동) | entry-service `ArchitectureTest` | Given presentation 이 domain 모델을 반환하는 임시 클래스 / When 실행 / Then R4 실패. 같은 방식으로 R6, R1 실패 확인 후 임시 클래스 삭제 (3.7) | - |
 | T0-03 | 통합 | `{svc}.ApplicationContextTest` ×4 (user, product, entry, coupon) | Given `PostgresContainerConfig` / When 컨텍스트 기동 / Then Flyway 실행 + `ddl-auto: validate` 통과, 기동 성공 | - |
-| T0-04 | 통합 | `{svc}.ApplicationContextTest` (queue, ranking) | Given `RedisContainerConfig`, `KafkaContainerConfig` / When 기동 / Then 성공 | - |
-| T0-05 | 단위 | presentation `GlobalExceptionHandlerTest` (entry-service 1곳) | Given `ApplicationException(CommonErrorCode.NOT_FOUND)` 를 던지는 테스트 컨트롤러 / When 호출 / Then 404 + `code=COMMON_NOT_FOUND` / 검증 실패 시 400 + fieldErrors | - |
+| T0-04 | 통합 | `{svc}.ApplicationContextTest` (queue, ranking) | Given `RedisContainerConfig`, `KafkaContainerConfig` / When 기동 / Then 성공 + Producer·ConsumerFactory 에 3.9 설정이 실제 적용(acks, 멱등, 타임아웃, 직렬화기, trusted.packages, group.id) + Redis PING + `DropCreated` 발행·수신 왕복(`__TypeId__` 헤더, Instant ISO-8601) | NFR-02 |
+| T0-05 | 슬라이스 | presentation `GlobalExceptionHandlerTest` (entry-service 1곳) | Given 예외를 던지는 테스트 컨트롤러 / When 호출 / Then `ApplicationException(NOT_FOUND)` → 404 + `code=COMMON_NOT_FOUND` · 검증 실패 → 400 + fieldErrors · `X-User-Id` 누락 → 400 `COMMON_MISSING_USER_HEADER` · 깨진 JSON·타입 불일치 → 400 `COMMON_INVALID_INPUT` · 없는 경로 → 404 · 지원하지 않는 메서드 → 405 · `@RequestParam @Min` 위반 → 400 + fieldErrors · Content-Type 미지원 → 415 · `ResponseStatusException(409)` 등 표준 4xx → 400 정규화 · 다른 필수 헤더 누락 → 400 `COMMON_INVALID_INPUT` · `ApplicationException` 하위 예외(503 코드) → 503 + 해당 code · 예상 못한 예외 → 500 `COMMON_INTERNAL_ERROR`(메시지 고정) | - |
 | T0-06 | 인프라 (수동) | - | Given `docker compose up -d` / When `docker compose ps` / Then postgres·redis·kafka healthy, kafka-init exit 0 | NFR-03 |
 | T0-07 | 인프라 (수동) | - | When `docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic entry.created` / Then PartitionCount 6, `retention.ms=2592000000` | REQ-RANK-03 |
 | T0-09 | 인프라 (수동) | - | When `kafka-topics.sh --list` / Then 토픽 8개(이벤트 5 + DLT 3: `drop.created.DLT`, `entry.created.DLT`, `coupon.issued.DLT`) | NFR-03 |
@@ -859,10 +972,10 @@ create coupon.issued.DLT 1
 | 1 | `chore: 테스트 의존성과 common test fixtures 설정` | 루트 `build.gradle`, `common/build.gradle` |
 | 2 | `feat(common): 서비스 간 이벤트 메시지 스키마와 토픽 상수 추가` | `common/.../event/*` |
 | 3 | `feat(common): 공통 에러 코드와 에러 응답 형식 추가` | `common/.../error/*` |
-| 4 | `test(common): ArchUnit 4계층 의존 규칙 R1~R7 추가` | `LayerRules.java` |
+| 4 | `test(common): ArchUnit 4계층 의존 규칙 R1~R7 추가` | `LayerRules.java`, `LayerRulesTest.java`, `sample/**`, `common/build.gradle`(testImplementation) |
 | 5 | `test(common): Testcontainers 지원 설정 추가` | `container/*Config.java` |
 | 6 | `chore: 서비스별 4계층 패키지 골격과 아키텍처 테스트 추가` | 각 서비스 `package-info.java`, `ArchitectureTest.java` |
-| 7 | `feat: 서비스별 전역 예외 처리기 추가` | 각 서비스 `GlobalExceptionHandler.java`, T0-05 |
+| 7 | `feat: 서비스별 전역 예외 처리기 추가` | `CommonErrorCode`(코드 2개 추가), `ApplicationException`(javadoc), 각 서비스 `GlobalExceptionHandler.java`, T0-05 (`GlobalExceptionHandlerTest` — 테스트 전용 컨트롤러·에러 코드는 static 중첩 클래스로 두어 컴포넌트 스캔 제외, entry-service `build.gradle` 에 `spring-boot-starter-webmvc-test` — Boot 4 는 `@WebMvcTest` 가 별도 모듈) |
 | 8 | `chore: Flyway 도입 및 JPA ddl-auto validate 전환` | JPA 서비스 `build.gradle`, `application.yml`, `db/migration/.gitkeep`, `ApplicationContextTest` |
 | 9 | `chore: Kafka 프로듀서·컨슈머 공통 설정 추가` | Kafka 서비스 `application.yml` |
 | 10 | `chore(infra): Redis AOF 활성화 및 Kafka 토픽·DLT 토픽 사전 생성` | `docker-compose.yml`, `infra/kafka/create-topics.sh` |

@@ -5,6 +5,8 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 (4계층, 엄격한 DIP, 모델 비노출 원칙 합의) | 전체 |
 | v1.1 | 2026-11-16 | application 의 `common.error` 의존 허용, 커밋 후 발행 규칙(발행 어댑터 내 afterCommit), 에러 계약 위치·추가 에러 코드, domain `exception` 패키지, R3 금지 목록 확장 | phase-0·2·4 구현 상세 6장 |
+| v1.2 | 2026-11-16 | R1 허용 목록에 `lombok..` 추가 (Lombok 생성 코드의 `@lombok.Generated` 가 바이트코드에 남는 것을 확인), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가 | phase-0 커밋 #4 |
+| v1.3 | 2026-11-16 | 4.5: `X-User-Id` 누락 코드 `COMMON_MISSING_USER_HEADER`(400) 로 공통화, 에러 코드 명명 규칙 `{SERVICE}_{REASON}`, 응답 메시지는 코드별 고정(도메인 상세 메시지는 로그만), 서비스 예외는 `ApplicationException` 상속·`GlobalExceptionHandler` 단일화 | phase-0 커밋 #7 |
 
 ## 1. 쉬운 설명 (한눈에)
 > 가게로 비유하면 **창구(presentation)** 는 손님 말을 주문서로 옮겨 적고, **매니저(application)** 는 주문서를 보고 일을 지시하고,
@@ -98,7 +100,10 @@ flowchart LR
 - presentation 의 `@RestControllerAdvice` 가 application 예외 → HTTP 상태·응답 바디로 매핑한다.
 - domain 의 불변식 위반(예: `Drop` 생성 시 M < K)은 domain 예외(`DomainException`, 순수 Java, `domain/exception`)로 던지고, application 이 받아 에러 코드로 변환한다.
   - 리스너 경로도 같다: 수신 메시지가 불변식을 어기면 application 이 예외를 변환해 던지고(예: `InvalidDropSnapshotException`), 리스너 재시도 후 DLT 로 간다.
-- `X-User-Id` 누락(Gateway 우회 등)은 presentation 이 `MISSING_USER_HEADER`(400) 로 처리한다.
+- `X-User-*` 헤더 누락(Gateway 우회 등)은 presentation 이 `COMMON_MISSING_USER_HEADER`(400) 로 처리한다 (`CommonErrorCode.MISSING_USER_HEADER`, 전 서비스 공통).
+- **에러 코드 명명 규칙**: 응답의 `code` 값은 `{SERVICE}_{REASON}` 대문자 스네이크 (예: `ENTRY_SOLD_OUT`, `USER_DUPLICATE_EMAIL`, 공통은 `COMMON_*`). enum 상수명은 접두어 없이 사유만 쓴다 (`EntryErrorCode.SOLD_OUT` → code `"ENTRY_SOLD_OUT"`).
+- **응답 메시지와 로그**: 응답 `message` 는 항상 `ErrorCode.message()`(코드별 고정 문구)다. `DomainException` 의 상세 메시지는 응답에 싣지 않고 `GlobalExceptionHandler` 가 로그로만 남긴다 — 5xx 는 error + 스택, 4xx 는 warn + 원인 메시지(스택 없음). 입력 형식 오류의 필드별 사유는 `fieldErrors` 로 전달한다. Spring MVC 표준 예외의 매핑은 phase-0 3.8 표를 따른다.
+- 서비스별 예외는 모두 `ApplicationException` 을 상속하고 서비스별 에러 코드 enum 은 `ErrorCode` 를 구현한다. 서비스별 `@ExceptionHandler` 를 따로 두지 않고 공통 형태의 `GlobalExceptionHandler` 하나로 매핑한다 (상태 코드는 `ErrorCode.status()`).
 - `@RestControllerAdvice` 는 Spring Web 의존이 있어 `common` 에 두지 않고 서비스마다 같은 형태로 둔다.
 
 ## 5. 패키지 구조 (서비스 공통)
@@ -134,15 +139,15 @@ com.queuedrop.{service}
 
 | # | 규칙 | 의미 |
 |---|------|------|
-| R1 | `domain..` 은 `domain..`, `java..` 외에 의존하지 않는다 | domain 순수성 (Spring·JPA·Lombok 런타임 의존 금지*) |
+| R1 | `domain..` 은 `domain..`, `java..`, `lombok..` 외에 의존하지 않는다 | domain 순수성 (Spring·JPA 의존 금지, 컴파일 타임 Lombok 허용*) |
 | R2 | `application..` 은 `presentation..`, `infrastructure..` 에 의존하지 않는다 | 상위·기술 계층 모름 |
-| R3 | `application..` 은 `jakarta.persistence..`, `org.springframework.data..`, `org.springframework.kafka..`, `org.springframework.web..`, `com.queuedrop.common.event..` 에 의존하지 않는다 | 기술 의존 금지, 메시지 계약 직접 의존 금지(4.4) |
+| R3 | `application..` 은 `jakarta.persistence..`, `org.hibernate..`, `org.springframework.data..`, `org.springframework.kafka..`, `org.springframework.web..`, `org.apache.kafka..`, `io.lettuce..`, `redis.clients..`, `com.queuedrop.common.event..` 에 의존하지 않는다 | 기술 의존 금지(Spring 추상화와 클라이언트 라이브러리 모두), 메시지 계약 직접 의존 금지(4.4) |
 | R4 | `presentation..` 은 `domain..`, `infrastructure..` 에 의존하지 않는다 | **모델 비노출** |
 | R5 | `infrastructure..` 는 `presentation..` 에 의존하지 않는다 | 역방향 금지 |
 | R6 | `application.service..` 의 public 메서드는 `domain.model..` 타입을 파라미터·반환으로 쓰지 않는다 | **모델 비노출 (메서드 시그니처 수준)** |
 | R7 | `@Entity` 클래스는 `infrastructure.persistence..` 에만 존재한다 | 엔티티 분리 |
 
-\* Lombok 은 컴파일 타임 전용(`compileOnly`)이라 바이트코드 의존이 남지 않는 어노테이션(`@Getter`, `@RequiredArgsConstructor` 등)은 domain 에서 허용한다. ArchUnit R1 은 바이트코드 기준으로 검사되므로 자연스럽게 판별된다.
+\* Lombok 은 컴파일 타임 전용(`compileOnly`)이라 `@Getter`, `@RequiredArgsConstructor` 등은 domain 에서 허용한다. 단, Lombok 이 생성한 메서드에는 CLASS 보존 어노테이션 `@lombok.Generated` 가 남아 ArchUnit 이 바이트코드 의존으로 잡으므로, R1 허용 목록에 `lombok..` 을 명시한다 (런타임 클래스패스에는 Lombok 이 없다).
 
 - 규칙 정의는 중복을 피하기 위해 `common` 모듈의 **test fixtures**(`java-test-fixtures` 플러그인)에 두고 각 서비스 테스트에서 재사용한다.
 
