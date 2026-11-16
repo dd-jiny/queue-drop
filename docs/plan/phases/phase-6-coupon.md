@@ -5,6 +5,7 @@
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 발행 정책을 4단계와 통일(애플리케이션 재시도 제거, producer 내부 재시도 + delivery.timeout 3000, get 3.5초), 저장 컨슈머 DLT(3회 재시도 후 `coupon.issued.DLT`) 추가, 저장 전 Redis 확인 확정, 재발급 유령 이벤트 테스트 추가, 설계 반영 완료 표시 |
+| v1.2 | 2026-11-17 | DLT recoverer 에 목적지 리졸버 명시 (Spring Kafka 4 기본 `{topic}-dlt`, 4단계 v1.4 에서 확인) |
 
 ---
 
@@ -475,7 +476,9 @@ class KafkaConsumerConfig {
 
     @Bean
     DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, Object> template) {
-        var recoverer = new DeadLetterPublishingRecoverer(template);   // coupon.issued.DLT 로 보냄
+        // Spring Kafka 4 기본 목적지는 {topic}-dlt — 리졸버로 coupon.issued.DLT·같은 파티션 지정 (4단계 v1.4 확인)
+        var recoverer = new DeadLetterPublishingRecoverer(template,
+                (record, ex) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
         var handler = new DefaultErrorHandler(recoverer, new FixedBackOff(1_000L, 3L));
         handler.addNotRetryableExceptions(DeserializationException.class);
         return handler;

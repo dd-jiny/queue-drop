@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 발행 정책·DLT·저장 전 Redis 확인 확정 반영 (0단계 토픽 초기화에 DLT 추가됨), JSON 직렬화 클래스명을 0단계 공통 설정과 통일, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 0~3단계 실제 코드에 정렬. 에러 계약: `EntryErrorCode implements ErrorCode`(코드 `ENTRY_*`, 상태는 enum 이 보유), `ApplicationException` 으로 던지고 0단계 `GlobalExceptionHandler` 가 매핑 — `BusinessException`·`EntryApplyException`·`EntryExceptionHandler`·`UserIdHeader` 제거, 헤더 누락은 `COMMON_MISSING_USER_HEADER`(400). `DomainException` 은 entry `domain/exception` 에 서비스별로 둔다(queue 와 같은 형태). 잘못된 `drop.created` 는 queue 처럼 application 이 `DomainException` 을 잡아 로그·스킵(재시도·DLT 없음) — `InvalidDropSnapshotException` 제거, 설계 문서 반영. `DropSnapshotRegisterCommand` 를 `Long`/null 검증으로. Kafka 설정은 0단계 `application.yml` 공통 블록(이미 있음) 기준으로 추가분만 표기, `DefaultErrorHandler` 빈 자동 적용(3단계 확인), `@KafkaListener(idIsGroup = false)`. `entry:{dropId}:remaining` 정수 문자열 계약·queue 의존 명시. 스크립트 빈 `EntryScripts` → `infrastructure/config/RedisScriptConfig`, 테스트 지원은 `*ContainerConfig` `@Import`, 테스트 슬라이스 의존성(`data-redis-test`·`data-jpa-test`). 테스트 T4-33~35 추가. 커밋 계획을 테스트 포함 기능 커밋 단위로 재편. 6.1 에 E-34·E-39 사용자 결정 기록 |
 | v1.3 | 2026-11-17 | 커밋 #3 검증 반영: `DropSnapshotRegisterService` 가 Redis 를 재수신 메시지 값이 아니라 DB 에 저장된 스냅샷 값으로 초기화 (DB·Redis 정원 불일치 방지). T4-09 에 인프라 예외 전파 케이스 추가 |
+| v1.4 | 2026-11-17 | 커밋 #8 구현 확인: 역직렬화 실패 레코드를 원본 바이트로 DLT 에 보내도록 `byte[]` 전용 템플릿 추가(JSON 템플릿은 Base64 문자열로 감쌈). Spring Kafka 4 의 `DeadLetterPublishingRecoverer` 기본 목적지가 `{topic}-dlt` 라서 리졸버로 `{topic}.DLT`·같은 파티션을 명시 (토픽 이름·설계 문서는 그대로). 6단계 coupon 도 같은 리졸버 사용 |
 
 > 표기
 > - **(구현 결정)**: 설계 문서에 없던 내용을 이 문서에서 정한 것
@@ -322,15 +323,21 @@ public class KafkaConsumerConfig {
 
     @Bean
     DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, Object> kafkaTemplate) {
-        var recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate);   // 기본: {topic}.DLT, 같은 파티션 번호
+        // Spring Kafka 4 기본 목적지는 {topic}-dlt 라서 리졸버로 {topic}.DLT·같은 파티션 번호를 지정한다 (v1.4)
+        // 값 타입 순서 매칭: 역직렬화 실패 레코드(byte[])는 ByteArraySerializer 템플릿으로 원본 그대로 (v1.4)
+        Map<Class<?>, KafkaOperations<?, ?>> templates = new LinkedHashMap<>();
+        templates.put(byte[].class, bytesTemplate);      // 기존 producer 설정 복사 + ByteArraySerializer, destroy() 에서 닫음
+        templates.put(Object.class, kafkaTemplate);
+        var recoverer = new DeadLetterPublishingRecoverer(templates,
+                (record, ex) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
         return new DefaultErrorHandler(recoverer, new FixedBackOff(RETRY_INTERVAL_MS, MAX_RETRIES));
     }
 }
 ```
 - queue 의 `KafkaConsumerConfig` 와 같은 형태에 recoverer 만 더한다. 저장 실패(DB 장애 등)는 1초 간격 3번 재시도 후 `entry.created.DLT` / `drop.created.DLT` 로 보낸다.
-- DLT 토픽은 0단계 `create-topics.sh` 가 원본과 같은 파티션 수로 만든다 (기본 recoverer 가 원본 파티션 번호로 보내므로). 토픽 이름은 `Topics.*_DLT` 상수.
-- 잘못된 `drop.created`(도메인 불변식 위반)는 application 이 로그·스킵하므로 이 핸들러까지 오지 않는다 (3.1, v1.2). DLT 로 가는 건 인프라 장애와 역직렬화 실패뿐이다.
-- 역직렬화 실패 레코드는 값이 원본 `byte[]` 로 복원돼 recoverer 에 전달된다. JSON serializer 템플릿이 이를 원본 그대로 보내는지 **구현 시 확인** (T4-34 와 별개로 수동 확인). 아니면 `byte[]` 용 템플릿을 따로 두는 `DeadLetterPublishingRecoverer(Map<Class<?>, KafkaOperations<?, ?>>)` 생성자를 쓴다.
+- DLT 토픽은 0단계 `create-topics.sh` 가 원본과 같은 파티션 수로 만든다 (리졸버가 원본 파티션 번호로 보내므로). 토픽 이름은 `Topics.*_DLT` 상수.
+- 잘못된 `drop.created`(도메인 불변식 위반)는 application 이 로그·스킵하므로 이 핸들러까지 오지 않는다 (3.1, v1.2). DLT 로 가는 건 인프라 장애와 역직렬화 실패뿐이다. 예외로, `entry.created` 의 `dropId`·`userId` 가 null 이면 리스너의 언박싱 NPE 가 재시도 후 DLT 로 간다 (같은 서비스가 발행하는 메시지라 실제로는 생기지 않으며, 생기면 DLT 에서 드러나는 쪽이 맞다).
+- 역직렬화 실패 레코드는 값이 원본 `byte[]` 로 복원돼 recoverer 에 전달된다. JSON 템플릿으로 보내면 Base64 JSON 문자열로 바뀌는 것을 확인해서(v1.4, T4-34 poison pill 케이스), `byte[]` 용 템플릿을 먼저 매칭하는 Map 생성자를 쓴다.
 - DLT 로 간 응모는 Redis 에는 있고 DB 에는 없는 상태라, 5단계 추첨의 건수 비교에서 불일치로 드러난다. 그때 DLT 를 다시 처리하면 된다.
 
 #### Flyway 마이그레이션 (`db/migration/V1__create_entry_tables.sql`, 전문)

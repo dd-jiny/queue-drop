@@ -42,6 +42,9 @@ spring:
       properties:
         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
         spring.json.trusted.packages: com.queuedrop.common.event
+    listener:
+      ack-mode: record             # 레코드 단위로 처리 성공 후 커밋
+      concurrency: 3               # entry.created 파티션 6 → 인스턴스 2개 기준 3씩. drop.created(파티션 1)는 1개만 일함
 
 entry:
   publish:
