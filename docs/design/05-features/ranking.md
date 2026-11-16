@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-RANK-01 ~ 03 |
+| v1.1 | 2026-11-16 | `rank:drop:closeAt` 키, dedupe Set TTL 정책, Lua KEYS·주간 키 TTL 설정 위치, 리스너 실패 정책 명시 | phase-7 구현 상세 6장 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-RANK-01: 인기 드로우 랭킹 (응모 수 기준 실시간)
@@ -23,17 +24,24 @@ if SADD rank:dedupe:{dropId} userId == 1:     # 처음 보는 응모만
     ZINCRBY rank:user:weekly:{week} 1 userId   # week = appliedAt 기준 ISO 주차 (Asia/Seoul)
     ZINCRBY rank:user:all 1 userId
 ```
-- 위 4개 명령은 **Lua 하나로 원자 실행** (dedupe 와 증가 사이 장애 시 누락 방지)
+- 위 명령은 **`rank.lua` 하나로 원자 실행** (dedupe 와 증가 사이 장애 시 누락 방지)
+  - KEYS: `rank:dedupe:{dropId}`, `rank:drop:popular`, `rank:user:weekly:{week}`, `rank:user:all`, `rank:drop:closeAt`
+  - 같은 스크립트 안에서 주간 키 TTL(35일)과 dedupe Set TTL 을 설정한다
+- **dedupe Set TTL**: `closeAt + 7일` (최소 1일 보장). closeAt 을 아직 모르면(`drop.created` 미수신) 30일
 - 주차 기준은 처리 시각이 아니라 **이벤트의 `appliedAt`** → 컨슈머 지연이 있어도 올바른 주에 집계
-- 주간 키 TTL: 5주 (지난 주 랭킹 조회 가능하게 일부 보관)
+- 주간 키 TTL: 35일 (지난 주 랭킹 조회 가능하게 일부 보관)
 - dedupe 기준 `(dropId, userId)` 는 요구사항(1인 1드로우 1응모)과 정확히 일치하므로 별도 eventId 가 필요 없다
 
 ### 표시 정보
-- `drop.created` 소비 → `HSET rank:drop:info dropId title`
+- `drop.created` 소비 → `HSET rank:drop:info dropId title`, `HSET rank:drop:closeAt dropId closeAtEpochMs`
+  - closeAt 은 "진행 중 드로우만" 필터(기본안 — 7단계에서 확정)와 dedupe TTL 계산에 쓴다
 - `user.registered` 소비 → `HSET rank:user:info userId nickname`
-- 조회 시 ZSet 상위 N + Hash 로 이름 조인
+- 조회 시 ZSet 상위 N + Hash 로 이름 조인 (닉네임이 없으면 `user-{id}` 로 표시)
 
-### API (공개)
+### 리스너 실패 처리
+- 3회 재시도 후 로그를 남기고 건너뛴다 (DLT 없음). 랭킹은 응모의 진실의 원천이 아니며, 누락은 Kafka 오프셋 리셋 재집계로 복구한다.
+
+### API (`/users/me` 를 제외하고 공개 — 인증 제외 경로는 [architecture.md](../02-architecture/architecture.md) 6장)
 | Method | Path | 설명 |
 |--------|------|------|
 | GET | `/api/rankings/drops?size=10` | 인기 드로우 Top N |

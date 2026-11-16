@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | 전체 |
 | v1.1 | 2026-11-16 | entries.entry_seq 의미 변경 (1..M 연속 → 고유·빈 번호 허용) | NFR-03 |
+| v1.2 | 2026-11-16 | `draw_results.published` 추가, 스키마는 Flyway 로 관리하며 CHECK 제약을 둔다는 원칙 추가 | phase-0·2·4·5 구현 상세 6장 |
 
 ## 쉬운 설명
 > 서비스마다 장부(DB)가 따로 있어요. 장부끼리는 선(외래키)으로 연결하지 않고, 번호(id)만 적어서 서로를 가리켜요.
@@ -13,7 +14,8 @@
 ## 원칙
 - **Database per Service**: user_db / product_db / entry_db / coupon_db. queue·ranking 은 Redis 만 사용.
 - **서비스 간 FK 없음**: `entries.user_id`, `entries.drop_id` 등은 논리 참조. 존재 보장은 발행 측 책임.
-- **중복 방지 최종 방어선은 DB UNIQUE**: Redis 판정이 1차, 유니크 제약이 2차 (컨슈머 멱등성).
+- **중복 방지 최종 방어선은 DB UNIQUE**: Redis 판정이 1차, 유니크 제약이 2차 (컨슈머 멱등성). 컨슈머 저장은 `INSERT ... ON CONFLICT DO NOTHING` 으로 한다.
+- **스키마는 Flyway 마이그레이션으로 관리**하고 `ddl-auto: validate` 로 엔티티와 일치만 검사한다. 값 범위(예: `entry_capacity >= winner_count >= 1`)는 DB `CHECK` 제약으로도 막는다.
 
 ---
 
@@ -84,6 +86,7 @@ erDiagram
         int applicant_count
         int winner_count "실제 당첨 수 = min(K, 응모자)"
         timestamp drawn_at
+        boolean published "draw.completed 발행 완료 여부 (false 면 재발행 대상)"
     }
 ```
 **읽는 법**

@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | 설계 반영 완료 표시 |
 
 ---
 
@@ -719,10 +720,10 @@ public class DrawCompletedListener {
 ### 설계 수정 필요
 | 대상 문서 | 내용 |
 |-----------|------|
-| [erd.md](../../design/06-erd/erd.md) entry_db | `draw_results.published BOOLEAN` 추가 — 커밋 후 `draw.completed` 발행 실패 시 재발행 대상 식별용 |
-| [draw.md](../../design/05-features/draw.md) 3장 | 추첨 트랜잭션 순서: `CLOSING → DRAWN` 조건부 UPDATE 를 **첫 문장**으로 (다중 인스턴스 동시 추첨 방지용 행 잠금). 발행 실패 시 재발행(스케줄러) 추가 |
-| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.2 | `DrawTransaction`, `SeedGenerator`, `DrawOutcome` 추가. `DrawService` 메서드명 `drawIfReady` → `drawReadyDrops` + `republishUnpublished`. `DrawResultController.myResult` 제거 (4단계 `EntryController` 의 `/me` 재사용) |
-| [architecture.md](../../design/02-architecture/architecture.md) 6장 | D5-2 가 (a) 이면 인증 제외 경로에 `GET /api/entries/drops/*/result` 추가 |
+| [erd.md](../../design/06-erd/erd.md) entry_db | `draw_results.published BOOLEAN` 추가 — 커밋 후 `draw.completed` 발행 실패 시 재발행 대상 식별용 → 설계 반영 완료 (2026-11-16) |
+| [draw.md](../../design/05-features/draw.md) 3장 | 추첨 트랜잭션 순서: `CLOSING → DRAWN` 조건부 UPDATE 를 **첫 문장**으로 (다중 인스턴스 동시 추첨 방지용 행 잠금). 발행 실패 시 재발행(스케줄러) 추가 → 설계 반영 완료 (2026-11-16) |
+| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.2 | `DrawTransaction`, `SeedGenerator`, `DrawOutcome` 추가. `DrawService` 메서드명 `drawIfReady` → `drawReadyDrops` + `republishUnpublished`. `DrawResultController.myResult` 제거 (4단계 `EntryController` 의 `/me` 재사용) → 설계 반영 완료 (2026-11-16) |
+| [architecture.md](../../design/02-architecture/architecture.md) 6장 | D5-2 가 (a) 이면 인증 제외 경로에 `GET /api/entries/drops/*/result` 추가 → 설계 반영 완료 (2026-11-16) |
 
 ### 리스크
 - **응모자 수가 매우 큰 경우**: 전체 userId 를 메모리에 올려 셔플한다. M 이 수십만 이상이면 부분 셔플(K 개 인덱스만 뽑기)로 바꿔야 한다. 현재 범위(수천~수만)는 문제 없음.

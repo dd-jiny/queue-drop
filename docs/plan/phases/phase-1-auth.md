@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | 관리자 계정 생성(ADMIN_EMAIL / ADMIN_PASSWORD 기동 시 생성) 확정 및 구현 상세·테스트·커밋 추가, 설계 반영 완료 표시 |
 
 ---
 
@@ -46,6 +47,7 @@ user-service/
     │   ├── application/
     │   │   ├── service/UserService.java
     │   │   ├── dto/
+    │   │   │   ├── CreateAdminCommand.java
     │   │   │   ├── SignupCommand.java
     │   │   │   ├── SignupResult.java
     │   │   │   ├── LoginCommand.java
@@ -71,6 +73,9 @@ user-service/
     │   │   ├── messaging/KafkaUserEventPublisher.java
     │   │   └── config/ClockConfig.java
     │   └── presentation/
+    │       ├── bootstrap/
+    │       │   ├── AdminAccountProperties.java
+    │       │   └── AdminAccountInitializer.java
     │       └── api/
     │           ├── UserController.java
     │           ├── GlobalExceptionHandler.java          # 0단계 산출물
@@ -95,6 +100,8 @@ user-service/
         ├── infrastructure/persistence/UserRepositoryImplTest.java
         ├── infrastructure/security/JwtTokenIssuerTest.java
         ├── presentation/api/UserControllerTest.java
+        ├── presentation/bootstrap/AdminAccountInitializerTest.java
+        ├── AdminBootstrapIntegrationTest.java
         └── SignupIntegrationTest.java
 
 gateway/
@@ -265,6 +272,11 @@ public class User {
         return new User(null, email, passwordHash, nickname, Role.USER, now);
     }
 
+    /** 관리자 계정 생성. 기동 시 초기화에서만 사용 (일반 가입 경로로는 ADMIN 을 만들 수 없다) */
+    public static User registerAdmin(Email email, String passwordHash, String nickname, Instant now) {
+        return new User(null, email, passwordHash, nickname, Role.ADMIN, now);
+    }
+
     /** 영속 데이터로부터 복원 (Mapper 전용) */
     public static User reconstitute(Long id, Email email, String passwordHash,
                                     String nickname, Role role, Instant createdAt) {
@@ -330,6 +342,9 @@ public record SignupCommand(String email, String rawPassword, String nickname) {
 ```
 ```java
 public record LoginCommand(String email, String rawPassword) {}
+```
+```java
+public record CreateAdminCommand(String email, String rawPassword, String nickname) {}
 ```
 ```java
 package com.queuedrop.user.application.dto;
@@ -454,6 +469,31 @@ public class UserService {
 
         IssuedToken token = tokenIssuer.issue(new TokenSubject(user.getId(), user.getRole().name()));
         return new LoginResult(token.value(), "Bearer", token.expiresInSeconds());
+    }
+
+    /**
+     * 관리자 계정이 없으면 생성한다. 기동 시 초기화 러너에서 호출.
+     * @return 새로 만들었으면 true, 같은 이메일 계정이 이미 있으면 false (기존 계정의 역할은 바꾸지 않는다)
+     */
+    @Transactional
+    public boolean createAdminIfAbsent(CreateAdminCommand command) {
+        Email email = toEmail(command.email(), UserErrorCode.INVALID_EMAIL);
+        if (userRepository.existsByEmail(email)) {
+            return false;
+        }
+        User admin;
+        try {
+            admin = User.registerAdmin(email, passwordEncoder.encode(command.rawPassword()),
+                                       command.nickname(), clock.instant());
+        } catch (InvalidNicknameException e) {
+            throw new ApplicationException(UserErrorCode.INVALID_NICKNAME, e);
+        }
+        try {
+            userRepository.save(admin);
+        } catch (DuplicateEmailException e) {          // 인스턴스 여러 대가 동시에 기동한 경우
+            return false;
+        }
+        return true;                                    // 관리자는 랭킹 대상이 아니므로 user.registered 를 발행하지 않는다 (구현 결정)
     }
 
     private Email toEmail(String raw, UserErrorCode onInvalid) {
@@ -701,6 +741,10 @@ queuedrop:
     secret: ${JWT_SECRET:queue-drop-local-development-secret-key-0123456789}   # gateway 와 동일해야 함
     issuer: queue-drop
     access-token-ttl: 1h
+  admin:
+    email: ${ADMIN_EMAIL:}            # 비어 있으면 관리자 생성 건너뜀
+    password: ${ADMIN_PASSWORD:}
+    nickname: ${ADMIN_NICKNAME:admin}
 ```
 
 ### 3.6 user-service — presentation
@@ -759,6 +803,54 @@ public class UserController {
     }
 }
 ```
+
+#### 관리자 계정 초기화 (확정, 2026-11-16)
+기동 시 `ADMIN_EMAIL` / `ADMIN_PASSWORD` 가 있으면 관리자 계정을 **없을 때만** 만든다. 드로우·쿠폰 이벤트 등록(ADMIN 권한)의 전제.
+
+```java
+package com.queuedrop.user.presentation.bootstrap;
+
+@ConfigurationProperties(prefix = "queuedrop.admin")
+public record AdminAccountProperties(String email, String password, String nickname) {
+    public boolean enabled() { return email != null && !email.isBlank(); }
+}
+```
+```java
+package com.queuedrop.user.presentation.bootstrap;
+
+import com.queuedrop.user.application.dto.CreateAdminCommand;
+import com.queuedrop.user.application.service.UserService;
+
+/** 기동이라는 '입력'을 받아 application 을 호출하는 입력 어댑터 → presentation (Scheduler·Listener 와 같은 위치) */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+@EnableConfigurationProperties(AdminAccountProperties.class)
+class AdminAccountInitializer implements ApplicationRunner {
+
+    private static final int PASSWORD_MIN = 8;
+
+    private final AdminAccountProperties properties;
+    private final UserService userService;
+
+    @Override
+    public void run(ApplicationArguments args) {
+        if (!properties.enabled()) {
+            log.info("ADMIN_EMAIL not set — skip admin bootstrap");
+            return;
+        }
+        if (properties.password() == null || properties.password().length() < PASSWORD_MIN) {
+            throw new IllegalStateException("ADMIN_PASSWORD must be at least " + PASSWORD_MIN + " characters");  // 기동 실패로 설정 오류를 빨리 드러냄
+        }
+        boolean created = userService.createAdminIfAbsent(
+                new CreateAdminCommand(properties.email(), properties.password(), properties.nickname()));
+        log.info(created ? "admin account created: {}" : "admin account already exists: {}", properties.email());
+    }
+}
+```
+- presentation 은 `CreateAdminCommand`(application DTO)만 알고 `User`/`Role`(domain)은 모른다 (R4).
+- 같은 이메일의 일반 회원이 이미 있으면 **역할을 승격하지 않고** false 를 반환한다. 권한 상승 경로를 만들지 않기 위함 (구현 결정).
+- 비밀번호 길이 검증은 회원가입과 같은 기준(8자 이상)을 러너에서 한다 — domain 은 원문 비밀번호를 받지 않는다.
 
 ### 3.7 gateway
 
@@ -1016,6 +1108,11 @@ public ResponseEntity<EntryApplyResponse> apply(@PathVariable Long dropId,
 | T1-24 | gateway 단위 | `JwtAuthenticationFilterTest` | Given 공개 경로 `GET /api/products/drops`, 토큰 없음 / 잘못된 토큰 / Then 체인 호출, 사용자 헤더 없음 | REQ-USER-03 |
 | T1-25 | gateway 통합 | `JwtAuthenticationFilterTest` (두 필터를 순서대로 연결) | Given 유효 토큰(sub=42) + 위조 `X-User-Id: 1` / Then 최종 `X-User-Id` = 42 (값 1개) | REQ-USER-03 |
 | T1-26 | gateway 단위 | `PublicPathMatcherTest` | `GET /api/rankings/users/weekly` → 공개, `GET /api/rankings/users/me` → 보호, `POST /api/products/drops/1/republish` → 보호, `GET /api/products/drops/1` → 공개 | REQ-USER-03 |
+| T1-27 | domain 단위 | `UserTest` | When `User.registerAdmin` / Then role=ADMIN, id=null, 닉네임 규칙 동일 적용 | REQ-DROP-01 (관리자 전제) |
+| T1-28 | application 단위 | `UserServiceTest` | Given 빈 저장소 / When `createAdminIfAbsent` 2회 / Then 1회차 true(ADMIN 1건, 해시 저장), 2회차 false, `user.registered` 이벤트 0건 | REQ-DROP-01 |
+| T1-29 | application 단위 | `UserServiceTest` | Given 같은 이메일의 USER 계정 존재 / When `createAdminIfAbsent` / Then false, 기존 계정 role=USER 유지 (승격 없음) | REQ-DROP-01 |
+| T1-30 | presentation 단위 | `AdminAccountInitializerTest` | Given email 빈 값 / Then `UserService` 호출 없음. Given 비밀번호 7자 / Then `IllegalStateException` | REQ-DROP-01 |
+| T1-31 | 통합 | `AdminBootstrapIntegrationTest` (`@SpringBootTest` + PG, `queuedrop.admin.*` 프로퍼티 지정) | When 기동 후 해당 계정으로 login / Then 토큰 role claim = ADMIN, users 에 ADMIN 1행. 컨텍스트 재기동 시에도 1행 | REQ-DROP-01 |
 
 **테스트 지원**
 - `TestTokens`(gateway test): 테스트용 secret 으로 jjwt 를 직접 사용해 유효/만료/위조 토큰을 만든다. user-service 코드에 의존하지 않는다.
@@ -1033,11 +1130,12 @@ public ResponseEntity<EntryApplyResponse> apply(@PathVariable Long dropId,
 | 4 | `feat(user): BCrypt 비밀번호 인코더와 JWT 발급 어댑터 추가` | security, ClockConfig, build.gradle(jjwt, crypto), T1-12~13 |
 | 5 | `feat(user): 커밋 후 user.registered 이벤트 발행` | messaging, build.gradle(kafka), yml |
 | 6 | `feat(user): 회원가입·로그인 API 추가` | presentation, T1-14~16·17, T1-18 |
-| 7 | `feat(gateway): 클라이언트 사용자 헤더 제거 필터 추가` | HeaderSanitizeFilter, T1-19 |
-| 8 | `feat(gateway): JWT 검증 필터와 인증 제외 경로 추가` | auth/*, filter/JwtAuthenticationFilter, config/*, yml, T1-20~26 |
-| 9 | `chore: JWT_SECRET 환경변수 예시 추가` | `.env.example` |
+| 7 | `feat(user): 기동 시 관리자 계정 생성` | `User.registerAdmin`, `UserService.createAdminIfAbsent`, `presentation/bootstrap/*`, yml, T1-27~31 |
+| 8 | `feat(gateway): 클라이언트 사용자 헤더 제거 필터 추가` | HeaderSanitizeFilter, T1-19 |
+| 9 | `feat(gateway): JWT 검증 필터와 인증 제외 경로 추가` | auth/*, filter/JwtAuthenticationFilter, config/*, yml, T1-20~26 |
+| 10 | `chore: JWT_SECRET·ADMIN 계정 환경변수 예시 추가` | `.env.example` (`JWT_SECRET`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`) |
 
-커밋 본문 예시 (#8):
+커밋 본문 예시 (#9):
 ```
 feat(gateway): JWT 검증 필터와 인증 제외 경로 추가
 
@@ -1051,20 +1149,22 @@ feat(gateway): JWT 검증 필터와 인증 제외 경로 추가
 
 ## 6. 결정 필요 · 리스크
 
+### 결정 사항 (확정)
+| 항목 | 결정 | 포기한 대안 |
+|------|------|-------------|
+| 관리자(ADMIN) 계정 생성 | **user-service 기동 시 환경변수(`ADMIN_EMAIL`, `ADMIN_PASSWORD`)로 없으면 생성** (2026-11-16 확정, 3.6 "관리자 계정 초기화") | Flyway 시드 SQL(비밀번호 해시를 SQL 에 고정) / DB 직접 UPDATE |
+
 ### 결정 필요
 | 항목 | 기본안 | 대안 |
 |------|--------|------|
-| 관리자(ADMIN) 계정 생성 | **user-service 기동 시 환경변수(`ADMIN_EMAIL`, `ADMIN_PASSWORD`)로 없으면 생성하는 초기화 러너** (presentation `bootstrap` 패키지 → `UserService.createAdminIfAbsent`) | Flyway 시드 SQL(비밀번호 해시를 SQL 에 고정) / 관리자 API 없이 DB 직접 UPDATE |
 | Access token 만료 | 1시간 | 더 짧게 + Refresh token (범위 증가) |
-
-> 관리자 계정 생성 방식은 2단계(관리자만 드로우 등록)부터 필요하다. 1단계에서 확정해 함께 구현하는 것을 권장.
 
 ### 설계 수정 필요
 | 문서 | 내용 |
 |------|------|
-| [architecture.md](../../design/02-architecture/architecture.md) 6장 | 인증 제외 경로에 `GET /api/coupons/events/{eventId}`(coupon-issue.md 에서 "공개"), `GET /api/entries/drops/{dropId}/result`(추첨 요약), `/actuator/health` 추가 / "공개 경로에서 잘못된 토큰은 익명 처리" 규칙 명시 |
-| [architecture.md](../../design/02-architecture/architecture.md) 6장 | JWT 세부(iss, 만료 1시간, 비밀키 32바이트 이상, Refresh 없음) 기록 |
-| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.1 | user-service application 에 `exception/UserErrorCode`, port 의 `TokenSubject`·`IssuedToken`·`UserRegisteredPayload`, domain `exception` 패키지 반영 / gateway 2.6 에 `PublicPathMatcher`, `ErrorResponseWriter`, `GatewayErrorCode` 추가 |
+| [architecture.md](../../design/02-architecture/architecture.md) 6장 | 인증 제외 경로에 `GET /api/coupons/events/{eventId}`(coupon-issue.md 에서 "공개"), `GET /api/entries/drops/{dropId}/result`(추첨 요약), `/actuator/health` 추가 / "공개 경로에서 잘못된 토큰은 익명 처리" 규칙 명시 → 설계 반영 완료 (2026-11-16) |
+| [architecture.md](../../design/02-architecture/architecture.md) 6장 | JWT 세부(iss, 만료 1시간, 비밀키 32바이트 이상, Refresh 없음) 기록 → 설계 반영 완료 (2026-11-16) |
+| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.1 | user-service application 에 `exception/UserErrorCode`, port 의 `TokenSubject`·`IssuedToken`·`UserRegisteredPayload`, domain `exception` 패키지 반영 / gateway 2.6 에 `PublicPathMatcher`, `ErrorResponseWriter`, `GatewayErrorCode` 추가 → 설계 반영 완료 (2026-11-16) |
 
 ### 리스크
 - **`user.registered` 유실**: 커밋 후 비동기 발행이라 브로커 장애 시 랭킹 닉네임이 빠진다. 랭킹 조회 시 닉네임이 없으면 `"user-{id}"` 로 표시하는 대비를 7단계에 둔다. 확실하게 하려면 Outbox (범위 밖).
@@ -1089,5 +1189,5 @@ feat(gateway): JWT 검증 필터와 인증 제외 경로 추가
 | (추가) 공개 경로 판단 | T1-24, T1-26 |
 | (추가) 계층 규칙 통과 | T1-18 |
 | 공통: `./gradlew build` 통과 | 전체 |
-| 결정 필요(관리자 계정 생성) 확정 및 반영 | 6장 |
+| 관리자 계정 생성 (확정 사항 구현) | T1-27 ~ T1-31 |
 | 설계 수정 필요 3건 설계 문서 반영 | 6장 |

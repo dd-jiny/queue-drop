@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 | 전체 |
 | v1.1 | 2026-11-16 | 서비스 내부 계층 구조 문서 링크 추가 | layered-architecture.md |
 | v1.2 | 2026-11-16 | Redis 키 `entry:{dropId}:seq` 추가 | NFR-03 |
+| v1.3 | 2026-11-16 | DLT 토픽·컨슈머 실패 정책, Redis 키(`queue:active-drops`, `queue:admission:gate`, `rank:drop:closeAt`) 추가, 인증 제외 경로 구체화·JWT 세부·관리자 시드 추가 | phase-1·3·4·7·8 구현 상세 6장, REQ-USER-04 |
 
 ---
 
@@ -77,8 +78,10 @@ flowchart LR
 | `entry.created` | entry | entry(저장), ranking | eventId, dropId, userId, entrySeq, appliedAt | `dropId:userId` |
 | `draw.completed` | entry | product | dropId, applicantCount, winnerCount, drawnAt | dropId |
 | `coupon.issued` | coupon | coupon(저장) | eventId, couponEventId, userId, issuedAt | `couponEventId:userId` |
+| `drop.created.DLT` / `entry.created.DLT` / `coupon.issued.DLT` | (DLT) | 운영자 재처리 | 원본과 동일 | 원본과 동일 |
 
 - 이벤트 스키마는 `common` 모듈에 둔다.
+- **컨슈머 실패 정책**: DB 에 저장하는 컨슈머(entry 의 `drop.created`·`entry.created`, coupon 의 `coupon.issued`)는 1초 간격 3회 재시도 후 `{topic}.DLT` 로 보낸다. Redis 만 쓰는 컨슈머(queue, ranking)와 product 의 `draw.completed` 는 3회 재시도 후 로그를 남기고 건너뛴다. 토픽 자동 생성이 꺼져 있으므로 DLT 도 미리 생성한다 ([infrastructure.md](../03-infrastructure/infrastructure.md) 5장).
 - 모든 컨슈머는 **at-least-once 전제로 멱등**하게 처리한다 (DB 유니크 제약 / Redis dedupe Set).
 - `entry.created` 키를 `dropId` 단독으로 두면 인기 드로우 하나가 한 파티션에 몰리므로 `dropId:userId` 로 분산. 드로우 내 순서는 `entrySeq` 가 보장하므로 파티션 순서에 의존하지 않는다.
 
@@ -90,6 +93,8 @@ flowchart LR
 | `queue:{dropId}:seq` | String | queue | queue | 대기열 진입 순번 발급 카운터 |
 | `queue:{dropId}:waiting` | ZSet | queue | queue | member=userId, score=진입 순번 |
 | `queue:{dropId}:token:{userId}` | String(TTL) | queue | **entry** | 입장 토큰 (존재 = 유효) |
+| `queue:active-drops` | ZSet | queue | queue | member=dropId, score=closeAt — 입장 스케줄러 대상 조회용 인덱스 (`KEYS`/`SCAN` 금지) |
+| `queue:admission:gate` | String(PX) | queue | queue | 입장 스케줄러 주기당 1회 실행 게이트 (`SET NX PX`, 해제하지 않음) |
 | `entry:{dropId}:meta` | Hash | entry | entry | state(OPEN/CLOSED), capacity, openAt, closeAt |
 | `entry:{dropId}:remaining` | String | entry | entry, **queue** | 잔여 응모 정원 |
 | `entry:{dropId}:applicants` | Set | entry | entry | 응모자 userId (중복 방지) |
@@ -102,6 +107,7 @@ flowchart LR
 | `rank:user:all` | ZSet | ranking | ranking | member=userId, score=누적 응모 수 |
 | `rank:dedupe:{dropId}` | Set | ranking | ranking | 이미 집계한 userId (멱등 처리) |
 | `rank:drop:info` / `rank:user:info` | Hash | ranking | ranking | 표시용 드로우 제목 / 닉네임 |
+| `rank:drop:closeAt` | Hash | ranking | ranking | dropId → closeAt(epoch ms) — 진행 중 드로우 필터, dedupe TTL 계산 |
 
 > **규칙**: 다른 서비스 소유 키는 **읽기만** 한다. 키 구조 변경 시 이 표와 읽는 서비스를 함께 수정한다.
 
@@ -111,9 +117,23 @@ flowchart LR
 > 로그인하면 신분증(JWT)을 받고, 정문(Gateway)이 매번 그 신분증을 확인한 뒤 "이 사람은 3번 회원이에요"라는 메모를 붙여 창구로 보내요.
 
 **상세 설명**
-- user-service 가 로그인 성공 시 JWT 발급 (HS256, claims: `sub=userId`, `role=USER|ADMIN`, 만료 시간)
+- user-service 가 로그인 성공 시 JWT 발급 (HS256, claims: `iss=queue-drop`, `sub=userId`, `role=USER|ADMIN`, `iat`, `exp`)
+  - 만료 1시간, Refresh token 없음
+  - 비밀키 `JWT_SECRET`(32바이트 이상)을 user-service(서명)와 gateway(검증)가 공유. 기동 시 길이 검증
 - Gateway 의 GlobalFilter 가 `Authorization: Bearer` 검증 → `X-User-Id`, `X-User-Role` 헤더 주입
 - **클라이언트가 보낸 `X-User-*` 헤더는 Gateway 에서 항상 제거** (헤더 위조 방지)
-- 인증 제외 경로: 회원가입, 로그인, 드로우 목록/상세 조회, 랭킹 조회
-- 관리자 API 는 각 서비스가 `X-User-Role == ADMIN` 확인
+- **필터 순서**: ① 클라이언트 `X-User-*` 헤더 제거 → ② JWT 검증·헤더 주입 (제거가 항상 먼저)
+- 인증 제외 경로 (경로를 한정한다 — 예: `/api/rankings/**` 전체를 공개하면 `/api/rankings/users/me` 에 `X-User-Id` 가 주입되지 않는다)
+
+  | Method | Path |
+  |--------|------|
+  | POST | `/api/users/signup`, `/api/users/login` |
+  | GET | `/api/products/drops`, `/api/products/drops/{dropId}` |
+  | GET | `/api/rankings/drops`, `/api/rankings/users/weekly`, `/api/rankings/users/all` |
+  | GET | `/api/coupons/events/{eventId}` |
+  | GET | `/api/entries/drops/{dropId}/result` (추첨 요약 — 공개 범위는 5단계에서 확정, 기본안 공개) |
+  | GET | `/actuator/health` |
+- 인증 제외 경로의 토큰 처리: 토큰 없음 → 익명 통과 / 유효 → 헤더 주입 / **잘못되거나 만료된 토큰 → 익명 통과** (공개 API 는 토큰 상태와 무관하게 응답)
+- 관리자 API 는 각 서비스가 `X-User-Role == ADMIN` 확인 (presentation 은 헤더를 전달만 하고, 판단은 application)
+- **관리자 계정 (REQ-USER-04)**: user-service 기동 시 환경변수 `ADMIN_EMAIL` / `ADMIN_PASSWORD` 가 있으면, 해당 이메일 계정이 없을 때만 ADMIN 으로 생성한다 (회원가입 API 는 USER 만 생성)
 - 내부 서비스 포트는 docker 네트워크 내부에만 노출하는 것을 전제로 한다 (Gateway 우회 방지)

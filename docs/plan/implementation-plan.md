@@ -5,6 +5,7 @@
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 (0~8단계) |
 | v1.1 | 2026-11-16 | 단계별 구현 상세 문서(`phases/`) 추가 및 링크 |
+| v1.2 | 2026-11-16 | 확정 사항 반영: Flyway, 커밋 후 발행 방식(afterCommit), 동기 발행 정책(애플리케이션 재시도 없음), DLT, 관리자 계정 생성, 저장 전 Redis 확인(응모·쿠폰). 미결정 표 갱신 |
 
 ---
 
@@ -109,15 +110,16 @@ flowchart LR
   - [ ] 공통 에러 응답 형식 + `@RestControllerAdvice` 기본 틀
 - 인프라 (`docker-compose.yml`)
   - [ ] Redis AOF (`appendonly yes`, `appendfsync everysec`) + 데이터 볼륨
-  - [ ] Kafka `auto.create.topics.enable=false` + 토픽 초기화 컨테이너 (파티션 수, `entry.created` 보존 30일)
+  - [ ] Kafka `auto.create.topics.enable=false` + 토픽 초기화 컨테이너 (파티션 수, `entry.created` 보존 30일, DLT 3종 `drop.created.DLT`·`entry.created.DLT`·`coupon.issued.DLT`)
+  - [ ] Kafka producer 공통 설정: `acks=all`, 멱등, `request.timeout.ms=1000`, `delivery.timeout.ms=3000` (동기 발행은 애플리케이션 재시도 없음)
 
-**결정 필요**
-- [ ] DB 스키마 관리: `ddl-auto: update` 유지 vs **Flyway 도입** (엔티티 분리 구조라 스키마를 명시적으로 관리하는 Flyway 권장)
+**확정 (2026-11-16)**
+- [x] DB 스키마 관리: **Flyway 도입**, `ddl-auto: validate`
 
 **완료 조건**
 - [ ] 모든 모듈 `./gradlew build` 통과, 각 서비스 `ArchitectureTest` 실행됨
 - [ ] 계층 규칙을 일부러 어긴 코드를 넣으면 테스트가 실패함을 확인 (규칙이 실제로 동작하는지)
-- [ ] `docker compose up -d` 후 모든 컨테이너 healthy, 토픽 5개 생성 확인 (Kafka UI)
+- [ ] `docker compose up -d` 후 모든 컨테이너 healthy, 토픽 5개 + DLT 3개 생성 확인 (Kafka UI)
 
 ---
 
@@ -132,6 +134,7 @@ flowchart LR
   - [ ] application: `UserService`(signup, login), Command/Result, 포트 `PasswordEncoder`, `TokenIssuer`, `UserEventPublisher`, 에러 코드
   - [ ] infrastructure: `UserJpaEntity`, `UserMapper`, `UserRepositoryImpl`, BCrypt 어댑터, JWT 발급기, `user.registered` Kafka 발행
   - [ ] presentation: `UserController`(signup, login), Request/Response
+  - [ ] 관리자 계정 초기화: 기동 시 `ADMIN_EMAIL` / `ADMIN_PASSWORD` 가 있으면 ADMIN 계정을 없을 때만 생성 (확정, 2026-11-16)
 - gateway
   - [ ] 클라이언트가 보낸 `X-User-*` 헤더 제거 필터
   - [ ] JWT 검증 필터 → `X-User-Id`, `X-User-Role` 주입
@@ -142,6 +145,7 @@ flowchart LR
 - [ ] 단위: `Email` 형식 검증, 중복 이메일 가입 거부, 비밀번호 불일치 로그인 실패
 - [ ] 통합: 가입 → DB 저장 + `user.registered` 발행 확인 (Testcontainers)
 - [ ] gateway: 토큰 없음/만료/위조 → 401, 정상 토큰 → 헤더 주입, **클라이언트가 보낸 `X-User-Id` 가 제거됨**
+- [ ] 관리자: 환경변수로 기동 → ADMIN 로그인 토큰의 role = ADMIN, 재기동해도 1계정
 
 ---
 
@@ -153,11 +157,11 @@ flowchart LR
 **작업**
 - [ ] domain: `Product`, `Drop`(생성 검증 M ≥ K ≥ 1, openAt < closeAt, `status(now)`, `markDrawn()`), `DropStatus`, Repository(I) 2개
 - [ ] application: `ProductService`, `DropService`(register, republish), `DropQueryService`, 포트 `DropEventPublisher`, 관리자 권한 검사
-- [ ] infrastructure: JPA 엔티티·Mapper·Repository 구현, `AFTER_COMMIT` 이벤트 발행 + 재시도
+- [ ] infrastructure: JPA 엔티티·Mapper·Repository 구현, 발행 어댑터 안의 `TransactionSynchronization.afterCommit` 발행 (1단계와 같은 패턴, producer 내부 재시도)
 - [ ] presentation: `ProductController`, `DropController` (API 5개)
 
-**결정 필요**
-- [ ] 드로우 이벤트 발행 방식: **AFTER_COMMIT + 재발행 API** (기본안) vs Outbox
+**확정 (2026-11-16)**
+- [x] 드로우 이벤트 발행 방식: **afterCommit 발행 + 재발행 API** (Outbox 미사용)
 
 **완료 조건**
 - [ ] 단위: `Drop.status(now)` 경계값 (openAt 직전/정각, closeAt 직전/정각), 생성 검증 실패 케이스
@@ -203,17 +207,17 @@ flowchart LR
 - 응모
   - [ ] domain: `Entry`, `EntryStatus`, `ApplyOutcome`, `EntryRepository`(I)
   - [ ] application: `EntryApplyService`, 포트 `EntryGate`, `EntryEventPublisher`, 에러 코드 (`CLOSED` / `NO_TOKEN` / `DUPLICATE` / `SOLD_OUT` / `TEMPORARILY_FAILED`)
-  - [ ] infrastructure: `apply.lua` (마감·토큰·중복·잔여 검사 → `DECR` + `SADD` + **`INCR seq`**), `compensate.lua`, `KafkaEntryEventPublisher` (`acks=all`, 동기 확인, 재시도 2회)
+  - [ ] infrastructure: `apply.lua` (마감·토큰·중복·잔여 검사 → `DECR` + `SADD` + **`INCR seq`**), `compensate.lua`, `KafkaEntryEventPublisher` (`acks=all`, 동기 확인 3.5초, **애플리케이션 재시도 없음** — producer 내부 재시도 + `delivery.timeout.ms=3000`)
   - [ ] presentation: `EntryController` (응모 → 202)
 - 저장
   - [ ] application: `EntrySaveService` (**저장 전 Redis 응모자 확인**, 유니크 위반 무시)
   - [ ] infrastructure: `EntryJpaEntity`(UK 2개), Mapper, Repository 구현
-  - [ ] presentation: `EntryCreatedListener`
+  - [ ] presentation: `EntryCreatedListener` (3회 재시도 후 `entry.created.DLT`)
 - 조회
   - [ ] `EntryQueryService`, 내 응모 목록 / 특정 드로우 내 응모 (DB 에 없으면 Redis 로 보완)
 
-**결정 필요**
-- [ ] 컨슈머 저장 전 Redis 응모자 확인 → 기본안 확정 여부
+**확정 (2026-11-16)**
+- [x] 컨슈머 저장 전 Redis 응모자 확인 (없으면 저장 스킵)
 
 **완료 조건**
 - [ ] 통합(Lua): 결과 5가지(OK / CLOSED / NO_TOKEN / DUPLICATE / SOLD_OUT)가 각각 올바르게 나옴
@@ -261,9 +265,9 @@ flowchart LR
 
 **작업**
 - [ ] domain: `CouponEvent`, `IssuedCoupon`, `IssueOutcome`, Repository(I) 2개
-- [ ] application: `CouponEventService`, `CouponIssueService`, `CouponSaveService`, `CouponQueryService`, 포트 `CouponGate`, `CouponEventPublisher`
-- [ ] infrastructure: `issue.lua`, `compensate.lua`, JPA, `coupon.issued` 발행
-- [ ] presentation: `CouponEventController`, `CouponController`, `CouponIssuedListener`
+- [ ] application: `CouponEventService`, `CouponIssueService`, `CouponSaveService`(**저장 전 Redis 발급 확인 필수**), `CouponQueryService`, 포트 `CouponGate`, `CouponEventPublisher`
+- [ ] infrastructure: `issue.lua`, `compensate.lua`, JPA, `coupon.issued` 발행 (4단계와 같은 동기 발행 정책)
+- [ ] presentation: `CouponEventController`, `CouponController`, `CouponIssuedListener` (3회 재시도 후 `coupon.issued.DLT`)
 
 > 응모(4단계)와 판정 패턴이 같다. Lua 실행·발행·보상 흐름을 공통 컴포넌트로 뽑을지는 4단계 구현 후 중복 정도를 보고 결정한다.
 
@@ -272,6 +276,7 @@ flowchart LR
 - [ ] 동시성: 같은 사용자 10번 동시 요청 → 1매
 - [ ] 발급 시작 전 요청 → `NOT_STARTED`
 - [ ] 발행 실패 → 보상 후 원상복구
+- [ ] 유령 이벤트(보상 후 실제로 기록된 발급) → DB 에 남지 않음, 초과 발급 없음
 
 ---
 
@@ -320,11 +325,15 @@ flowchart LR
 ---
 
 ## 4. 미결정 사항 처리 시점
-| 항목 | 처리 단계 | 기본안 |
-|------|-----------|--------|
-| DB 스키마 관리 (ddl-auto vs Flyway) | 0단계 | Flyway |
-| 드로우 이벤트 발행 방식 | 2단계 | AFTER_COMMIT + 재발행 API |
-| 컨슈머 저장 전 Redis 응모자 확인 | 4단계 | 확인 후 없으면 저장 스킵 |
-| 추첨 건수 불일치 장기화 | 5단계 | 경고 후 관리자 수동 확정 |
-| 인기 드로우 랭킹 범위 | 7단계 | 진행 중 드로우만 |
-| 랭킹 동점 처리 | 7단계 | member 사전순 |
+| 항목 | 처리 단계 | 기본안 / 결정 | 상태 |
+|------|-----------|---------------|------|
+| DB 스키마 관리 (ddl-auto vs Flyway) | 0단계 | Flyway, `ddl-auto: validate` | ✅ 확정 (2026-11-16) |
+| Kafka 동기 발행 정책 (응모·쿠폰) | 0·4·6단계 | 애플리케이션 재시도 없음, producer 내부 재시도 + `delivery.timeout.ms=3000`, `get` 3.5초 | ✅ 확정 (2026-11-16) |
+| 저장 컨슈머 실패 처리 | 0·4·6단계 | 3회 재시도 후 `{topic}.DLT` (랭킹은 로그·스킵) | ✅ 확정 (2026-11-16) |
+| 관리자 계정 생성 | 1단계 | 기동 시 `ADMIN_EMAIL`/`ADMIN_PASSWORD` 로 없으면 생성 | ✅ 확정 (2026-11-16) |
+| 드로우 이벤트 발행 방식 | 2단계 | 발행 어댑터 안의 afterCommit 발행 + 재발행 API | ✅ 확정 (2026-11-16) |
+| 컨슈머 저장 전 Redis 응모자 확인 | 4단계 | 확인 후 없으면 저장 스킵 | ✅ 확정 (2026-11-16) |
+| 쿠폰 저장 전 Redis 발급 확인 | 6단계 | 확인 후 없으면 저장 스킵 (초과 발급 방지) | ✅ 확정 (2026-11-16) |
+| 추첨 건수 불일치 장기화 | 5단계 | 경고 후 관리자 수동 확정 | 미결정 |
+| 인기 드로우 랭킹 범위 | 7단계 | 진행 중 드로우만 | 미결정 |
+| 랭킹 동점 처리 | 7단계 | member 사전순 | 미결정 |

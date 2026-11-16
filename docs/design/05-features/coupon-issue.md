@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-COUPON-01 ~ 05 |
+| v1.1 | 2026-11-16 | 저장 전 Redis 확인(필수) 추가, 발행 재시도를 producer 내부 멱등 재시도로 변경, Lua 결과 `NOT_FOUND`·재초기화 API·DLT 추가 | NFR-01·03, phase-6 구현 상세 6장 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-COUPON-01: 쿠폰 이벤트 등록 (총 수량, 발급 시작 시각)
@@ -22,6 +23,7 @@
 ### 발급 Lua
 | 순서 | 검사 | 실패 시 |
 |------|------|---------|
+| 0 | meta 존재 (이벤트가 Redis 에 초기화됨) | `NOT_FOUND` |
 | 1 | `now ≥ issueStartAt` | `NOT_STARTED` |
 | 2 | `SISMEMBER issued userId` == 0 | `DUPLICATE` |
 | 3 | `GET remaining` > 0 | `SOLD_OUT` |
@@ -32,14 +34,20 @@
 - 같은 서비스 내부이므로 이벤트 없이 직접 초기화. Redis 초기화 실패 시 관리자 재초기화 API 로 복구
 
 ### 발행·보상·저장
-- `coupon.issued` 동기 발행 확인 → 실패 시 보상 Lua (`SREM issued` + `INCR remaining`) → 503
-- 컨슈머: `INSERT issued_coupons`, `UNIQUE(coupon_event_id, user_id)` 위반 무시
+- `coupon.issued` 동기 발행 확인: 응모와 같은 규칙 — `get(3.5s)`, producer 내부 멱등 재시도(`acks=all`, `enable.idempotence=true`, `delivery.timeout.ms=3000`), **애플리케이션 재시도 없음** ([D2](../04-non-functional/concurrency-consistency.md))
+- 실패 시 보상 Lua (`SREM issued` 결과가 1이면 `INCR remaining`) → 503
+- 저장 컨슈머
+  1. **저장 전 Redis 확인 (필수)**: `SISMEMBER issued userId` 가 0 이면 보상된 발급(유령 이벤트)으로 보고 저장하지 않는다
+     - 쿠폰에는 추첨의 건수 비교(D6) 같은 사후 안전장치가 없다. 이 확인이 없으면 유령 이벤트가 그대로 저장되어 **수량보다 많이 발급**된다
+  2. `INSERT issued_coupons ... ON CONFLICT (coupon_event_id, user_id) DO NOTHING` (멱등)
+  3. 처리 실패 → 3회 재시도 후 `coupon.issued.DLT`
 
 ### API
 | Method | Path | 권한 | 설명 |
 |--------|------|------|------|
 | POST | `/api/coupons/events` | ADMIN | 쿠폰 이벤트 등록 |
 | GET | `/api/coupons/events/{eventId}` | 공개 | 이벤트 정보 + 잔여 수량 |
+| POST | `/api/coupons/events/{eventId}/initialize` | ADMIN | Redis 재초기화 (`SET NX`, 등록 시 초기화 실패 복구용) |
 | POST | `/api/coupons/events/{eventId}/issue` | USER | 발급 요청 → 202 |
 | GET | `/api/coupons/me` | USER | 내 쿠폰 목록 |
 
@@ -66,10 +74,10 @@ sequenceDiagram
 
     U->>CS: POST /issue
     CS->>R: EVALSHA issue.lua
-    alt NOT_STARTED / DUPLICATE / SOLD_OUT
+    alt NOT_FOUND / NOT_STARTED / DUPLICATE / SOLD_OUT
         CS-->>U: 409
     else OK
-        CS->>K: send(coupon.issued).get()
+        CS->>K: send(coupon.issued).get(3.5s)
         alt 성공
             CS-->>U: 202
         else 최종 실패
@@ -78,12 +86,14 @@ sequenceDiagram
         end
     end
     K->>C: coupon.issued
-    C->>DB: INSERT issued_coupons
+    C->>R: SISMEMBER issued (없으면 스킵)
+    C->>DB: INSERT ... ON CONFLICT DO NOTHING
 ```
 
 **읽는 법**
 - 응모 시퀀스([entry-apply.md](entry-apply.md) 5.2)와 구조가 같다 — 차이는 토큰 검사가 없고 시작 시각 검사만 있다는 점.
 - 대기열이 없으므로 **피크 요청이 전부 Redis 에 도달**한다. 판정 실패(SOLD_OUT)가 대부분인 구간에서도 Lua 가 실행된다.
+- 저장 컨슈머의 Redis 확인이 쿠폰의 **유일한 유령 이벤트 방어선**이다 (응모는 추첨 전 건수 비교가 한 번 더 있다).
 
 ### 5.2 ERD
 [erd.md](../06-erd/erd.md) 의 coupon_db (`coupon_events`, `issued_coupons`) 참고.

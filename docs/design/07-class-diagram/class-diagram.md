@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | 전체 |
 | v2.0 | 2026-11-16 | 4계층 + 엄격한 DIP + 모델 비노출 원칙으로 전면 재작성 (도메인/JPA 엔티티 분리, 포트 위치 확정) | [layered-architecture.md](../02-architecture/layered-architecture.md) |
+| v2.1 | 2026-11-16 | 단계별 구현 상세에서 구체화된 클래스·포트·메서드 반영 (EntryRepository.saveIfAbsent, DrawTransaction·SeedGenerator·DrawOutcome, DropPage·Requester, queue 포트, CouponGate, DropWindow, user·gateway 클래스), DropCreated.productId 추가, 발행 어댑터 afterCommit 구조 | phase-0~7 구현 상세 6장 |
 
 ## 쉬운 설명
 > 각 서비스는 창구(presentation) → 매니저(application) → 장인(domain) 순서로 일을 넘기고,
@@ -49,7 +50,7 @@ classDiagram
         class EntrySaveService {
             -EntryRepository entryRepository
             -EntryGate gate
-            +save(EntrySaveCommand)
+            +save(EntrySaveCommand) boolean
         }
         class EntryApplyCommand {
             <<record>>
@@ -72,6 +73,8 @@ classDiagram
             +tryApply(dropId, userId, now) GateResult
             +compensate(dropId, userId)
             +isApplicant(dropId, userId) boolean
+            +initialize(dropId, capacity, openAt, closeAt)
+            +close(dropId)
         }
         class EntryEventPublisher {
             <<interface>>
@@ -98,8 +101,9 @@ classDiagram
         }
         class EntryRepository {
             <<interface>>
-            +save(Entry) Entry
-            +existsByDropIdAndUserId(dropId, userId) boolean
+            +saveIfAbsent(Entry) boolean
+            +findByDropIdAndUserId(dropId, userId) Optional~Entry~
+            +findAllByUserId(userId) List~Entry~
         }
     }
     namespace infrastructure {
@@ -113,6 +117,7 @@ classDiagram
         class EntryRepositoryImpl {
             -EntryJpaRepository jpa
             -EntryMapper mapper
+            +saveIfAbsent() INSERT ON CONFLICT DO NOTHING
         }
         class EntryJpaEntity {
             <<Entity>>
@@ -143,7 +148,8 @@ classDiagram
 **읽는 법**
 - `EntryController` 는 `EntryApplyService` 와 Command/Result 만 안다. **domain 네임스페이스로 가는 화살표가 presentation 에 하나도 없다** (모델 비노출, ArchUnit R4).
 - `EntryApplyService`(응답 경로)는 domain 의 `EntryRepository` 를 쓰지 않는다 — 응답 경로에서 DB 를 뺀 설계([D1](../04-non-functional/concurrency-consistency.md))가 의존 그래프에 그대로 드러난다.
-- `EntrySaveService` 는 저장 전에 `EntryGate.isApplicant()` 로 보상된 응모를 걸러낸다 ([sequence-diagram.md](../08-sequence-diagram/sequence-diagram.md) 5.2).
+- `EntrySaveService` 는 저장 전에 `EntryGate.isApplicant()` 로 보상된 응모를 걸러내고(확정), `saveIfAbsent()` 로 멱등 저장한다 ([sequence-diagram.md](../08-sequence-diagram/sequence-diagram.md) 5.2). `EntrySaveService` 에는 `@Transactional` 을 두지 않는다 — 단일 `INSERT ... ON CONFLICT DO NOTHING` 이라 필요 없고, 예외 기반 중복 처리를 피한다.
+- 실패 응답은 application 예외(`EntryApplyException` + `EntryErrorCode`)로 나가고, presentation 의 `@RestControllerAdvice` 가 409/503 으로 매핑한다. `KafkaEntryEventPublisher` 는 `send().get(3.5s)` 실패를 포트 예외로 바꿔 던진다 (재시도는 producer 내부만).
 - infrastructure 의 네 클래스는 모두 **위쪽 인터페이스를 구현**하는 방향으로만 연결된다.
 
 ### 1.2 추첨 (Draw)
@@ -156,7 +162,6 @@ classDiagram
         }
         class DrawResultController {
             -DrawQueryService queryService
-            +myResult(dropId, userId) MyEntryResponse
             +summary(dropId) DrawSummaryResponse
         }
     }
@@ -164,17 +169,30 @@ classDiagram
         class DrawService {
             -DropSnapshotRepository snapshots
             -EntryRepository entries
-            -DrawResultRepository results
             -ApplicantCounter counter
             -EntryGate gate
-            -Drawer drawer
+            -DrawTransaction drawTransaction
             -DrawEventPublisher publisher
             +closeDueDrops(now)
-            +drawIfReady(dropId)
+            +drawReadyDrops(now)
+            +republishUnpublished()
+        }
+        class DrawTransaction {
+            -SeedGenerator seedGenerator
+            -Drawer drawer
+            +execute(dropId, now) DrawOutcome
+        }
+        class DrawOutcome {
+            <<record>>
+            boolean drawn
+            DrawCompletedPayload payload
         }
         class DrawQueryService {
-            +myResult(dropId, userId) MyEntryResult
             +summary(dropId) DrawSummaryResult
+        }
+        class SeedGenerator {
+            <<interface>>
+            +next() long
         }
         class ApplicantCounter {
             <<interface>>
@@ -205,9 +223,10 @@ classDiagram
         }
         class DropSnapshotRepository {
             <<interface>>
+            +findDueOpenIds(now) List~Long~
             +markClosingIfOpen(dropId, now) boolean
             +findClosing() List~DropSnapshot~
-            +markDrawn(dropId)
+            +markDrawnIfClosing(dropId) boolean
         }
         class EntryRepository {
             <<interface>>
@@ -217,7 +236,10 @@ classDiagram
         }
         class DrawResultRepository {
             <<interface>>
-            +save(DrawResult)
+            +save(DrawResult) DrawResult
+            +findByDropId(dropId) Optional~DrawResult~
+            +findUnpublished() List~DrawResult~
+            +markPublished(dropId)
         }
     }
 
@@ -225,16 +247,25 @@ classDiagram
     DrawResultController --> DrawQueryService
     DrawService --> DropSnapshotRepository
     DrawService --> EntryRepository
-    DrawService --> DrawResultRepository
     DrawService --> ApplicantCounter
-    DrawService --> Drawer
+    DrawService --> DrawTransaction
     DrawService --> DrawEventPublisher
-    DrawService ..> DrawResult
+    DrawTransaction --> DropSnapshotRepository
+    DrawTransaction --> EntryRepository
+    DrawTransaction --> DrawResultRepository
+    DrawTransaction --> SeedGenerator
+    DrawTransaction --> Drawer
+    DrawTransaction ..> DrawResult
+    DrawTransaction ..> DrawOutcome
 ```
 
 **읽는 법**
 - `Drawer` 는 domain 의 **순수 도메인 서비스**다 (입력 목록 + K + 시드 → 당첨자). 저장소·Spring 의존이 없어 공정성·재현성을 단위 테스트로 바로 검증한다.
-- 상태 전이 `OPEN → CLOSING` 은 동시성 제어(조건부 UPDATE) 때문에 `markClosingIfOpen()` 이라는 **원자적 저장소 연산**으로 표현한다. 도메인 모델을 읽어 바꾸고 save 하는 방식으로는 다중 인스턴스 중복 추첨을 막을 수 없기 때문이다.
+- 상태 전이 `OPEN → CLOSING`, `CLOSING → DRAWN` 은 동시성 제어(조건부 UPDATE) 때문에 `markClosingIfOpen()`, `markDrawnIfClosing()` 이라는 **원자적 저장소 연산**으로 표현한다. 도메인 모델을 읽어 바꾸고 save 하는 방식으로는 다중 인스턴스 중복 추첨을 막을 수 없기 때문이다.
+- `DrawTransaction` 을 `DrawService` 와 분리한 이유: 같은 클래스 안에서 `@Transactional` 메서드를 호출하면 프록시를 거치지 않아 트랜잭션이 적용되지 않는다. `execute()` 의 첫 문장이 `markDrawnIfClosing()` 이다 ([draw.md](../05-features/draw.md) 3장).
+- `SeedGenerator` 는 application 포트다 (구현 `SecureRandomSeedGenerator`, 테스트는 고정 시드).
+- 내 결과 조회(`/drops/{dropId}/me`)는 응모 단건 조회와 같은 API 라 `EntryController` 가 맡는다. `DrawResultController` 는 추첨 요약만 담당한다.
+- `DrawService.republishUnpublished()` 가 `published=false` 인 결과의 `draw.completed` 를 다시 발행한다.
 - 당첨/낙첨 반영도 엔티티 루프 대신 `markResults()` 벌크 연산 — JPA 엔티티 분리로 변경 감지를 쓰지 않기 때문 ([layered-architecture.md](../02-architecture/layered-architecture.md) 7장).
 - infrastructure 구현체(`DropSnapshotRepositoryImpl`, `RedisApplicantCounter`, `KafkaDrawEventPublisher` 등)는 1.1 과 같은 패턴이라 생략.
 
@@ -243,8 +274,10 @@ classDiagram
 |------|--------|
 | presentation | `DropCreatedListener` → `DropSnapshotRegisterCommand` 생성 |
 | application | `DropSnapshotRegisterService` (DB 저장 + `EntryGate.initialize()` 로 Redis 정원 초기화) |
-| domain | `DropSnapshot`, `DropSnapshotRepository` |
-| infrastructure | `DropSnapshotJpaEntity`, `DropSnapshotRepositoryImpl`, `RedisEntryGate.initialize()` (`SET NX`) |
+| domain | `DropSnapshot`, `DropSnapshotRepository` (`saveIfAbsent`, `findById`) |
+| infrastructure | `DropSnapshotJpaEntity`, `DropSnapshotRepositoryImpl` (`ON CONFLICT DO NOTHING`), `RedisEntryGate.initialize()` (`entry-initialize.lua`: meta 가 없을 때만 초기화) |
+
+- 수신 데이터가 도메인 불변식을 어기면 application 이 `DomainException` 을 `InvalidDropSnapshotException` 으로 바꿔 던지고, 리스너 재시도 후 `drop.created.DLT` 로 간다.
 
 ---
 
@@ -255,30 +288,31 @@ classDiagram
 ### 2.1 user-service
 | 계층 | 클래스 |
 |------|--------|
-| presentation | `UserController`, `SignupRequest`, `LoginRequest`, `LoginResponse`, `UserResponse` |
-| application | `UserService` (`signup(SignupCommand)`, `login(LoginCommand) → LoginResult`), 포트 `PasswordEncoder`(I), `TokenIssuer`(I), `UserEventPublisher`(I) |
-| domain | `User`(email, passwordHash, nickname, role), `Role`(enum), `Email`(값 객체: 형식 검증), `UserRepository`(I) |
-| infrastructure | `UserJpaEntity`, `UserRepositoryImpl`, `UserMapper`, `BCryptPasswordEncoderAdapter` → PasswordEncoder, `JwtTokenIssuer` → TokenIssuer, `KafkaUserEventPublisher` |
+| presentation | `UserController`, `SignupRequest`, `LoginRequest`, `LoginResponse`, `UserResponse`, `bootstrap/AdminAccountInitializer` (기동 시 `ADMIN_EMAIL`/`ADMIN_PASSWORD` 로 관리자 시드, REQ-USER-04) |
+| application | `UserService` (`signup(SignupCommand) → SignupResult`, `login(LoginCommand) → LoginResult`, `createAdminIfAbsent(...)`), `exception/UserErrorCode`, 포트 `PasswordEncoder`(I), `TokenIssuer`(I: `issue(TokenSubject) → IssuedToken`), `UserEventPublisher`(I: `publishRegistered(UserRegisteredPayload)`) |
+| domain | `User`(email, passwordHash, nickname, role), `Role`(enum), `Email`(값 객체: 형식 검증), `UserRepository`(I), `exception/DomainException` |
+| infrastructure | `UserJpaEntity`, `UserRepositoryImpl`, `UserMapper`, `BCryptPasswordEncoderAdapter` → PasswordEncoder, `JwtTokenIssuer` → TokenIssuer, `KafkaUserEventPublisher` → UserEventPublisher (afterCommit 등록) |
 
 > `PasswordEncoder` 를 application 포트로 둔 이유: Spring Security 의 `PasswordEncoder` 를 domain/application 이 직접 쓰면 기술 의존이 생긴다.
 
 ### 2.2 product-service
 | 계층 | 클래스 |
 |------|--------|
-| presentation | `ProductController`, `DropController`, `DrawCompletedListener`, `*Request`, `*Response` |
-| application | `ProductService`, `DropService` (`register(DropRegisterCommand) → DropResult`, `republish(dropId)`), `DropQueryService`, 포트 `DropEventPublisher`(I) |
-| domain | `Product`, `Drop`(+`status(now)`, `markDrawn()`, 생성 시 M≥K·시각 검증), `DropStatus`(enum), `ProductRepository`(I), `DropRepository`(I) |
-| infrastructure | `ProductJpaEntity`, `DropJpaEntity`, `*RepositoryImpl`, `*Mapper`, `KafkaDropEventPublisher` |
+| presentation | `ProductController`, `DropController`, `DrawCompletedListener`(5단계), `*Request`, `*Response` — 헤더를 `Requester` 로 바꿔 전달만 함 |
+| application | `ProductService`, `DropService` (`register(Requester, DropRegisterCommand) → DropResult`, `republish(Requester, dropId)`), `DropQueryService` (`→ DropPageResult`), `Requester`(record: userId, role, `isAdmin()`), `exception/ProductErrorCode`, 포트 `DropEventPublisher`(I: `publishCreated(DropCreatedPayload)`) |
+| domain | `Product`, `Drop`(+`status(now)`, `markDrawn()`, 생성 시 M≥K·시각·openAt 1분 여유 검증), `DropStatus`(enum), `DropPage`(자체 페이지 타입 — Spring Data `Page` 비의존), `ProductRepository`(I), `DropRepository`(I), `exception/DomainException` |
+| infrastructure | `ProductJpaEntity`, `DropJpaEntity`(연관관계 없이 `productId` 만), `*RepositoryImpl`, `*Mapper`, `KafkaDropEventPublisher` → DropEventPublisher (afterCommit 등록, 트랜잭션 없으면 즉시) |
 
 > `Drop.status(now)` 처럼 **시각을 인자로 받는** 도메인 메서드로 상태를 계산한다 — domain 이 시계(`Clock`)에 의존하지 않고, 시각은 application 이 주입한다.
+> ADMIN 판단은 application(`Requester.isAdmin()`)이 한다. `DropResult.status` 는 String 으로 내보내 presentation 이 domain enum 을 참조하지 않는다.
 
 ### 2.3 queue-service (DB 없음)
 | 계층 | 클래스 |
 |------|--------|
-| presentation | `QueueController`, `QueueStatusResponse`, `AdmissionScheduler`, `DropCreatedListener` |
-| application | `QueueService` (`enter(QueueEnterCommand) → QueueStatusResult`, `status(...)`), `AdmissionService` (`admit(now)`), 포트 `RemainingCapacityReader`(I, entry 소유 키 읽기) |
-| domain | `QueueState`(enum: WAITING/ADMITTED/SOLD_OUT/NOT_IN_QUEUE), `QueueMeta`(openAt, closeAt, `isOpen(now)`), `WaitingQueueRepository`(I: enqueue, rank, hasToken, admit) |
-| infrastructure | `RedisWaitingQueueRepository` → WaitingQueueRepository (admit 은 Lua), `RedisRemainingCapacityReader` → RemainingCapacityReader |
+| presentation | `QueueController`, `QueueStatusResponse`(state, position, `nextPollAfterMs`), `AdmissionScheduler`, `DropCreatedListener` |
+| application | `QueueService` (`enter(QueueEnterCommand) → QueueStatusResult`, `status(...)`), `AdmissionService` (`admit(now)`), `QueueMetaRegisterService`, `AdmissionProperties`(record: 배치 크기·주기·토큰 TTL), 포트 `RemainingCapacityReader`(I, entry 소유 키 읽기), `SchedulerGate`(I: `tryPass(name, window)`) |
+| domain | `QueueState`(enum: WAITING/ADMITTED/SOLD_OUT/NOT_IN_QUEUE), `QueueMeta`(openAt, closeAt, `isOpen(now)`), `EnqueueResult`(record: admitted, rank), `PollIntervalPolicy`(`nextPollAfterMs(aheadCount)`), `WaitingQueueRepository`(I: `saveMeta`, `findMeta`, `enqueue`, `hasToken`, `rank`, `admit`, `findActiveDropIds`, `removeExpiredDrops`) |
+| infrastructure | `RedisWaitingQueueRepository` → WaitingQueueRepository (`enqueue.lua`, `admit.lua`, `queue:active-drops`), `RedisRemainingCapacityReader` → RemainingCapacityReader, `RedisSchedulerGate` → SchedulerGate (`SET NX PX`, 미해제) |
 
 > 대기열은 도메인 개념(줄, 순번, 입장)이므로 저장소가 Redis 여도 포트를 **domain** 에 둔다. 반면 entry 의 잔여 정원 읽기는 다른 서비스 데이터 참조라 **application 포트**로 둔다.
 
@@ -286,20 +320,28 @@ classDiagram
 | 계층 | 클래스 |
 |------|--------|
 | presentation | `CouponEventController`, `CouponController`, `CouponIssuedListener`, `*Request`, `*Response` |
-| application | `CouponEventService`, `CouponIssueService` (`issue(CouponIssueCommand) → CouponIssueResult`), `CouponSaveService`, `CouponQueryService`, 포트 `CouponGate`(I), `CouponEventPublisher`(I) |
-| domain | `CouponEvent`, `IssuedCoupon`, `IssueOutcome`(enum), `CouponEventRepository`(I), `IssuedCouponRepository`(I) |
-| infrastructure | `*JpaEntity`, `*RepositoryImpl`, `*Mapper`, `RedisCouponGate` → CouponGate, `KafkaCouponEventPublisher` |
+| application | `CouponEventService` (등록, 재초기화), `CouponIssueService` (`issue(CouponIssueCommand) → CouponIssueResult`), `CouponSaveService` (→ `CouponGate.isIssued` 확인 후 저장), `CouponQueryService`, 포트 `CouponGate`(I: `initialize`, `tryIssue`, `compensate`, `isIssued`, `remaining`), `CouponEventPublisher`(I) |
+| domain | `CouponEvent`, `IssuedCoupon`, `IssueOutcome`(enum: OK / NOT_FOUND / NOT_STARTED / DUPLICATE / SOLD_OUT), `CouponEventRepository`(I), `IssuedCouponRepository`(I: `saveIfAbsent`) |
+| infrastructure | `*JpaEntity`, `*RepositoryImpl` (`ON CONFLICT DO NOTHING`), `*Mapper`, `RedisCouponGate` → CouponGate (`issue.lua`, `compensate.lua`), `KafkaCouponEventPublisher` (`send().get(3.5s)`, 재시도는 producer 내부만) |
 
 ### 2.5 ranking-service (DB 없음)
 | 계층 | 클래스 |
 |------|--------|
 | presentation | `RankingController`, `RankingResponse`, `EntryCreatedListener`, `DropCreatedListener`, `UserRegisteredListener` |
-| application | `RankingAggregateService` (`record(RankingRecordCommand)`), `RankingQueryService` (`topDrops(n) → List<DropRankResult>` 등) |
-| domain | `WeekKey`(값 객체: `of(Instant)` ISO 주차, Asia/Seoul), `RankingBoard`(enum: DROP_POPULAR / USER_WEEKLY / USER_ALL), `RankingRepository`(I: incrementOnce, top, rankOf), `DisplayNameRepository`(I) |
-| infrastructure | `RedisRankingRepository` (dedupe + ZINCRBY Lua), `RedisDisplayNameRepository` |
+| application | `RankingAggregateService` (`recordEntry(RankingRecordCommand)`, `registerDrop(DropInfoCommand)`, `registerUser(...)`), `RankingQueryService` (`topDrops(n) → List<DropRankResult>` 등) |
+| domain | `WeekKey`(값 객체: `of(Instant)` ISO 주차, Asia/Seoul), `RankingBoard`(enum: DROP_POPULAR / USER_WEEKLY / USER_ALL), `DropWindow`(record: dropId, closeAt, `isInProgress(now)`), `RankingRepository`(I: incrementOnce, top, rankOf), `DisplayNameRepository`(I), `DropWindowRepository`(I: `save`, `findAll`) |
+| infrastructure | `RedisRankingRepository` (`rank.lua`: dedupe + ZINCRBY + TTL), `RedisDisplayNameRepository`, `RedisDropWindowRepository` (`rank:drop:closeAt`) |
 
 ### 2.6 gateway
-계층 구조를 적용하지 않는다 — 도메인이 없는 라우팅·인증 필터만 존재 (`JwtAuthenticationFilter`, `HeaderSanitizeFilter`, `JwtVerifier`).
+계층 구조를 적용하지 않는다 — 도메인이 없는 라우팅·인증 필터만 존재.
+
+| 클래스 | 책임 |
+|--------|------|
+| `HeaderSanitizeFilter` | 클라이언트 `X-User-*` 헤더 제거 (가장 먼저 실행) |
+| `JwtAuthenticationFilter` | JWT 검증 → `X-User-Id`, `X-User-Role` 주입 / 401 |
+| `JwtVerifier` | 서명·만료·발급자 검증 |
+| `PublicPathMatcher` | 인증 제외 경로 판정 (Method + Path) |
+| `ErrorResponseWriter`, `GatewayErrorCode` | 401 등 응답 바디를 서비스와 같은 `ErrorResponse` 형식으로 작성 |
 
 ---
 
@@ -316,6 +358,7 @@ classDiagram
         class DropCreated {
             <<record>>
             Long dropId
+            Long productId
             String title
             int entryCapacity
             int winnerCount
@@ -348,6 +391,7 @@ classDiagram
 ```
 
 **읽는 법**
-- `common` 은 **서비스 간 메시지 계약**만 담는다. 도메인 모델을 공유하지 않는다 (서비스마다 같은 이름의 개념이라도 각자 모델을 갖는다).
+- `common` 은 **서비스 간 계약**만 담는다: `common.event`(메시지 record 5종, 토픽 이름 `Topics`)와 `common.error`(에러 계약: `ErrorCode` interface, `ApplicationException`, `ErrorResponse` — 순수 Java). 도메인 모델을 공유하지 않는다 (서비스마다 같은 이름의 개념이라도 각자 모델을 갖는다).
+- application 은 `common.error` 에만 의존할 수 있고 `common.event` 에는 의존하지 않는다 (ArchUnit R3).
 - 이 메시지를 직접 다루는 곳은 **presentation(Listener)** 과 **infrastructure(Publisher)** 뿐이다. application 은 자기 Payload DTO 로 포트를 호출한다.
 - ArchUnit 공통 규칙은 `common` 의 test fixtures 에 둔다.

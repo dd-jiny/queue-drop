@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | 리스너 실패 처리(로그·스킵) 확정 및 DLT 도입 시 토픽 이름 분리 주의 추가, 설계 반영 완료 표시 |
 
 ---
 
@@ -775,13 +776,13 @@ docker compose start ranking-service
 | 인기 드로우 범위 | **진행 중 드로우만** (closeAt 이 지나지 않은 드로우) — 기본안 — 7단계에서 확정 | 전체 누적으로 가면 `DropWindowRepository` 필터만 제거 |
 | 동점 처리 | **member 사전순** (ZSet 기본 동작) — 기본안 — 7단계에서 확정 | 3.5 참고 |
 | 진행 중 필터 탐색 한도 | 배치 50, 최대 500 (구현 결정) | 종료 드로우가 500개 넘게 상위를 차지하면 결과가 size 보다 적을 수 있음 |
-| 리스너 실패 처리 | 3회 재시도 후 로그·스킵 (구현 결정) | 누락이 문제되면 DLT(`entry.created.DLT`) 도입 |
+| 리스너 실패 처리 | 3회 재시도 후 로그·스킵 (확정, 2026-11-16 — DLT 는 저장 컨슈머만) | 누락이 문제되면 랭킹 전용 DLT 도입. `entry.created.DLT` 는 entry-service 저장 컨슈머가 쓰므로 **이름을 분리**해야 한다 (예: `entry.created.ranking.DLT`, `DeadLetterPublishingRecoverer` 의 destination resolver 지정) |
 
 ### 설계 수정 필요 (설계 문서는 이 단계 커밋 6에서 수정)
-- **[architecture.md](../../design/02-architecture/architecture.md) 5장 Redis 키 표**: `rank:drop:closeAt` (Hash, 쓰기 소유자 ranking) 추가.
-- **[ranking.md](../../design/05-features/ranking.md) 3장**: dedupe Set TTL 정책(closeAt + 7일, 최소 1일, closeAt 미상 시 30일)과 Lua KEYS 에 `rank:drop:closeAt` 포함, 집계 Lua 에서 주간 키 TTL 설정을 명시.
-- **[class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.5**: `DropWindow`, `DropWindowRepository` 추가, `RankingAggregateService` 에 `registerDrop`/`registerUser` 추가.
-- **[architecture.md](../../design/02-architecture/architecture.md) 6장 인증 제외 경로**: "랭킹 조회"를 `/api/rankings/**` 전체로 해석하면 `/api/rankings/users/me` 에 `X-User-Id` 가 주입되지 않는다. 제외 경로를 `GET /api/rankings/drops`, `/api/rankings/users/weekly`, `/api/rankings/users/all` 로 한정하도록 명시 필요 (1단계 Gateway 설정과 함께 확인).
+- **[architecture.md](../../design/02-architecture/architecture.md) 5장 Redis 키 표**: `rank:drop:closeAt` (Hash, 쓰기 소유자 ranking) 추가. → 설계 반영 완료 (2026-11-16)
+- **[ranking.md](../../design/05-features/ranking.md) 3장**: dedupe Set TTL 정책(closeAt + 7일, 최소 1일, closeAt 미상 시 30일)과 Lua KEYS 에 `rank:drop:closeAt` 포함, 집계 Lua 에서 주간 키 TTL 설정을 명시. → 설계 반영 완료 (2026-11-16)
+- **[class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.5**: `DropWindow`, `DropWindowRepository` 추가, `RankingAggregateService` 에 `registerDrop`/`registerUser` 추가. → 설계 반영 완료 (2026-11-16)
+- **[architecture.md](../../design/02-architecture/architecture.md) 6장 인증 제외 경로**: "랭킹 조회"를 `/api/rankings/**` 전체로 해석하면 `/api/rankings/users/me` 에 `X-User-Id` 가 주입되지 않는다. 제외 경로를 `GET /api/rankings/drops`, `/api/rankings/users/weekly`, `/api/rankings/users/all` 로 한정하도록 명시 필요 (1단계 Gateway 설정과 함께 확인). → 설계 반영 완료 (2026-11-16)
 
 ### 리스크
 - **Redis 유실 시 랭킹 소실**: 진실의 원천이 Redis 뿐. 3.6 절차로 30일 이내 응모만 복구된다. 그 이상은 entry_db 기반 재집계 배치가 필요 (범위 밖).

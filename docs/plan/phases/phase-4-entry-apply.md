@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | 발행 정책·DLT·저장 전 Redis 확인 확정 반영 (0단계 토픽 초기화에 DLT 추가됨), JSON 직렬화 클래스명을 0단계 공통 설정과 통일, 설계 반영 완료 표시 |
 
 > 표기
 > - **(구현 결정)**: 설계 문서에 없던 내용을 이 문서에서 정한 것
@@ -242,7 +243,7 @@ spring:
       acks: all
       retries: 2147483647
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer   # 구현 시 확인 (아래 참고)
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # 0단계 공통 설정과 동일, 구현 시 확인 (아래 참고)
       properties:
         enable.idempotence: true
         max.in.flight.requests.per.connection: 5
@@ -256,7 +257,7 @@ spring:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       properties:
-        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer  # 구현 시 확인
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer  # 0단계 공통 설정과 동일, 구현 시 확인
         spring.json.trusted.packages: com.queuedrop.common.event
     listener:
       ack-mode: record
@@ -284,7 +285,7 @@ entry:
 | `enable-auto-commit` | `false` | 자동 커밋은 처리 전에 오프셋이 커밋될 수 있다 → 저장 전 장애 시 유실 |
 | `ack-mode` | `record` | 레코드 하나를 **DB 저장 성공 후** 커밋. at-least-once + 컨슈머 멱등으로 정확히 한 번처럼 동작 |
 | `ErrorHandlingDeserializer` | - | 역직렬화 실패 레코드 하나가 파티션 전체를 막지 않게 한다 |
-| 타입 정보 | `__TypeId__` 헤더 (JsonSerializer 기본) | 모든 서비스가 같은 `common` 클래스를 쓰므로 헤더의 FQCN 이 그대로 맞는다. `trusted.packages` 로 범위를 제한 |
+| 타입 정보 | `__TypeId__` 헤더 (JSON serializer 기본) | 모든 서비스가 같은 `common` 클래스를 쓰므로 헤더의 FQCN 이 그대로 맞는다. `trusted.packages` 로 범위를 제한 |
 
 > Spring Kafka 4.x(Boot 4.1.2 관리 버전)는 Jackson 3 기반 `JacksonJsonSerializer` / `JacksonJsonDeserializer` 를 새로 두고 기존 `JsonSerializer` 계열을 deprecated 했을 가능성이 있다. **구현 시 확인**: deprecated 면 새 클래스로 바꾸고 프로퍼티 키도 함께 확인한다.
 
@@ -303,7 +304,7 @@ class KafkaConsumerConfig {
 }
 ```
 - 저장 실패(DB 장애 등)는 1초 간격 3번 재시도 후 `entry.created.DLT` 로 보낸다.
-- **DLT 토픽은 설계에 없다 (설계 수정 필요 ②)**. 0단계 토픽 초기화에 `drop.created.DLT`, `entry.created.DLT` 추가가 필요하다.
+- DLT 토픽 `drop.created.DLT`, `entry.created.DLT` 는 0단계 토픽 초기화(`create-topics.sh`)에서 만든다 (확정, 설계 수정 ② 반영). 토픽 이름은 `Topics.*_DLT` 상수를 쓴다.
 - DLT 로 간 응모는 Redis 에는 있고 DB 에는 없는 상태라, 5단계 추첨의 건수 비교에서 불일치로 드러난다. 그때 DLT 를 다시 처리하면 된다.
 - Boot 4 에서 `DefaultErrorHandler` 빈 하나만 두면 기본 컨테이너 팩토리에 자동 적용되는지 **구현 시 확인**. 안 되면 `ConcurrentKafkaListenerContainerFactory` 에 직접 설정한다.
 
@@ -1548,17 +1549,19 @@ feat(entry): Redis Lua 기반 응모 게이트 구현
 ### 6.1 이 단계에서 확정하는 것
 | # | 항목 | 결정 |
 |---|------|------|
-| ① | 컨슈머 저장 전 Redis 응모자 확인 | **확정 (기본안 채택)**. `EntrySaveService` 에서 `isApplicant` 확인 후 없으면 저장하지 않음 |
+| ① | 컨슈머 저장 전 Redis 응모자 확인 | **확정 (2026-11-16 사용자 승인)**. `EntrySaveService` 에서 `isApplicant` 확인 후 없으면 저장하지 않음 |
+| ② | Kafka 동기 발행 정책 | **확정 (2026-11-16)**. 애플리케이션 재시도 없음, producer 내부 재시도 + `request.timeout.ms=1000`, `delivery.timeout.ms=3000`, `get` 대기 3.5초. 쿠폰(6단계)도 같은 정책 |
+| ③ | 저장 컨슈머 실패 처리 | **확정 (2026-11-16)**. 3회 재시도 후 `{topic}.DLT` |
 
 ### 6.2 설계 수정 필요 (구현 전에 설계 문서부터 고침)
 | # | 대상 문서 | 현재 | 변경 |
 |---|-----------|------|------|
-| ① | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [concurrency-consistency.md](../../design/04-non-functional/concurrency-consistency.md) D2, [implementation-plan.md](../implementation-plan.md) 4단계 | `get(3s)` + 재시도 2회 | 애플리케이션 재시도 없음. producer 내부 재시도(멱등) + `request.timeout.ms=1000`, `delivery.timeout.ms=3000`, `get` 대기 3.5초 |
-| ② | [architecture.md](../../design/02-architecture/architecture.md) 4장, [infrastructure.md](../../design/03-infrastructure/infrastructure.md) | DLT 없음 | `drop.created.DLT`, `entry.created.DLT` 토픽 추가, 재시도 3회 후 DLT |
-| ③ | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.1 | `EntryRepository.save(Entry) Entry`, `existsByDropIdAndUserId` | `saveIfAbsent(Entry) boolean`, `findByDropIdAndUserId`, `findAllByUserId` |
-| ④ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장 API 설명 | "조회 API 는 DB 에 없으면 Redis 로 보완" | **단건 조회(`/drops/{dropId}/me`)만** 보완. 목록(`/me`)은 DB 만 |
-| ⑤ | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 3장 | `DropCreated` 에 `productId` 없음 | [architecture.md](../../design/02-architecture/architecture.md) 4장 페이로드에는 있음 → 둘 중 하나로 통일 (entry 는 쓰지 않으므로 어느 쪽이든 무방, ranking·queue 확인 필요) |
-| ⑥ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 4.5 | 에러 코드 5개 | `ENTRY_NOT_FOUND`(404), `MISSING_USER_HEADER`(400), `InvalidDropSnapshotException` 추가 |
+| ① | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [concurrency-consistency.md](../../design/04-non-functional/concurrency-consistency.md) D2, [implementation-plan.md](../implementation-plan.md) 4단계 | `get(3s)` + 재시도 2회 | 애플리케이션 재시도 없음. producer 내부 재시도(멱등) + `request.timeout.ms=1000`, `delivery.timeout.ms=3000`, `get` 대기 3.5초 → 설계 반영 완료 (2026-11-16) |
+| ② | [architecture.md](../../design/02-architecture/architecture.md) 4장, [infrastructure.md](../../design/03-infrastructure/infrastructure.md) | DLT 없음 | `drop.created.DLT`, `entry.created.DLT`(+ 6단계 `coupon.issued.DLT`) 토픽 추가, 재시도 3회 후 DLT → 설계 반영 완료 (2026-11-16) |
+| ③ | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.1 | `EntryRepository.save(Entry) Entry`, `existsByDropIdAndUserId` | `saveIfAbsent(Entry) boolean`, `findByDropIdAndUserId`, `findAllByUserId` → 설계 반영 완료 (2026-11-16) |
+| ④ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장 API 설명 | "조회 API 는 DB 에 없으면 Redis 로 보완" | **단건 조회(`/drops/{dropId}/me`)만** 보완. 목록(`/me`)은 DB 만 → 설계 반영 완료 (2026-11-16) |
+| ⑤ | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 3장 | `DropCreated` 에 `productId` 없음 | [architecture.md](../../design/02-architecture/architecture.md) 4장 페이로드에는 있음 → 둘 중 하나로 통일 (entry 는 쓰지 않으므로 어느 쪽이든 무방, ranking·queue 확인 필요) → 설계 반영 완료 (2026-11-16) |
+| ⑥ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 4.5 | 에러 코드 5개 | `ENTRY_NOT_FOUND`(404), `MISSING_USER_HEADER`(400), `InvalidDropSnapshotException` 추가 → 설계 반영 완료 (2026-11-16) |
 
 ### 6.3 리스크
 | 리스크 | 영향 | 대응 |
@@ -1569,7 +1572,7 @@ feat(entry): Redis Lua 기반 응모 게이트 구현
 | Redis 재시작 시 데이터 유실 | 오버 응모 가능 | 0단계의 AOF everysec. 최대 1초 유실 가능성은 남음 |
 | Redis Cluster 미지원 | 키가 `{}` 해시태그 없이 여러 슬롯에 흩어져 Lua 다중 키 실행 불가 | 현재 단일 인스턴스 전제. 클러스터 전환 시 키를 `entry:{42}:meta` 형태의 해시태그로 바꾸고 queue 토큰 키도 같은 태그를 쓰게 해야 함 |
 | 서버 시계 차이 | 인스턴스마다 `now` 가 달라 마감 경계에서 판정이 조금씩 다를 수 있음 | 판정은 Redis 한 곳에서 하므로 결과가 갈리진 않음. 서버 NTP 동기화 전제 |
-| `drop.created` 전파 지연 | 오픈 직후 `CLOSED` 응답 | 드로우 등록 시 `openAt` 최소 1분 이후 검증 (2단계, drop-register.md 권장) |
+| `drop.created` 전파 지연 | 오픈 직후 `CLOSED` 응답 | 드로우 등록 시 `openAt` 최소 1분 이후 검증 (2단계 확정 규칙) |
 | queue 토큰 키 형식 의존 | queue 가 키 형식을 바꾸면 응모가 전부 `NO_TOKEN` | `EntryRedisKeys.queueToken` 주석 + 4단계 E2E(5단계)에서 실제 queue 와 함께 검증 |
 | Spring Kafka 4 JSON 직렬화 클래스 변경 | 설정 오류로 기동 실패 | 구현 시 확인 (3.0 참고) |
 
@@ -1592,5 +1595,5 @@ feat(entry): Redis Lua 기반 응모 게이트 구현
 - [ ] `./gradlew :entry-service:build` 통과 (T4-27 ArchUnit 포함)
 - [ ] API 3개가 [entry-apply.md](../../design/05-features/entry-apply.md) API 표와 일치 (경로, 202, 에러 코드)
 - [ ] 6.2 "설계 수정 필요" ①~⑥ 설계 문서 반영 + 변경 이력 추가
-- [ ] 6.1 결정 ① 을 플랜 4장 "미결정 사항" 표와 설계 README "확인 필요" 에서 확정으로 갱신
+- [x] 6.1 결정 ① 을 플랜 4장 "미결정 사항" 표와 설계 README "확인 필요" 에서 확정으로 갱신 (2026-11-16)
 - [ ] 플랜 진행 현황에서 4단계 ✅

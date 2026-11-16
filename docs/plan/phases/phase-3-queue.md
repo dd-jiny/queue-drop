@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | 설계 반영 완료 표시 |
 
 ---
 
@@ -777,9 +778,9 @@ public class EntryRemainingFixture {
 | 설정 바인딩 | `AdmissionProperties` record 는 application, 바인딩은 infrastructure |
 
 ### 설계 수정 필요
-- [architecture.md](../../design/02-architecture/architecture.md) 5장 Redis 키 표에 `queue:active-drops`(ZSet), `queue:admission:gate`(String PX) 추가.
-- [queue-enter.md](../../design/05-features/queue-enter.md) 3장·5.2: 진입을 `INCR → ZADD NX` 2명령에서 **`enqueue.lua` 원자 처리**로 변경, 입장 Lua 에 잔여 정원 확인 포함, 스케줄러 분산 락을 "미해제 게이트"로 명시, `nextPollAfterMs` 응답 필드 확정, 잔여 정원 키 없음 정책 추가.
-- [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.3: `EnqueueResult`, `QueueMetaRegisterService`, `SchedulerGate` 포트, `PollIntervalPolicy` 추가. `WaitingQueueRepository` 메서드 시그니처(`saveMeta`, `findMeta`, `findActiveDropIds`, `removeExpiredDrops`) 반영.
+- [architecture.md](../../design/02-architecture/architecture.md) 5장 Redis 키 표에 `queue:active-drops`(ZSet), `queue:admission:gate`(String PX) 추가. → 설계 반영 완료 (2026-11-16)
+- [queue-enter.md](../../design/05-features/queue-enter.md) 3장·5.2: 진입을 `INCR → ZADD NX` 2명령에서 **`enqueue.lua` 원자 처리**로 변경, 입장 Lua 에 잔여 정원 확인 포함, 스케줄러 분산 락을 "미해제 게이트"로 명시, `nextPollAfterMs` 응답 필드 확정, 잔여 정원 키 없음 정책 추가. → 설계 반영 완료 (2026-11-16)
+- [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.3: `EnqueueResult`, `QueueMetaRegisterService`, `SchedulerGate` 포트, `PollIntervalPolicy` 추가. `WaitingQueueRepository` 메서드 시그니처(`saveMeta`, `findMeta`, `findActiveDropIds`, `removeExpiredDrops`) 반영. → 설계 반영 완료 (2026-11-16)
 
 ### 결정 필요
 - [ ] 상태 조회에서 마감 후(`closeAt` 경과) 별도 `CLOSED` 상태를 둘지 (현재: 없음, 드로우 상세로 판단)

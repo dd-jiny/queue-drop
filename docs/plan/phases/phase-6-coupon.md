@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | 발행 정책을 4단계와 통일(애플리케이션 재시도 제거, producer 내부 재시도 + delivery.timeout 3000, get 3.5초), 저장 컨슈머 DLT(3회 재시도 후 `coupon.issued.DLT`) 추가, 저장 전 Redis 확인 확정, 재발급 유령 이벤트 테스트 추가, 설계 반영 완료 표시 |
 
 ---
 
@@ -80,7 +81,8 @@ coupon-service/src/main/java/com/queuedrop/coupon/
 │   ├── messaging
 │   │   └── KafkaCouponEventPublisher.java       [신규]
 │   └── config
-│       └── ClockConfig.java                     [신규]
+│       ├── ClockConfig.java                     [신규]
+│       └── KafkaConsumerConfig.java             [신규] DefaultErrorHandler + DLT (4단계와 같은 패턴)
 └── presentation
     ├── api
     │   ├── CouponEventController.java           [신규]
@@ -275,7 +277,7 @@ public class CouponIssueService {
         CouponIssuedPayload payload = new CouponIssuedPayload(
                 UUID.randomUUID().toString(), command.eventId(), command.userId(), now);
         try {
-            publisher.publishIssued(payload);                   // ack 까지 대기 (재시도 포함)
+            publisher.publishIssued(payload);                   // ack 까지 대기 (재시도는 producer 내부, 최대 3초)
         } catch (RuntimeException e) {
             gate.compensate(command.eventId(), command.userId());   // D2: Redis 보상
             throw new CouponException(CouponErrorCode.TEMPORARILY_FAILED);
@@ -308,7 +310,8 @@ public class CouponSaveService {
     }
 }
 ```
-> 응모(4단계)는 유령 이벤트가 저장되면 "응모 수 불일치" 로 드러나지만, 쿠폰은 건수 비교 단계가 없어 **조용히 초과 발급**이 된다. 그래서 저장 전 Redis 확인이 쿠폰에서는 필수다 (6장 설계 수정 필요).
+> 응모(4단계)는 유령 이벤트가 저장되면 "응모 수 불일치" 로 드러나지만, 쿠폰은 건수 비교 단계가 없어 **조용히 초과 발급**이 된다. 그래서 저장 전 Redis 확인이 쿠폰에서는 필수다 (**확정, 2026-11-16**).
+> - DB 장애 등으로 저장이 실패하면 예외를 그대로 올린다 → `DefaultErrorHandler` 가 1초 간격 3회 재시도 후 `coupon.issued.DLT` 로 보낸다 (4단계와 같은 정책).
 
 #### `CouponQueryService`
 ```java
@@ -412,40 +415,75 @@ public class RedisCouponGate implements CouponGate {
 #### `KafkaCouponEventPublisher`
 ```java
 @Component
-@RequiredArgsConstructor
-public class KafkaCouponEventPublisher implements CouponEventPublisher {
-    private static final int MAX_ATTEMPTS = 3;           // 최초 1 + 재시도 2 (D2)
+class KafkaCouponEventPublisher implements CouponEventPublisher {
+
     private final KafkaTemplate<String, Object> kafka;
+    private final Duration awaitTimeout;
+
+    KafkaCouponEventPublisher(KafkaTemplate<String, Object> kafka,
+                              @Value("${coupon.publish.await-timeout}") Duration awaitTimeout) {
+        this.kafka = kafka;
+        this.awaitTimeout = awaitTimeout;
+    }
 
     @Override
     public void publishIssued(CouponIssuedPayload p) {
         CouponIssued message = new CouponIssued(p.eventId(), p.couponEventId(), p.userId(), p.issuedAt());
         String key = p.couponEventId() + ":" + p.userId();
-        RuntimeException last = null;
-        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            try {
-                kafka.send(Topics.COUPON_ISSUED, key, message).get(3, TimeUnit.SECONDS);
-                return;
-            } catch (Exception e) {
-                last = new EventPublishException("coupon.issued", e);
-            }
+        try {
+            kafka.send(Topics.COUPON_ISSUED, key, message)
+                 .get(awaitTimeout.toMillis(), TimeUnit.MILLISECONDS);   // 애플리케이션 재시도 없음
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new EventPublishException("발행 대기 중 인터럽트", e);
+        } catch (ExecutionException | TimeoutException e) {
+            throw new EventPublishException("coupon.issued 발행 실패", e);
         }
-        throw last;
     }
 }
 ```
 - 파티션 키 `couponEventId:userId` ([architecture.md](../../design/02-architecture/architecture.md) 4장).
-- producer 설정은 4단계와 동일 (`application.yml`):
+- **발행 정책 (확정, 4단계와 동일)**: 재시도는 producer 내부(멱등)에만 맡기고 애플리케이션은 다시 send 하지 않는다. 같은 메시지를 다시 send 하면 멱등 producer 도 별개 레코드로 취급해 유령 이벤트가 늘어나고 응답이 최대 9초까지 길어진다 ([phase-4-entry-apply.md](phase-4-entry-apply.md) 3장 "Producer 설정 근거").
+- producer·consumer 설정 (`application.yml`, 4단계와 동일):
 ```yaml
 spring:
   kafka:
     producer:
       acks: all
+      retries: 2147483647
       properties:
         enable.idempotence: true
+        linger.ms: 0
+        request.timeout.ms: 1000
         delivery.timeout.ms: 3000
-        request.timeout.ms: 2000
+    consumer:
+      group-id: coupon-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+    listener:
+      ack-mode: record
+
+coupon:
+  publish:
+    await-timeout: 3500ms         # delivery.timeout.ms(3000) + 여유
 ```
+
+#### `KafkaConsumerConfig` — 저장 실패 시 DLT (4단계와 같은 패턴)
+```java
+@Configuration
+class KafkaConsumerConfig {
+
+    @Bean
+    DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, Object> template) {
+        var recoverer = new DeadLetterPublishingRecoverer(template);   // coupon.issued.DLT 로 보냄
+        var handler = new DefaultErrorHandler(recoverer, new FixedBackOff(1_000L, 3L));
+        handler.addNotRetryableExceptions(DeserializationException.class);
+        return handler;
+    }
+}
+```
+- DLT 토픽 `coupon.issued.DLT` 는 0단계 토픽 초기화에서 만든다.
+- DLT 로 간 발급은 Redis 에는 있고 DB 에는 없는 상태다. 응모와 달리 이를 자동으로 드러내는 단계가 없으므로 **DLT 적재를 ERROR 로그로 남기고 재처리**한다 (리스크 참고).
 
 #### Flyway
 `V1__create_coupon_events.sql`
@@ -596,6 +634,8 @@ public class CouponIssuedListener {
 | T6-19 | presentation 슬라이스 | `CouponEventControllerTest` | 요청 검증: 수량 0, 과거 시작 시각 → 400. 정상 → 201. `GET` 응답에 `remaining` 포함 | REQ-COUPON-01, 04 |
 | T6-20 | 통합 (전체 컨텍스트) | `MyCouponQueryTest` | G: 이벤트 2개에서 각각 발급 / W: `GET /me` / T: 2건, 이벤트 이름 포함, 최신순 | REQ-COUPON-04 |
 | T6-21 | 아키텍처 | `ArchitectureTest` | R1~R7 통과. `CouponIssueService` 가 `IssuedCouponRepository` 에 의존하지 않음 (추가 규칙, 구현 결정) | - |
+| T6-22 | 통합 (전체 컨텍스트) | `CouponGhostEventTest` | G: 수량 2. A 발급 → 실제 발행 후 예외 주입 → 보상 → **A 재발급 성공** → B 발급 성공 / W: 컨슈머 처리 완료 / T: DB 에 A 1건, B 1건 (총 2 = 수량), Redis 잔여 0. 유령 이벤트가 A 의 재발급과 겹쳐도 초과 발급 없음 | NFR-01, 03 |
+| T6-23 | 통합 (전체 컨텍스트) | `CouponIssuedListenerTest` | G: 저장소가 항상 예외를 던지도록 주입 / W: `coupon.issued` 1건 소비 / T: 3회 재시도 후 `coupon.issued.DLT` 에 1건 | NFR-03 |
 
 ---
 
@@ -606,14 +646,21 @@ public class CouponIssuedListener {
 | 1 | domain | `feat(coupon): 쿠폰 도메인 모델 추가`<br>- CouponEvent(생성 검증, isStarted), IssuedCoupon, IssueOutcome<br>- Repository 포트 2개<br>- T6-01, T6-02 |
 | 2 | application | `feat(coupon): 쿠폰 등록·발급·저장 유스케이스 구현`<br>- CouponEventService, CouponIssueService, CouponSaveService, CouponQueryService<br>- 포트 CouponGate, CouponEventPublisher, 에러 코드<br>- T6-03 ~ T6-07 (Fake 포트) |
 | 3 | infra (Redis) | `feat(coupon): 선착순 발급 Lua 스크립트와 Gate 구현`<br>- issue.lua, compensate.lua, RedisCouponGate(SET NX 초기화)<br>- T6-08 ~ T6-10 |
-| 4 | infra (DB, Kafka) | `feat(coupon): 쿠폰 영속성과 coupon.issued 발행 구현`<br>- V1, V2 마이그레이션, ON CONFLICT DO NOTHING 저장<br>- KafkaCouponEventPublisher (acks=all, 재시도 2회)<br>- T6-11, T6-12 |
+| 4 | infra (DB, Kafka) | `feat(coupon): 쿠폰 영속성과 coupon.issued 발행 구현`<br>- V1, V2 마이그레이션, ON CONFLICT DO NOTHING 저장<br>- KafkaCouponEventPublisher (acks=all, producer 내부 재시도, delivery.timeout 3000)<br>- KafkaConsumerConfig (3회 재시도 후 coupon.issued.DLT)<br>- T6-11, T6-12 |
 | 5 | presentation | `feat(coupon): 쿠폰 API와 발급 이벤트 리스너 추가`<br>- CouponEventController, CouponController, CouponIssuedListener<br>- Gateway 인증 제외 경로에 쿠폰 이벤트 조회 추가<br>- T6-18 ~ T6-20 |
-| 6 | 동시성·장애 테스트 | `test(coupon): 동시 발급·보상·유령 이벤트 테스트 추가`<br>- T6-13 ~ T6-17, T6-21 |
+| 6 | 동시성·장애 테스트 | `test(coupon): 동시 발급·보상·유령 이벤트 테스트 추가`<br>- T6-13 ~ T6-17, T6-21 ~ T6-23 |
 | 7 | docs | `docs: 6단계 구현 결과 반영`<br>- 설계 수정 필요 항목 반영, 플랜 진행 현황 갱신 |
 
 ---
 
 ## 6. 결정 필요 · 리스크
+
+### 결정 사항 (확정, 2026-11-16)
+| 항목 | 결정 |
+|------|------|
+| 발행 정책 | 4단계와 동일: 애플리케이션 재시도 없음, producer 내부 재시도 + `delivery.timeout.ms=3000`, `get` 대기 3.5초, 실패 시 보상 |
+| 저장 전 Redis 확인 | 필수 (`gate.isIssued`) — 유령 이벤트로 인한 초과 발급 방지 |
+| 저장 컨슈머 실패 | 3회 재시도 후 `coupon.issued.DLT` |
 
 ### 결정 필요
 | ID | 항목 | 선택지 | 기본안 |
@@ -625,16 +672,17 @@ public class CouponIssuedListener {
 ### 설계 수정 필요
 | 대상 문서 | 내용 |
 |-----------|------|
-| [coupon-issue.md](../../design/05-features/coupon-issue.md) 3장 | 저장 컨슈머가 **저장 전 Redis `SISMEMBER` 로 보상된 발급을 걸러낸다**는 단계 추가. 쿠폰은 추첨의 건수 비교 같은 안전장치가 없어, 이 확인이 없으면 유령 이벤트가 그대로 **초과 발급**으로 이어진다 |
-| [coupon-issue.md](../../design/05-features/coupon-issue.md) API 표 | 재초기화 API `POST /api/coupons/events/{eventId}/initialize` (ADMIN) 추가 (본문에는 언급되어 있으나 API 표에 없음) |
-| [coupon-issue.md](../../design/05-features/coupon-issue.md) 발급 Lua 표 | 결과 `NOT_FOUND`(Redis meta 없음) 추가 |
-| [architecture.md](../../design/02-architecture/architecture.md) 6장 | 인증 제외 경로에 `GET /api/coupons/events/*` 추가 (쿠폰 이벤트 조회는 공개) |
-| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.4 | `CouponGate` 메서드(`initialize`, `isIssued`, `remaining`), `CouponSaveService` 의 `CouponGate` 의존 추가 |
+| [coupon-issue.md](../../design/05-features/coupon-issue.md) 3장 | 저장 컨슈머가 **저장 전 Redis `SISMEMBER` 로 보상된 발급을 걸러낸다**는 단계 추가. 쿠폰은 추첨의 건수 비교 같은 안전장치가 없어, 이 확인이 없으면 유령 이벤트가 그대로 **초과 발급**으로 이어진다 → 설계 반영 완료 (2026-11-16) |
+| [coupon-issue.md](../../design/05-features/coupon-issue.md) API 표 | 재초기화 API `POST /api/coupons/events/{eventId}/initialize` (ADMIN) 추가 (본문에는 언급되어 있으나 API 표에 없음) → 설계 반영 완료 (2026-11-16) |
+| [coupon-issue.md](../../design/05-features/coupon-issue.md) 발급 Lua 표 | 결과 `NOT_FOUND`(Redis meta 없음) 추가 → 설계 반영 완료 (2026-11-16) |
+| [architecture.md](../../design/02-architecture/architecture.md) 6장 | 인증 제외 경로에 `GET /api/coupons/events/*` 추가 (쿠폰 이벤트 조회는 공개) → 설계 반영 완료 (2026-11-16) |
+| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.4 | `CouponGate` 메서드(`initialize`, `isIssued`, `remaining`), `CouponSaveService` 의 `CouponGate` 의존 추가 → 설계 반영 완료 (2026-11-16) |
 
 ### 리스크
 - **대기열이 없어 피크 요청이 전부 Redis 로**: 응모와 달리 유입 조절이 없다. 같은 Redis 를 쓰는 응모·대기열·랭킹이 쿠폰 오픈 순간 영향을 받을 수 있다 → 8단계에서 쿠폰 스파이크와 드로우 응모를 동시에 걸어 측정.
 - **Redis 초기화 실패 후 발급 시작**: 등록 시 초기화가 실패하면 발급 요청이 `EVENT_NOT_FOUND` 로 거부된다. 오버 발급 방향이 아니라 서비스 불가 방향이므로 정합성은 안전. 재초기화 API 로 복구.
 - **Redis 유실**: AOF 없이 재시작되면 잔여 수량·발급 Set 이 사라져 재초기화 시 초과 발급 가능. 0단계 AOF 설정이 전제.
+- **DLT 적재분 방치**: DLT 로 간 발급은 Redis 에만 있어 사용자 `/me` 에 영원히 안 보인다. DLT 를 ERROR 로그로 감지하고 재처리하는 절차가 필요하다 (8단계 관측 구성 시 알림 대상).
 - **Kafka 응답 지연**: 발급 응답 시간에 Kafka ack 왕복이 포함된다. 동시성 테스트(T6-13)에서 소요 시간을 기록해 8단계 비교 기준으로 쓴다.
 
 ---
@@ -647,7 +695,8 @@ public class CouponIssuedListener {
 | 동시성: 같은 사용자 10번 동시 요청 → 1매 | T6-14 |
 | 발급 시작 전 요청 → `NOT_STARTED` | T6-04, T6-08 |
 | 발행 실패 → 보상 후 원상복구 | T6-05, T6-09, T6-15 |
-| (추가) 보상된 발급이 DB 에 남지 않음 (초과 발급 없음) | T6-06, T6-16 |
+| (추가) 보상된 발급이 DB 에 남지 않음 (초과 발급 없음) | T6-06, T6-16, T6-22 |
+| (추가) 저장 실패 시 DLT | T6-23 |
 | (추가) 컨슈머 재전달 멱등 | T6-11, T6-17 |
 | (추가) 재초기화가 진행 중 수량을 덮어쓰지 않음 | T6-10 |
 | (추가) API 4개 + 재초기화 API | T6-18 ~ T6-20 |

@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-DROP-01 ~ 03 |
+| v1.1 | 2026-11-16 | openAt 최소 1분 여유를 확정 규칙으로, 발행 방식을 발행 어댑터 내 afterCommit 등록으로 확정 | phase-2 구현 상세 6장, D4 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-DROP-01: 관리자 상품 등록
@@ -32,7 +33,13 @@
 ### 등록 검증
 - `entryCapacity ≥ winnerCount ≥ 1`
 - `now < openAt < closeAt`
+- **`openAt ≥ 등록 시각 + 1분`** (확정) — `drop.created` 가 entry/queue 에 전파되기 전에 오픈되는 것을 막는다
 - 등록 후 수정 불가 (1차 범위)
+
+### 이벤트 발행 (D4 확정)
+- application `DropService` 는 포트 `DropEventPublisher.publishCreated(...)` 만 호출한다. 발행 시점은 모른다.
+- infrastructure `KafkaDropEventPublisher` 가 `TransactionSynchronizationManager` 로 **`afterCommit` 에 발행을 등록**한다. 활성 트랜잭션이 없으면(재발행 API) 즉시 발행한다.
+- 롤백되면 발행되지 않는다. 커밋 후 발행이 최종 실패하면 ERROR 로그 → 관리자 재발행 API 로 복구.
 
 ### API
 | Method | Path | 권한 | 설명 |
@@ -47,7 +54,7 @@
 | 결정점 | 선택 | 이유 / 포기한 것 |
 |--------|------|------------------|
 | 정보 전파 | `DropCreated` Kafka 이벤트 | 응모 피크 시 product 의존 제거 / 데이터 중복 저장 |
-| 이벤트 발행 시점 | `AFTER_COMMIT` + 재시도 + 재발행 API | Outbox 대비 단순 / 발행 유실 가능성 → 재발행으로 보완 |
+| 이벤트 발행 시점 | 발행 어댑터 내 `afterCommit` 등록 + producer 재시도 + 재발행 API | Outbox 대비 단순, application 이 Spring 이벤트 API 에 비의존 / 발행 유실 가능성 → 재발행으로 보완 |
 | 상태 저장 | 시각 계산 + DRAWN 만 저장 | 상태 전이 스케줄러 불필요 |
 
 ## 5. 다이어그램
@@ -70,7 +77,7 @@ sequenceDiagram
     PS->>PS: 검증 (M≥K, openAt<closeAt)
     PS->>DB: INSERT drops
     PS-->>A: 201 Created
-    Note over PS: AFTER_COMMIT
+    Note over PS: afterCommit (발행 어댑터가 등록)
     PS->>K: drop.created
 
     par entry 준비
@@ -87,7 +94,7 @@ sequenceDiagram
 ```
 
 **읽는 법**
-- 관리자 응답(201)과 이벤트 전파는 분리되어 있다. 전파가 끝나기 전 오픈되면 응모가 실패하므로 **`openAt` 은 등록 시각보다 충분히 뒤(예: 최소 1분)** 여야 한다는 검증을 추가하는 것을 권장.
+- 관리자 응답(201)과 이벤트 전파는 분리되어 있다. 전파가 끝나기 전 오픈되면 응모가 실패하므로 **`openAt` 은 등록 시각 + 1분 이후**여야 한다 (등록 검증 규칙).
 - entry 의 Redis 초기화는 `SET NX` 로 수행해 이벤트 재수신 시 잔여 정원을 덮어쓰지 않는다 (멱등).
 
 ### 5.2 ERD

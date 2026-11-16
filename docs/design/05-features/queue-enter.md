@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-QUEUE-01 ~ 06 |
+| v1.1 | 2026-11-16 | 진입을 `enqueue.lua` 원자 처리로, 입장 Lua 에 잔여 정원 확인 포함, 스케줄러 미해제 게이트, 활성 드로우 인덱스, `nextPollAfterMs`, 잔여 정원 키 없음 정책, 상태 우선순위 추가 | phase-3 구현 상세 6장 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-QUEUE-01: 드로우별 대기열
@@ -29,18 +30,22 @@
 | SOLD_OUT | `entry:{dropId}:remaining ≤ 0` | 마감 안내, 폴링 중단 |
 | NOT_IN_QUEUE | 둘 다 없음 (토큰 만료 포함) | 재진입 가능 |
 
+- 상태 판정 우선순위: **SOLD_OUT > ADMITTED > WAITING > NOT_IN_QUEUE**
+- 상태 응답에는 다음 폴링 시점 `nextPollAfterMs` 를 포함한다 (순번이 가까울수록 짧게: 1초 / 3초 / 5초). 클라이언트는 이 값을 따른다.
+
 ### 진입 (REQ-QUEUE-02)
 - 검증: `openAt ≤ now < closeAt` (queue meta), 잔여 정원 > 0
-- 이미 WAITING/ADMITTED 이면 현재 상태 그대로 반환 (멱등, 새로고침해도 순번 유지)
-- 순번: `INCR queue:{dropId}:seq` → `ZADD NX waiting seq userId`
+  - **잔여 정원 키(`entry:{dropId}:remaining`)가 아직 없으면** (entry 가 `drop.created` 를 처리하기 전) 진입은 허용하고 입장만 보류한다
+- **`enqueue.lua` 하나로 원자 처리**: 토큰 보유 확인 → 대기 여부 확인 → `INCR queue:{dropId}:seq` → `ZADD NX waiting seq userId`
+  - 이미 WAITING/ADMITTED 이면 현재 상태 그대로 반환 (멱등, 새로고침해도 순번 유지). 신규·재진입 모두 200
   - 타임스탬프 대신 카운터를 쓰는 이유: 같은 ms 진입 시 동점 방지, 서버 간 시계 차이 무관
 
 ### 입장 처리 스케줄러 (REQ-QUEUE-04, 05)
-- 주기 1초, 배치 크기 N (설정값, 예: 100)
-- `ZPOPMIN waiting N` → 각 userId 에 `SET token:{userId} EX 300`
-- `ZPOPMIN` 은 원자적이므로 같은 사용자가 두 번 입장되지 않는다
-- 잔여 정원 ≤ 0 이면 입장 중단 (토큰을 줘도 응모 불가)
-- 오픈 중인 드로우 목록은 queue meta 에서 조회
+- 주기 1초, 배치 크기 N (설정값, 예: 100, 최대 1,000). 드로우마다 N 을 적용
+- **`admit.lua` 하나로 원자 처리**: 잔여 정원 확인(없거나 ≤ 0 이면 중단) → `ZPOPMIN waiting N` → 각 userId 에 `SET token:{userId} EX 300`
+  - 대기열에서 빠졌는데 토큰이 없는 상태가 생기지 않는다
+- 오픈 중인 드로우 목록은 인덱스 `queue:active-drops` (ZSet, score=closeAt) 에서 조회한다. `queue:*:meta` 를 `KEYS`/`SCAN` 하지 않는다. 마감이 지난 드로우는 인덱스에서 제거
+- **다중 인스턴스 게이트**: 실행 전 `SET queue:admission:gate {instanceId} NX PX {interval}` 를 잡고, **작업 후 해제하지 않는다**. 해제하면 같은 1초 안에 다른 인스턴스가 다시 실행해 초당 2N명이 입장할 수 있다 → 전역 "주기당 1회" 게이트
 
 ### API
 | Method | Path | 설명 |
@@ -89,39 +94,40 @@ sequenceDiagram
     U->>GW: POST /api/queue/drops/{id}
     GW->>QS: X-User-Id
     QS->>R: HGET queue:{id}:meta (openAt, closeAt)
-    QS->>R: GET entry:{id}:remaining
+    QS->>R: GET entry:{id}:remaining (없으면 진입 허용)
     alt 오픈 전/마감 후 또는 잔여 0
         QS-->>U: 409 NOT_OPEN / CLOSED / SOLD_OUT
-    else 이미 토큰 보유
-        QS-->>U: ADMITTED
-    else 이미 대기 중
-        QS->>R: ZRANK
-        QS-->>U: WAITING(position)
-    else 신규
-        QS->>R: INCR seq → ZADD NX waiting
-        QS-->>U: WAITING(position)
+    else 진입
+        QS->>R: EVALSHA enqueue.lua
+        Note over R: 토큰 보유 → ADMITTED<br/>대기 중 → 현재 순번<br/>신규 → INCR seq + ZADD NX
+        QS-->>U: 200 상태 + position + nextPollAfterMs
     end
 
-    loop 매 1초
-        SCH->>R: GET entry:{id}:remaining
-        alt remaining > 0
-            SCH->>R: ZPOPMIN waiting N
-            SCH->>R: SET token:{userId} EX 300 (각 사용자)
+    loop 매 1초 (모든 인스턴스)
+        SCH->>R: SET queue:admission:gate NX PX 1000
+        alt 게이트 획득
+            SCH->>R: ZRANGEBYSCORE queue:active-drops (now, +inf)
+            loop 활성 드로우마다
+                SCH->>R: EVALSHA admit.lua (remaining 확인 → ZPOPMIN N → SET token EX 300)
+            end
+        else 다른 인스턴스가 이미 실행
+            Note over SCH: 이번 주기 건너뜀
         end
     end
 ```
 
 **읽는 법**
-- "이미 대기 중 / 이미 토큰 보유" 분기 덕분에 새로고침이나 중복 클릭이 순번을 뒤로 밀지 않는다.
-- 신규 진입의 `INCR → ZADD NX` 는 두 명령이라 원자적이지 않다. 같은 사용자가 동시에 두 번 요청하면 seq 하나가 낭비되지만, `NX` 때문에 순번이 두 개 생기지는 않는다 (허용 가능한 빈 번호).
-- `ZPOPMIN` 과 `SET token` 사이에 장애가 나면 해당 사용자는 대기열에서 빠졌는데 토큰이 없다 → NOT_IN_QUEUE 로 보이고 재진입 시 맨 뒤로 간다. 피하려면 두 동작을 Lua 하나로 묶는다 (**구현 시 Lua 로 묶는 것을 권장**).
+- "이미 대기 중 / 이미 토큰 보유" 판정이 `enqueue.lua` 안에 있어 새로고침·중복 클릭·동시 요청이 순번을 뒤로 밀거나 순번을 두 개 만들지 않는다.
+- `admit.lua` 가 잔여 정원 확인·`ZPOPMIN`·토큰 발급을 한 번에 하므로, 대기열에서 빠졌는데 토큰이 없는 사용자가 생기지 않는다.
+- 게이트를 해제하지 않는 것이 핵심이다. TTL(1초)이 곧 "주기당 1회"의 경계다.
 
 ### 5.3 클래스 / 저장 구조
 - DB 없음. Redis 키는 [architecture.md](../02-architecture/architecture.md) 5장 참고.
 - 클래스는 [class-diagram.md](../07-class-diagram/class-diagram.md) 의 queue-service 참고.
 
 ## 6. 잠재 리스크
-- **다중 인스턴스 스케줄러**: queue-service 가 2대면 초당 2N명이 입장된다. 선택지: (a) Redis 분산 락(`SET NX EX`)으로 한 인스턴스만 실행, (b) 처리량이 인스턴스 수에 비례함을 받아들이고 N 을 나눠 설정. 1차는 (a) 권장.
+- **다중 인스턴스 스케줄러**: 미해제 게이트로 주기당 1회만 실행한다. 게이트 TTL 과 각 인스턴스의 실행 주기가 어긋나면 실제 입장 간격이 1~2초 사이로 흔들릴 수 있다 → 처리량은 "초당 N명 이하"로만 보장된다.
+- **Redis Cluster 비호환**: Lua 가 여러 키(entry 소유 키 포함)를 다루므로 단일 Redis 전제. Cluster 전환 시 해시 태그(`{drop:1}`)로 키 재설계 필요.
 - **토큰을 받고 응모하지 않는 사용자**: 정원은 남는데 입장 기회만 소모 → TTL 로 회수. 정원 소진 전까지는 스케줄러가 계속 입장시키므로 결국 정원은 채워진다.
-- **폴링 부하**: 대기자 수 × 폴링 주기만큼 조회 요청. 대기 순번에 따라 폴링 간격을 늘리도록(서버가 `nextPollAfterMs` 응답) 클라이언트를 설계하면 완화.
-- **잔여 정원 키 공유**: queue 가 entry 소유 키를 읽음 → 키 이름 변경 시 두 서비스 동시 수정 필요.
+- **폴링 부하**: 대기자 수 × 폴링 주기만큼 조회 요청. 서버가 `nextPollAfterMs` 로 간격을 늘려 완화하지만, 클라이언트가 따르지 않으면 효과 없다.
+- **잔여 정원 키 공유**: queue 가 entry 소유 키를 읽음 → 키 이름 변경 시 두 서비스 동시 수정 필요. 키가 없으면 "입장 보류"로 동작하므로, entry 가 키 형식을 바꾸면 조용히 입장이 멈춘다 → 통합 테스트로 고정.

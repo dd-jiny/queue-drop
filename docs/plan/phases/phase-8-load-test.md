@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | 튜닝 프로퍼티 이름을 1·3·4·5·6단계 문서와 일치(발행 재시도 항목 제거 — 애플리케이션 재시도 없음 확정), 관리자 계정 생성 확정 반영, 설계 반영 완료 표시 |
 
 ---
 
@@ -157,18 +158,19 @@ management:
 > **커스텀 메트릭 위치 (구현 결정)**: application 계층은 Micrometer 에 의존하지 않는다. 판정 결과 카운트는 presentation(Controller/ExceptionHandler)에서, 보상·입장 카운트는 infrastructure 어댑터(`RedisEntryGate.compensate`, `RedisWaitingQueueRepository.admit`)에서 기록한다.
 
 #### 튜닝 파라미터 환경변수화
-부하 테스트 중 재빌드 없이 바꿀 값들. 프로퍼티 이름은 3·4·5단계 구현 상세 문서의 이름과 반드시 맞춘다 (아래는 Spring relaxed binding 기준 가정 — 구현 결정).
+부하 테스트 중 재빌드 없이 바꿀 값들. 프로퍼티 이름은 1·3·4·5·6단계 구현 상세 문서와 일치시켰다 (환경변수는 Spring relaxed binding).
 
-| 서비스 | 프로퍼티 (가정) | 환경변수 | 기본값 |
-|--------|-----------------|----------|--------|
-| queue | `queue.admission.batch-size` | `QUEUE_ADMISSION_BATCH_SIZE` | 100 |
-| queue | `queue.admission.interval-ms` | `QUEUE_ADMISSION_INTERVAL_MS` | 1000 |
-| queue | `queue.token.ttl` | `QUEUE_TOKEN_TTL` | 300s |
-| entry | `entry.publish.timeout` | `ENTRY_PUBLISH_TIMEOUT` | 3s |
-| entry | `entry.publish.retries` | `ENTRY_PUBLISH_RETRIES` | 2 |
-| entry | `entry.draw.interval-ms` | `ENTRY_DRAW_INTERVAL_MS` | 5000 |
-| coupon | `coupon.publish.timeout` | `COUPON_PUBLISH_TIMEOUT` | 3s |
-| user | `jwt.expiration` | `JWT_EXPIRATION` | 부하 테스트 시 2h |
+| 서비스 | 프로퍼티 | 환경변수 | 기본값 | 출처 |
+|--------|----------|----------|--------|------|
+| queue | `queue.admission.batch-size` | `QUEUE_ADMISSION_BATCH_SIZE` | 100 | 3단계 |
+| queue | `queue.admission.interval-ms` | `QUEUE_ADMISSION_INTERVAL_MS` | 1000 | 3단계 |
+| queue | `queue.admission.token-ttl-seconds` | `QUEUE_ADMISSION_TOKEN_TTL_SECONDS` | 300 | 3단계 |
+| entry | `entry.publish.await-timeout` | `ENTRY_PUBLISH_AWAIT_TIMEOUT` | 3500ms | 4단계 |
+| entry | `entry.draw.interval-ms` | `ENTRY_DRAW_INTERVAL_MS` | 5000 | 5단계 |
+| coupon | `coupon.publish.await-timeout` | `COUPON_PUBLISH_AWAIT_TIMEOUT` | 3500ms | 6단계 |
+| user | `queuedrop.jwt.access-token-ttl` | `QUEUEDROP_JWT_ACCESS_TOKEN_TTL` | 1h (부하 테스트 시 2h) | 1단계 |
+
+> 발행 재시도 횟수는 튜닝 대상이 아니다. 응모·쿠폰은 **애플리케이션 재시도 없이 producer 내부 재시도**만 쓴다(0단계 확정). 발행 시간 상한을 바꾸려면 `spring.kafka.producer.properties.delivery.timeout.ms`(`SPRING_KAFKA_PRODUCER_PROPERTIES_DELIVERY_TIMEOUT_MS`)와 위 `await-timeout`(delivery + 500ms)을 **함께** 조정한다.
 | 공통 | `spring.kafka.listener.concurrency` | `SPRING_KAFKA_LISTENER_CONCURRENCY` | 1 (파티션 수 이하로 조정) |
 | 공통 | `spring.datasource.hikari.maximum-pool-size` | `SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE` | 10 |
 
@@ -251,8 +253,8 @@ services:
     environment:
       <<: [*db-env, *kafka-env]
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 필요}
-      JWT_EXPIRATION: ${JWT_EXPIRATION:-2h}
-      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@queuedrop.test}         # 6장 "설계 수정 필요" 참고
+      QUEUEDROP_JWT_ACCESS_TOKEN_TTL: ${QUEUEDROP_JWT_ACCESS_TOKEN_TTL:-2h}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@queuedrop.test}         # 1단계 관리자 계정 초기화 (확정)
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin!2345}
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8081/actuator/health"]
@@ -276,7 +278,7 @@ services:
       <<: [*redis-env, *kafka-env]
       QUEUE_ADMISSION_BATCH_SIZE: ${QUEUE_ADMISSION_BATCH_SIZE:-100}
       QUEUE_ADMISSION_INTERVAL_MS: ${QUEUE_ADMISSION_INTERVAL_MS:-1000}
-      QUEUE_TOKEN_TTL: ${QUEUE_TOKEN_TTL:-300s}
+      QUEUE_ADMISSION_TOKEN_TTL_SECONDS: ${QUEUE_ADMISSION_TOKEN_TTL_SECONDS:-300}
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8083/actuator/health"]
     depends_on: *infra-deps
@@ -287,7 +289,7 @@ services:
     container_name: queuedrop-coupon
     environment:
       <<: [*db-env, *redis-env, *kafka-env]
-      COUPON_PUBLISH_TIMEOUT: ${COUPON_PUBLISH_TIMEOUT:-3s}
+      COUPON_PUBLISH_AWAIT_TIMEOUT: ${COUPON_PUBLISH_AWAIT_TIMEOUT:-3500ms}
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8084/actuator/health"]
     depends_on: *infra-deps
@@ -298,8 +300,7 @@ services:
     container_name: queuedrop-entry
     environment:
       <<: [*db-env, *redis-env, *kafka-env]
-      ENTRY_PUBLISH_TIMEOUT: ${ENTRY_PUBLISH_TIMEOUT:-3s}
-      ENTRY_PUBLISH_RETRIES: ${ENTRY_PUBLISH_RETRIES:-2}
+      ENTRY_PUBLISH_AWAIT_TIMEOUT: ${ENTRY_PUBLISH_AWAIT_TIMEOUT:-3500ms}
       ENTRY_DRAW_INTERVAL_MS: ${ENTRY_DRAW_INTERVAL_MS:-5000}
       SPRING_KAFKA_LISTENER_CONCURRENCY: ${ENTRY_LISTENER_CONCURRENCY:-3}
     healthcheck:
@@ -938,15 +939,15 @@ done
 | 모니터링 스택 | Actuator + CLI 우선, Prometheus·Grafana 는 선택 | 병목 분석이 막히면 도입 |
 
 ### 설계 수정 필요
-- **관리자 계정 생성 방법이 설계에 없다.** 드로우·쿠폰 이벤트 등록은 ADMIN 권한이 필요한데, 회원가입은 USER 만 만든다. 기본안: user-service 기동 시 `ADMIN_EMAIL`/`ADMIN_PASSWORD` 환경변수가 있으면 관리자 계정을 없을 때만 생성 (1단계에서 미반영 시 8단계에서 추가). [requirements.md](../../design/01-requirements/requirements.md) 액터(관리자)·[architecture.md](../../design/02-architecture/architecture.md) 6장에 생성 방식 명시 필요.
-- **튜닝 프로퍼티 이름 통일**: 3.2 표의 프로퍼티 이름은 가정이다. 3·4·5·6단계 구현 상세와 다르면 그쪽 이름을 따르고, [infrastructure.md](../../design/03-infrastructure/infrastructure.md) 4장 환경변수 표에 추가해야 한다.
-- **[infrastructure.md](../../design/03-infrastructure/infrastructure.md) 3장**: app / loadtest / monitoring 프로필과 "서비스 컨테이너 환경에서는 `KAFKA_BOOTSTRAP_SERVERS=kafka:29092`" 를 반영해야 한다.
+- **관리자 계정 생성 방법이 설계에 없다.** 드로우·쿠폰 이벤트 등록은 ADMIN 권한이 필요한데, 회원가입은 USER 만 만든다. **확정 (2026-11-16)**: user-service 기동 시 `ADMIN_EMAIL`/`ADMIN_PASSWORD` 환경변수가 있으면 관리자 계정을 없을 때만 생성 — 1단계에서 구현([phase-1-auth.md](phase-1-auth.md) 3.6). [requirements.md](../../design/01-requirements/requirements.md) 액터(관리자)·[architecture.md](../../design/02-architecture/architecture.md) 6장에 생성 방식 명시 필요. → 설계 반영 완료 (2026-11-16)
+- **튜닝 프로퍼티 이름 통일**: 3.2 표는 1·3·4·5·6단계 구현 상세의 이름과 일치시켰다 (2026-11-16). [infrastructure.md](../../design/03-infrastructure/infrastructure.md) 4장 환경변수 표에 추가해야 한다. → 설계 반영 완료 (2026-11-16)
+- **[infrastructure.md](../../design/03-infrastructure/infrastructure.md) 3장**: app / loadtest / monitoring 프로필과 "서비스 컨테이너 환경에서는 `KAFKA_BOOTSTRAP_SERVERS=kafka:29092`" 를 반영해야 한다. → 설계 반영 완료 (2026-11-16)
 
 ### 리스크
 - **k6 와 서비스가 같은 머신**: 부하 발생기가 CPU 를 나눠 써서 서비스 처리량이 낮게 측정될 수 있다. 리포트에 명시하고, 가능하면 k6 를 다른 머신에서 실행한다.
 - **k6 VU 메모리**: VU 하나당 수 MB 가 들어 3,000~5,000 VU 는 수 GB 가 필요할 수 있다. 첫 실행에서 `docker stats` 로 확인하고 USERS 를 조정한다.
 - **로그인 BCrypt 부하**: 모든 VU 가 시작 시 로그인 → user-service CPU 급증. `OPEN_DELAY_SEC` 안에 로그인이 끝나는지 확인 (끝나지 않으면 지연 늘리기).
-- **JWT 만료**: 기본 만료가 짧으면 긴 대기열 폴링 중 401 이 난다 → 부하 테스트 시 `JWT_EXPIRATION=2h`.
+- **JWT 만료**: 기본 만료가 짧으면 긴 대기열 폴링 중 401 이 난다 → 부하 테스트 시 `QUEUEDROP_JWT_ACCESS_TOKEN_TTL=2h`.
 - **입장 처리량 상한**: 배치 100 · 1초면 초당 100명만 응모 단계에 도달한다. 응모 API 의 한계를 보려면 배치를 키운 S5 결과를 함께 봐야 한다 (대기열이 의도대로 응모 부하를 막고 있다는 증거이기도 함).
 - **k6 결과 디렉터리 권한**: `grafana/k6` 이미지는 비루트 사용자로 실행된다. `/results` 마운트에 쓰기 실패하면 디렉터리 권한을 열거나 `user:` 를 지정한다.
 - **`handleSummary` 의 `setup_data`, `jslib` 원격 import**: k6 버전에 따라 동작이 다를 수 있다 (구현 시 확인). 네트워크가 막힌 환경이면 `textSummary` 를 로컬 파일로 내려받는다.

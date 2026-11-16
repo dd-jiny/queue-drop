@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 (인증, 전체 흐름, 쿠폰, 랭킹, 장애 시나리오) | 전체 |
 | v1.1 | 2026-11-16 | 5.2 응모 번호 재사용 문제 해결 반영 (별도 seq 카운터) 및 해결 후 시퀀스 추가 | NFR-03 |
+| v1.2 | 2026-11-16 | 5.1 애플리케이션 재시도 제거(producer 내부 재시도), 저장 컨슈머의 저장 전 Redis 확인·ON CONFLICT 반영 (응모·쿠폰) | D2, phase-4·6 구현 상세 6장 |
 
 ## 쉬운 설명
 > 기능 문서(`05-features/`)의 시퀀스가 "창구 하나에서 무슨 일이 일어나는지"라면,
@@ -150,8 +151,8 @@ sequenceDiagram
     ES->>K: entry.created (ack 대기)
     ES-->>U: 202 {entrySeq}
     par
-        K->>ES: EntryCreatedConsumer → INSERT entries
-        ES->>EDB: INSERT (UNIQUE 위반 무시)
+        K->>ES: EntryCreatedConsumer → SISMEMBER applicants 확인
+        ES->>EDB: INSERT ... ON CONFLICT DO NOTHING
     and
         K->>RS: Lua: dedupe + ZINCRBY ×3
     end
@@ -218,7 +219,8 @@ sequenceDiagram
         CS->>K: coupon.issued (ack 대기)
         CS-->>U: 202
         K->>CS: CouponIssuedConsumer
-        CS->>DB: INSERT issued_coupons (UNIQUE 위반 무시)
+        CS->>R: SISMEMBER issued (없으면 스킵 — 초과 발급 방지)
+        CS->>DB: INSERT issued_coupons ... ON CONFLICT DO NOTHING
     end
 
     U->>GW: GET /api/coupons/me
@@ -292,16 +294,15 @@ sequenceDiagram
     U->>ES: 응모
     ES->>R: Lua 판정
     R-->>ES: OK(entrySeq) — 정원 1 차감됨
-    ES-xK: entry.created (타임아웃)
-    ES-xK: 재시도 1 (실패)
-    ES-xK: 재시도 2 (실패)
+    ES-xK: entry.created — get(3.5s)
+    Note over ES,K: producer 내부 멱등 재시도만 (delivery.timeout.ms=3000)<br/>애플리케이션은 다시 send 하지 않음
     rect rgb(255, 235, 235)
     ES->>R: compensate.lua: SREM applicants == 1 이면 INCR remaining
     end
     ES-->>U: 503 다시 시도해 주세요
     Note over U,R: 정원·응모자 상태가 판정 전으로 복구 → 사용자는 재응모 가능 (토큰 TTL 내)
 ```
-**읽는 법**: "성공 응답 = 이벤트 기록" 불변식을 지키기 위해 실패를 사용자에게 돌려준다. 토큰은 삭제하지 않았으므로 복구할 필요가 없다.
+**읽는 법**: "성공 응답 = 이벤트 기록" 불변식을 지키기 위해 실패를 사용자에게 돌려준다. 토큰은 삭제하지 않았으므로 복구할 필요가 없다. 애플리케이션이 다시 send 하지 않는 이유: 다시 보낸 레코드는 Kafka 가 별개로 받아 멱등 producer 도 중복을 막지 못하고, 앞선 send 가 보상 이후 늦게 기록되는 유령 이벤트(5.2)를 늘리기 때문이다.
 
 ### 5.2 발행이 실제로는 성공했는데 타임아웃으로 판단한 경우
 ```mermaid

@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 (Phase 1 합의) | NFR-01 ~ NFR-04 |
 | v1.1 | 2026-11-16 | D2 남는 리스크에 '보상 후 응모 번호 재사용' 과 해결 방식(별도 seq 카운터) 추가 | NFR-03 |
+| v1.2 | 2026-11-16 | D2 재시도를 producer 내부 멱등 재시도로 변경(애플리케이션 재시도 제거), 저장 전 Redis 확인 확정, D4 발행 방식 확정(어댑터 내 afterCommit), 저장 컨슈머 DLT 추가 | NFR-03, phase-4·6 구현 상세 6장 |
 
 > 이 문서는 여러 기능에 걸친 **비기능 결정**의 합의 기록이다.
 > 기능 설계 문서(응모, 쿠폰, 추첨, 대기열)는 모두 이 결정을 전제로 한다.
@@ -16,9 +17,9 @@
 | 결정점 | 선택 | 포기한 대안 |
 |--------|------|-------------|
 | D1. 선착순 판정 위치 / 진실의 원천 | **Redis Lua 원자 판정 + Kafka 비동기 DB 저장** | Redis 판정 + DB 동기 저장, DB 락 판정 |
-| D2. Kafka 발행 실패 시 | **동기 발행 확인 + 재시도, 초과 시 Redis 보상(롤백) 후 실패 응답** | 보정 배치(Reconciliation) |
+| D2. Kafka 발행 실패 시 | **동기 발행 확인(producer 내부 멱등 재시도, 3초 제한), 실패 시 Redis 보상(롤백) 후 실패 응답 + 저장 전 Redis 확인** | 보정 배치(Reconciliation), 애플리케이션 재시도 |
 | D3. 입장 토큰 검증 | **entry-service 가 공유 Redis 를 직접 조회 (응모 Lua 안에서)** | queue REST 호출, 서명 토큰(JWT) |
-| D4. 드로우 정보 전파 | **Kafka `DropCreated` 이벤트로 entry/queue/ranking 에 복제** | 필요 시 REST 조회 |
+| D4. 드로우 정보 전파 | **Kafka `DropCreated` 이벤트로 entry/queue/ranking 에 복제 (커밋 후 발행, 재발행 API)** | 필요 시 REST 조회, Outbox |
 | D5. 추첨 위치 | **entry-service 내부** | 별도 draw-service |
 | D6. 추첨 명단 기준 | **DB 기준. 마감 후 Redis 응모 수 == DB 응모 수 가 될 때까지 대기 후 추첨** | Redis 명단으로 즉시 추첨 |
 | D7. 추첨 공정성 | **시드 저장 셔플 (재현 가능)** | 단순 무작위 |
@@ -44,7 +45,7 @@
 
 ---
 
-## D2. Kafka 발행 실패 대응: 재시도 후 Redis 롤백
+## D2. Kafka 발행 실패 대응: 동기 확인 후 Redis 롤백
 
 **쉬운 설명**
 > 장부 기록을 우체통에 못 넣으면, 줄에서 잡아준 자리도 다시 풀어주고 "실패했어요, 다시 시도해 주세요"라고 답해요.
@@ -52,19 +53,25 @@
 
 **상세 설명**
 1. Lua 판정 성공
-2. `kafkaTemplate.send(...).get(timeout)` 로 **브로커 수신 확인(acks=all)까지 동기 대기**, 정해진 횟수 재시도
-3. 최종 실패 시 **보상 Lua** 실행: `SISMEMBER` 확인 후 `SREM applicants` + `INCR remaining`
-4. 클라이언트에 실패 응답 (재시도 가능 에러)
+2. `kafkaTemplate.send(...).get(3.5s)` 로 **브로커 수신 확인(acks=all)까지 동기 대기**
+   - 재시도는 **producer 내부 멱등 재시도**만 사용한다: `enable.idempotence=true`, `retries=MAX`, `request.timeout.ms=1000`, `delivery.timeout.ms=3000`
+   - **애플리케이션 재시도는 하지 않는다.** 애플리케이션이 같은 내용을 다시 `send` 하면 Kafka 는 별개 레코드로 받아 멱등 producer 도 중복을 막지 못하고, 앞선 send 가 보상 이후 뒤늦게 기록되는 **유령 이벤트**가 생기기 쉽다
+   - `delivery.timeout.ms` 로 전체 시간을 3초로 제한해 send 결과가 반드시 확정되게 한다 (`get` 타임아웃만 걸면 producer 가 기본 120초 동안 계속 재시도한다)
+3. 실패(예외 또는 3.5초 초과) 시 **보상 Lua** 실행: `SREM applicants` 결과가 1이면 `INCR remaining` (응모 번호 `seq` 는 되돌리지 않음)
+4. 클라이언트에 실패 응답 (재시도 가능 에러, 503)
+
+> 응모(entry)와 선착순 쿠폰(coupon)이 같은 규칙을 쓴다.
 
 **불변식**: "성공 응답을 받은 응모 = Kafka 에 반드시 기록된 응모"
 
 **남는 리스크**
 - 발행은 실제로 성공했는데 타임아웃으로 실패로 판단 → 보상 실행 → **DB 에는 기록되지만 Redis 에는 없음**.
-  → 컨슈머가 저장 시 Redis 에 없는 응모를 감지할 수 있도록 D6 의 건수 비교에서 불일치로 드러남.
-  → 대응 선택지(구현 시 결정): (a) 컨슈머가 Redis 에서 SISMEMBER 확인 후 없으면 저장 스킵, (b) 불일치 알림 후 수동 처리
+  → **확정**: 저장 컨슈머가 저장 전 Redis `SISMEMBER` 로 확인하고, 없으면(보상된 응모·발급) 저장하지 않는다.
+  → 쿠폰은 추첨의 건수 비교(D6) 같은 사후 안전장치가 없어서, 이 확인이 없으면 유령 이벤트가 곧 **초과 발급**이 된다. 응모·쿠폰 모두 필수.
 - **보상 후 응모 번호 재사용** (해결됨): 번호를 `M - remaining` 으로 계산하면 보상 후 같은 번호가 재발급되어 정상 응모가 DB 유니크 제약에서 누락될 수 있다.
   → `entrySeq` 를 **되돌리지 않는 별도 카운터(`INCR entry:{dropId}:seq`)** 로 발급. 빈 번호는 허용한다 (번호는 정렬 기준일 뿐 당첨은 셔플로 결정).
 - 보상 Lua 자체가 실패하는 극단 케이스 → 정원 한 자리가 "새는" 상태. 오버 응모가 아니라 **언더 응모** 방향이므로 정합성 위반은 아님.
+- 저장 컨슈머 자체 실패(DB 장애 등) → 3회 재시도 후 `{topic}.DLT` 로 보낸다 (`entry.created.DLT`, `coupon.issued.DLT`). 응모는 Redis 에 있고 DB 에 없는 상태라 D6 건수 비교에서 드러나며, DLT 재처리로 복구한다.
 
 ---
 
@@ -92,9 +99,14 @@
 - queue-service: Redis 대기열 메타(오픈/마감 시각) 초기화
 - ranking-service: 랭킹 표시용 드로우 이름 저장
 
-**리스크**: 드로우 DB 저장 후 이벤트 발행 실패(이중 쓰기) → 드로우는 있는데 응모 불가.
-- 선택지(구현 시 결정): (a) `@TransactionalEventListener(AFTER_COMMIT)` + 재시도 (단순), (b) Transactional Outbox (확실, 구현량 증가)
-- 드로우 등록은 관리자 저빈도 작업이라 (a) 로 시작하고, 발행 실패 시 관리자 재발행 API 로 보완하는 것을 권장.
+**발행 방식 (확정)**: 커밋 후 발행 + 관리자 재발행 API. Outbox 는 사용하지 않는다.
+- application 은 포트(`DropEventPublisher`)만 호출하고 발행 시점을 모른다.
+- infrastructure 발행 어댑터가 `TransactionSynchronizationManager` 로 **`afterCommit` 에 발행을 등록**한다. 활성 트랜잭션이 없으면 즉시 발행한다. (회원가입 `user.registered` 도 같은 방식)
+- 롤백되면 발행되지 않는다. 커밋 후 발행이 최종 실패하면 ERROR 로그를 남기고, 관리자 재발행 API 로 복구한다.
+- 수신 측(entry/queue/ranking)은 재수신에 멱등해야 한다 (`SET NX`, `ON CONFLICT DO NOTHING`).
+- 수신 측 저장 실패: entry 의 `drop.created` 처리는 3회 재시도 후 `drop.created.DLT`. queue·ranking 은 Redis 쓰기만 하므로 3회 재시도 후 로그.
+
+**리스크**: 커밋 후 발행 실패(이중 쓰기) → 드로우는 있는데 응모 불가. 관리자 저빈도 작업이라 재발행 API 로 감당하고, 더 확실하게 하려면 Outbox 로 전환한다.
 - 드로우 **수정**은 1차 범위에서 제외 (등록 후 변경 불가) → 동기화 문제 회피.
 
 ---

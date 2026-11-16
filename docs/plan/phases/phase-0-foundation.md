@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | Flyway 확정, 공통 producer 설정을 4단계 기준(request 1000 / delivery 3000)으로 통일, DLT 토픽 3종 추가, 설계 반영 완료 표시 |
 
 ---
 
@@ -176,7 +177,7 @@ dependencies {
     implementation 'org.flywaydb:flyway-database-postgresql'
 }
 ```
-(기본안 — 0단계에서 확정: Flyway 도입)
+(확정: Flyway 도입, `ddl-auto: validate`)
 
 ---
 
@@ -194,6 +195,11 @@ public final class Topics {
     public static final String ENTRY_CREATED   = "entry.created";
     public static final String DRAW_COMPLETED  = "draw.completed";
     public static final String COUPON_ISSUED   = "coupon.issued";
+
+    /** 저장 컨슈머 실패 시 DefaultErrorHandler 가 3회 재시도 후 보내는 토픽 ({topic}.DLT 규칙) */
+    public static final String DROP_CREATED_DLT  = DROP_CREATED + ".DLT";
+    public static final String ENTRY_CREATED_DLT = ENTRY_CREATED + ".DLT";
+    public static final String COUPON_ISSUED_DLT = COUPON_ISSUED + ".DLT";
 
     private Topics() {}
 }
@@ -687,10 +693,11 @@ spring:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3), 구현 시 확인
       acks: all
+      retries: 2147483647          # 횟수가 아니라 delivery.timeout.ms 로 전체 시간을 제한
       properties:
         enable.idempotence: true
+        request.timeout.ms: 1000
         delivery.timeout.ms: 3000
-        request.timeout.ms: 2000
     consumer:
       group-id: ${spring.application.name}
       auto-offset-reset: earliest
@@ -701,7 +708,8 @@ spring:
         spring.json.trusted.packages: com.queuedrop.common.event
 ```
 - `acks: all`, `enable.idempotence: true` 는 [D2](../../design/04-non-functional/concurrency-consistency.md) "성공 응답 = 이벤트 기록" 의 전제.
-- `delivery.timeout.ms: 3000` 은 응모·쿠폰의 동기 발행 대기(3초)와 맞춘 값 (구현 결정). 4단계에서 부하 측정 후 조정.
+- **동기 발행 정책 (확정, 응모·쿠폰 공통)**: 애플리케이션 재시도 없음. producer 내부 재시도(멱등)만 사용하고 `request.timeout.ms=1000`, `delivery.timeout.ms=3000` 으로 send 결과가 3초 안에 확정되게 한다. 호출 측 `send().get()` 대기는 3.5초, 최종 실패 시 보상. 근거는 [phase-4-entry-apply.md](phase-4-entry-apply.md) 3장 (애플리케이션이 다시 send 하면 멱등 producer 도 별개 레코드로 취급해 유령 이벤트가 생긴다).
+- 저빈도 이벤트를 보내는 서비스(user, product)는 발행 대기 시간이 응답에 포함되지 않으므로 `delivery.timeout.ms` 를 서비스별로 늘려도 된다 (각 단계 문서 참고).
 - 토픽 하나에 한 종류 메시지만 흐르므로, 컨슈머 쪽 타입은 각 `@KafkaListener` 의 파라미터 타입 / 타입 헤더로 결정된다. 타입 헤더 매핑 방식은 2단계 첫 Listener 구현 시 확정한다.
 - user-service 는 1단계에서 Kafka 의존성을 추가할 때 이 블록을 넣는다 (현재 골격에 Kafka 없음).
 
@@ -816,6 +824,11 @@ create draw.completed  1
 create entry.created  6 --config retention.ms=2592000000
 create coupon.issued  6
 
+# DLT: 저장 컨슈머(entry, coupon)가 3회 재시도 후 보내는 토픽. 재처리용이라 파티션 1 (구현 결정)
+create drop.created.DLT  1
+create entry.created.DLT 1
+create coupon.issued.DLT 1
+
 "$TOPICS_BIN" --bootstrap-server "$BOOTSTRAP" --list
 ```
 
@@ -834,6 +847,7 @@ create coupon.issued  6
 | T0-05 | 단위 | presentation `GlobalExceptionHandlerTest` (entry-service 1곳) | Given `ApplicationException(CommonErrorCode.NOT_FOUND)` 를 던지는 테스트 컨트롤러 / When 호출 / Then 404 + `code=COMMON_NOT_FOUND` / 검증 실패 시 400 + fieldErrors | - |
 | T0-06 | 인프라 (수동) | - | Given `docker compose up -d` / When `docker compose ps` / Then postgres·redis·kafka healthy, kafka-init exit 0 | NFR-03 |
 | T0-07 | 인프라 (수동) | - | When `docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic entry.created` / Then PartitionCount 6, `retention.ms=2592000000` | REQ-RANK-03 |
+| T0-09 | 인프라 (수동) | - | When `kafka-topics.sh --list` / Then 토픽 8개(이벤트 5 + DLT 3: `drop.created.DLT`, `entry.created.DLT`, `coupon.issued.DLT`) | NFR-03 |
 | T0-08 | 인프라 (수동) | - | Given `redis-cli SET t 1` / When `docker compose restart redis` 후 `GET t` / Then `1` 유지, `CONFIG GET appendonly` = yes | NFR-01 |
 
 ---
@@ -851,7 +865,7 @@ create coupon.issued  6
 | 7 | `feat: 서비스별 전역 예외 처리기 추가` | 각 서비스 `GlobalExceptionHandler.java`, T0-05 |
 | 8 | `chore: Flyway 도입 및 JPA ddl-auto validate 전환` | JPA 서비스 `build.gradle`, `application.yml`, `db/migration/.gitkeep`, `ApplicationContextTest` |
 | 9 | `chore: Kafka 프로듀서·컨슈머 공통 설정 추가` | Kafka 서비스 `application.yml` |
-| 10 | `chore(infra): Redis AOF 활성화 및 Kafka 토픽 사전 생성` | `docker-compose.yml`, `infra/kafka/create-topics.sh` |
+| 10 | `chore(infra): Redis AOF 활성화 및 Kafka 토픽·DLT 토픽 사전 생성` | `docker-compose.yml`, `infra/kafka/create-topics.sh` |
 
 커밋 본문 예시 (#4):
 ```
@@ -866,18 +880,20 @@ test(common): ArchUnit 4계층 의존 규칙 R1~R7 추가
 
 ## 6. 결정 필요 · 리스크
 
-### 결정 필요
-| 항목 | 기본안 | 대안 |
-|------|--------|------|
-| DB 스키마 관리 | **Flyway 도입, `ddl-auto: validate`** (기본안 — 0단계에서 확정) | `ddl-auto: update` 유지 — 엔티티 분리 구조에서 스키마 변경 이력이 남지 않음 |
+### 결정 사항 (확정)
+| 항목 | 결정 | 포기한 대안 |
+|------|------|-------------|
+| DB 스키마 관리 | **Flyway 도입, `ddl-auto: validate`** (2026-11-16 확정) | `ddl-auto: update` 유지 — 엔티티 분리 구조에서 스키마 변경 이력이 남지 않음 |
+| Kafka 동기 발행 | **producer 내부 재시도 + `delivery.timeout.ms=3000`, 애플리케이션 재시도 없음** (2026-11-16 확정) | `get(3s)` + 애플리케이션 재시도 2회 |
+| DLT | 저장 컨슈머(entry, coupon)는 3회 재시도 후 `{topic}.DLT`. 랭킹은 로그·스킵 (2026-11-16 확정) | 전 컨슈머 로그·스킵 |
 
 ### 설계 수정 필요
 | 문서 | 내용 |
 |------|------|
-| [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 3장 | application 의존 허용 목록에 **`common.error`(ErrorCode, ApplicationException)** 추가. 4.5 의 "application 이 에러 코드 정의"는 유지 (서비스별 enum 이 `ErrorCode` 구현) |
-| [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 6장 | R3 금지 목록에 `org.springframework.web..`, `com.queuedrop.common.event..` 추가 (4.4 "application 은 common 메시지에 직접 의존하지 않는다"를 규칙화) |
-| [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 5장 | domain 하위 패키지에 `exception`(도메인 예외) 추가 — 4.5 에서 `DomainException` 을 언급하지만 패키지 구조에 없음 |
-| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 3장 | `DropCreated` 에 `productId` 필드 누락 — [architecture.md](../../design/02-architecture/architecture.md) 4장 페이로드에는 있음. 이 문서는 architecture.md 기준으로 `productId` 포함 |
+| [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 3장 | application 의존 허용 목록에 **`common.error`(ErrorCode, ApplicationException)** 추가. 4.5 의 "application 이 에러 코드 정의"는 유지 (서비스별 enum 이 `ErrorCode` 구현) → 설계 반영 완료 (2026-11-16) |
+| [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 6장 | R3 금지 목록에 `org.springframework.web..`, `com.queuedrop.common.event..` 추가 (4.4 "application 은 common 메시지에 직접 의존하지 않는다"를 규칙화) → 설계 반영 완료 (2026-11-16) |
+| [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 5장 | domain 하위 패키지에 `exception`(도메인 예외) 추가 — 4.5 에서 `DomainException` 을 언급하지만 패키지 구조에 없음 → 설계 반영 완료 (2026-11-16) |
+| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 3장 | `DropCreated` 에 `productId` 필드 누락 — [architecture.md](../../design/02-architecture/architecture.md) 4장 페이로드에는 있음. 이 문서는 architecture.md 기준으로 `productId` 포함 → 설계 반영 완료 (2026-11-16) |
 
 ### 리스크
 - **라이브러리 좌표 불확실**: Testcontainers 2.x 아티팩트·패키지명, Spring Kafka 4 의 Jackson 3 직렬화 클래스명(`JacksonJsonSerializer`)은 구현 시 실제 해석 결과로 확인한다. 다르면 이 문서의 코드 블록을 수정한다.
@@ -893,7 +909,7 @@ test(common): ArchUnit 4계층 의존 규칙 R1~R7 추가
 |----------------|-----------|
 | 모든 모듈 `./gradlew build` 통과, 각 서비스 `ArchitectureTest` 실행됨 | T0-01, T0-03, T0-04, T0-05 |
 | 계층 규칙을 일부러 어기면 테스트가 실패함 | T0-02 |
-| `docker compose up -d` 후 모든 컨테이너 healthy, 토픽 5개 생성 | T0-06, T0-07 |
+| `docker compose up -d` 후 모든 컨테이너 healthy, 토픽 5개 + DLT 3개 생성 | T0-06, T0-07, T0-09 |
 | (추가) Redis AOF 동작 | T0-08 |
-| 결정 필요 항목(Flyway) 확정 및 [implementation-plan.md](../implementation-plan.md) 4장 반영 | 6장 |
+| 결정 사항(Flyway) 확정 및 [implementation-plan.md](../implementation-plan.md) 4장 반영 — 완료 | 6장 |
 | 설계 수정 필요 항목 4건 설계 문서 반영 (변경 이력 추가) | 6장 |

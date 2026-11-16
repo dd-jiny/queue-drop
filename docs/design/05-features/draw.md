@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-ENTRY-05, 06 |
+| v1.1 | 2026-11-16 | 추첨 트랜잭션 첫 문장을 `CLOSING → DRAWN` 조건부 UPDATE 로 변경(동시 추첨 방지), `draw_results.published` 와 발행 실패 재발행 추가, 시드 생성 포트, 벌크 UPDATE 분할 | phase-5 구현 상세 6장 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-ENTRY-05: 응모 마감 시각에 자동 추첨, 응모자 중 K명 무작위 (정원이 일찍 차도 마감 시각까지 대기)
@@ -29,12 +30,15 @@ OPEN ──(closeAt 도달, 조건부 UPDATE)──▶ CLOSING ──(건수 일
 2. **건수 일치 확인**: `SCARD entry:{id}:applicants` == `SELECT COUNT(*) FROM entries WHERE drop_id=?`
    - 불일치 → 이번 주기는 종료, 다음 주기 재확인. `CLOSING` 상태가 일정 시간(예: 5분) 넘으면 경고 로그
 3. **추첨 (하나의 DB 트랜잭션)**
+   - **첫 문장**: `UPDATE drop_snapshots SET status='DRAWN' WHERE drop_id=? AND status='CLOSING'`
+     - 영향 행 0 → 다른 인스턴스가 이미 추첨함 → 롤백하고 종료
+     - 이 UPDATE 가 행 잠금을 잡으므로, 두 인스턴스가 같은 드로우를 동시에 추첨하지 못한다 (나중에 온 쪽은 잠금을 기다린 뒤 0행)
    - `SELECT user_id FROM entries WHERE drop_id=? ORDER BY entry_seq`
-   - `seed = SecureRandom.nextLong()`, `Collections.shuffle(list, new Random(seed))`
-   - 앞 `min(K, 응모자 수)` 명 → `WON`, 나머지 → `LOST` (bulk update)
-   - `INSERT draw_results (drop_id, seed, applicant_count, winner_count, drawn_at)`
-   - `UPDATE drop_snapshots SET status='DRAWN'`
-4. **결과 이벤트**: 커밋 후 `draw.completed` 발행 → product-service 가 드로우 상태 DRAWN 반영
+   - 시드: application 포트 `SeedGenerator` 로 생성 (구현은 `SecureRandom`, 테스트는 고정값) → `Collections.shuffle(list, new Random(seed))`
+   - 앞 `min(K, 응모자 수)` 명 → `WON`, 나머지 → `LOST` (벌크 UPDATE, 1,000건 단위로 나눠 실행)
+   - `INSERT draw_results (drop_id, seed, applicant_count, winner_count, drawn_at, published=false)`
+4. **결과 이벤트**: 커밋 후 `draw.completed` 발행 → 성공 시 `draw_results.published=true` → product-service 가 드로우 상태 DRAWN 반영
+   - 발행 실패 → `published=false` 로 남고, 스케줄러가 다음 주기에 미발행 결과를 다시 발행한다 (product 쪽 처리는 멱등)
 
 ### 경계 케이스
 | 케이스 | 처리 |
@@ -43,11 +47,13 @@ OPEN ──(closeAt 도달, 조건부 UPDATE)──▶ CLOSING ──(건수 일
 | 응모자 0명 | 당첨 0, draw_results 는 기록 |
 | CLOSING 중 서버 재시작 | 다음 주기에 CLOSING 상태 드로우도 대상으로 2단계부터 재시도 |
 | 추첨 트랜잭션 실패 | 롤백 → CLOSING 유지 → 다음 주기 재시도 (새 시드로) |
+| 두 인스턴스가 동시에 추첨 시도 | 첫 문장(`CLOSING → DRAWN`)의 행 잠금으로 한쪽만 진행, 다른 쪽은 0행 → 종료 |
+| `draw.completed` 발행 실패 | `published=false` → 다음 주기 재발행 |
 
 ### API
 | Method | Path | 설명 |
 |--------|------|------|
-| GET | `/api/entries/drops/{dropId}/me` | 내 결과 (APPLIED / WON / LOST) |
+| GET | `/api/entries/drops/{dropId}/me` | 내 결과 (APPLIED / WON / LOST) — 응모 단건 조회와 같은 API ([entry-apply.md](entry-apply.md)) |
 | GET | `/api/entries/drops/{dropId}/result` | 추첨 요약 (응모자 수, 당첨 수, 추첨 시각, 시드) |
 
 ## 4. 설계 결정
@@ -56,7 +62,7 @@ OPEN ──(closeAt 도달, 조건부 UPDATE)──▶ CLOSING ──(건수 일
 | 추첨 위치 | entry-service | 응모 데이터 로컬 조회 / entry 책임 증가 |
 | 추첨 시점 | 마감 시각 자동 | 시점 명확·재현 가능 / 정원 조기 마감 시에도 대기 |
 | 명단 기준 | DB + 건수 일치 대기 | 결과가 영속 데이터와 일치 / 추첨 지연 가능 |
-| 중복 추첨 방지 | 조건부 UPDATE (OPEN→CLOSING) | 분산 락 불필요 / DB 왕복 1회 |
+| 중복 추첨 방지 | 마감 잠금(OPEN→CLOSING) + 추첨 트랜잭션 첫 문장(CLOSING→DRAWN) 조건부 UPDATE | 분산 락 불필요 / 추첨 중 해당 행 잠금 유지 |
 | 공정성 | entry_seq 정렬 + 시드 셔플 | 재현·감사 가능 / 시드 공개 시 결과 검증 가능하지만 사전 예측 불가 |
 
 ## 5. 다이어그램
@@ -88,22 +94,29 @@ sequenceDiagram
         else 일치
             rect rgb(240, 240, 255)
             Note over SCH,DB: 단일 트랜잭션
-            SCH->>DB: SELECT entries ORDER BY entry_seq
-            SCH->>SCH: shuffle(seed) → 앞 K명 WON
-            SCH->>DB: bulk UPDATE status
-            SCH->>DB: INSERT draw_results(seed)
-            SCH->>DB: UPDATE status=DRAWN
+            SCH->>DB: UPDATE status=DRAWN WHERE status=CLOSING (행 잠금)
+            alt 0행
+                Note over SCH: 다른 인스턴스가 추첨함 → 종료
+            else 1행
+                SCH->>DB: SELECT entries ORDER BY entry_seq
+                SCH->>SCH: shuffle(seed) → 앞 K명 WON
+                SCH->>DB: bulk UPDATE status (1,000건 단위)
+                SCH->>DB: INSERT draw_results(seed, published=false)
+            end
             end
             SCH->>K: draw.completed
+            SCH->>DB: published=true
             K->>PS: 드로우 상태 DRAWN
         end
     end
+    Note over SCH: 매 주기: published=false 인 결과 재발행
 ```
 
 **읽는 법**
 - `CLOSING` 은 "닫혔지만 아직 안 뽑음" 을 나타내는 **재시작 지점**이다. 어떤 단계에서 죽어도 CLOSING 이 남아 있으므로 다음 주기에 이어서 진행된다.
 - 마감 잠금(DB 조건부 UPDATE)이 Redis CLOSED 보다 먼저다. 두 작업 사이에 죽으면 Redis 는 아직 OPEN 이지만 Lua 가 `closeAt` 시각도 함께 검사하므로 마감 후 응모는 들어오지 않는다.
-- 회색 박스(트랜잭션) 밖의 `draw.completed` 발행이 실패하면 product 의 표시 상태만 늦어진다 → 결과 조회는 entry 가 진실의 원천이므로 영향 없음.
+- 트랜잭션의 **첫 문장이 상태 전이**다. 이 UPDATE 가 행 잠금을 잡아서, 동시에 들어온 다른 인스턴스는 잠금이 풀린 뒤 0행을 보고 빠진다.
+- 박스(트랜잭션) 밖의 `draw.completed` 발행이 실패하면 product 의 표시 상태만 늦어진다 → `published=false` 로 남아 다음 주기에 재발행된다. 결과 조회는 entry 가 진실의 원천이므로 영향 없음.
 
 ### 5.2 ERD
 [erd.md](../06-erd/erd.md) 의 entry_db (`drop_snapshots`, `entries`, `draw_results`) 참고.

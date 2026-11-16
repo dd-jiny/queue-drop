@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
+| v1.1 | 2026-11-16 | 커밋 후 발행을 1단계와 같은 방식(발행 어댑터 안의 `TransactionSynchronization.afterCommit`)으로 교체 — Spring 이벤트 중계 구조 제거, 재시도는 producer 내부 재시도로 일원화. 이벤트 발행 방식 확정, 설계 반영 완료 표시 |
 
 ---
 
@@ -78,9 +79,7 @@ product-service/
     │   │   │   │   ├── DropMapper.java
     │   │   │   │   └── DropRepositoryImpl.java
     │   │   │   ├── messaging
-    │   │   │   │   ├── SpringDropEventPublisher.java      # 포트 구현: Spring 내부 이벤트로 적재
-    │   │   │   │   ├── DropCreatedInternalEvent.java
-    │   │   │   │   └── KafkaDropCreatedRelay.java         # AFTER_COMMIT → Kafka 전송 + 재시도
+    │   │   │   │   └── KafkaDropEventPublisher.java       # 포트 구현: 커밋 후(afterCommit) Kafka 전송, 트랜잭션 밖이면 즉시
     │   │   │   └── config
     │   │   │       └── ClockConfig.java
     │   │   └── presentation
@@ -173,21 +172,16 @@ spring:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       acks: all
-      retries: 3
+      retries: 2147483647        # 재시도는 producer 내부(멱등)에 맡기고 delivery.timeout.ms 로 전체 시간 제한
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
       properties:
         enable.idempotence: true
-        delivery.timeout.ms: 10000
+        delivery.timeout.ms: 10000   # 관리자 응답과 무관한 비동기 발행이라 0단계 공통값(3000)보다 길게 (구현 결정)
         request.timeout.ms: 3000
     consumer:
       group-id: product-service
       auto-offset-reset: earliest
-
-product:
-  event:
-    publish-timeout-ms: 3000
-    publish-max-attempts: 3
 ```
 > `JacksonJsonSerializer` 는 Spring Kafka 4.x(Jackson 3) 기준 이름이다. **구현 시 클래스명 확인** (3.x 의 `JsonSerializer` 대체). 0단계에서 Kafka 직렬화를 공통 설정했다면 그 설정을 따른다.
 
@@ -589,67 +583,61 @@ public class DropRepositoryImpl implements DropRepository {
 
 `ProductJpaEntity`, `ProductMapper`, `ProductJpaRepository`, `ProductRepositoryImpl` 은 같은 패턴 (생략).
 
-#### AFTER_COMMIT 발행 구조
+#### 커밋 후 발행 구조 (1단계 `KafkaUserEventPublisher` 와 같은 패턴, 확정)
 
 ```mermaid
 sequenceDiagram
     participant DS as DropService (application)
-    participant P as SpringDropEventPublisher (infra)
-    participant AEP as ApplicationEventPublisher (Spring)
-    participant R as KafkaDropCreatedRelay (infra)
+    participant P as KafkaDropEventPublisher (infra)
+    participant TS as TransactionSynchronizationManager (Spring)
     participant K as Kafka
 
     DS->>P: publishCreated(payload)  [포트 호출]
-    P->>AEP: publishEvent(DropCreatedInternalEvent)
-    Note over DS: 트랜잭션 커밋
-    AEP->>R: @TransactionalEventListener(AFTER_COMMIT)
-    R->>K: send(drop.created, key=dropId).get(3s), 최대 3회
+    alt 트랜잭션 진행 중 (register)
+        P->>TS: registerSynchronization(afterCommit = send)
+        Note over DS: 트랜잭션 커밋
+        TS->>P: afterCommit()
+        P->>K: send(drop.created, key=dropId) — 비동기, producer 내부 재시도
+    else 트랜잭션 없음 (republish)
+        P->>K: 즉시 send
+    end
+    K-->>P: whenComplete: 최종 실패 시 ERROR 로그 → 관리자 재발행
 ```
-**읽는 법**: application 은 포트만 호출한다. "커밋 후에 보낸다"는 타이밍 제어는 **infrastructure 안에서** Spring 이벤트로 처리되므로 application 이 Spring 이벤트 API 에 의존하지 않는다. 롤백되면 `AFTER_COMMIT` 리스너가 호출되지 않아 발행되지 않는다.
+**읽는 법**: application 은 포트만 호출한다. "커밋 후에 보낸다"는 타이밍 제어는 **발행 어댑터 안에서** `TransactionSynchronization` 으로 처리하므로 application 이 Spring 트랜잭션·이벤트 API 에 의존하지 않는다. 롤백되면 `afterCommit` 이 호출되지 않아 발행되지 않는다.
 
 ```java
 // infrastructure/messaging
-record DropCreatedInternalEvent(DropCreatedPayload payload) {}
-
-@Component
-@RequiredArgsConstructor
-public class SpringDropEventPublisher implements DropEventPublisher {
-    private final ApplicationEventPublisher applicationEventPublisher;
-
-    @Override
-    public void publishCreated(DropCreatedPayload payload) {
-        applicationEventPublisher.publishEvent(new DropCreatedInternalEvent(payload));
-    }
-}
-
 @Slf4j
 @Component
 @RequiredArgsConstructor
-public class KafkaDropCreatedRelay {
-    private final KafkaTemplate<String, Object> kafkaTemplate;
-    @Value("${product.event.publish-timeout-ms}") private long timeoutMs;
-    @Value("${product.event.publish-max-attempts}") private int maxAttempts;
+class KafkaDropEventPublisher implements DropEventPublisher {
 
-    /** fallbackExecution=true: 트랜잭션 밖(republish)에서 발행해도 즉시 실행 */
-    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
-    public void relay(DropCreatedInternalEvent event) {
-        DropCreatedPayload p = event.payload();
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    @Override
+    public void publishCreated(DropCreatedPayload p) {
         DropCreated message = new DropCreated(p.dropId(), p.productId(), p.title(),
                 p.entryCapacity(), p.winnerCount(), p.openAt(), p.closeAt());
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                kafkaTemplate.send(Topics.DROP_CREATED, String.valueOf(p.dropId()), message)
-                        .get(timeoutMs, TimeUnit.MILLISECONDS);
-                return;
-            } catch (Exception e) {
-                log.warn("drop.created 발행 실패 dropId={} attempt={}/{}", p.dropId(), attempt, maxAttempts, e);
-            }
+        Runnable send = () -> kafkaTemplate.send(Topics.DROP_CREATED, String.valueOf(p.dropId()), message)
+                .whenComplete((r, ex) -> {
+                    if (ex != null) {
+                        log.error("drop.created 최종 발행 실패 — 관리자 재발행 필요 dropId={}", p.dropId(), ex);
+                    }
+                });
+
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override public void afterCommit() { send.run(); }
+            });
+        } else {
+            send.run();     // republish 처럼 트랜잭션 밖 호출은 즉시 발행
         }
-        log.error("drop.created 최종 발행 실패 — 관리자 재발행 필요 dropId={}", p.dropId());
     }
 }
 ```
-- 커밋 이후라 예외를 던져도 관리자 응답(201)에는 영향이 없다 → **로그(ERROR) 후 재발행 API 로 복구** (D4 기본안).
+- 재시도는 **producer 내부 재시도(멱등, `delivery.timeout.ms=10000` 안에서)** 로 일원화한다. 애플리케이션이 같은 메시지를 다시 send 하는 루프는 두지 않는다 (0단계 공통 발행 정책과 같은 원칙).
+- 발행은 비동기(`whenComplete`)라 관리자 응답(201)을 지연시키지 않는다. 최종 실패는 **ERROR 로그 후 재발행 API 로 복구** (D4 확정안).
+- 수신 측(entry/queue/ranking)은 재수신에 멱등하다(`SET NX`, `ON CONFLICT DO NOTHING`) — 재발행이 여러 번 와도 안전.
 - `DropCreated` 의 필드 구성은 0단계 `common` record 를 따른다 (architecture.md 4장: dropId, productId, title, entryCapacity, winnerCount, openAt, closeAt).
 
 #### `ClockConfig`
@@ -807,7 +795,7 @@ public class ProductExceptionHandler {
 | T2-20 | infra 통합 (PostgreSQL) | `DropRepositoryImplTest` | Flyway 마이그레이션 적용 후 `ddl-auto=validate` 로 컨텍스트 기동 성공. CHECK 제약 위반 INSERT 는 실패 | REQ-DROP-02 |
 | T2-21 | infra 통합 (PostgreSQL+Kafka) | `DropCreatedPublishIntegrationTest` | Given ADMIN 등록 / When 트랜잭션 커밋 / Then `drop.created` 1건 수신, key=dropId, 필드 일치 | REQ-DROP-02 |
 | T2-22 | infra 통합 (PostgreSQL+Kafka) | `DropCreatedPublishIntegrationTest` | Given 같은 트랜잭션에서 저장 후 예외로 **롤백** / Then 일정 시간(예: 3초) 동안 `drop.created` 미수신, DB 0건 | REQ-DROP-02 |
-| T2-23 | infra 통합 (Kafka) | `DropCreatedPublishIntegrationTest` | Given 트랜잭션 밖 republish / Then 즉시 1건 수신 (`fallbackExecution`) | REQ-DROP-02 |
+| T2-23 | infra 통합 (Kafka) | `DropCreatedPublishIntegrationTest` | Given 트랜잭션 밖 republish / Then 즉시 1건 수신 (동기화 비활성 → 즉시 send 분기) | REQ-DROP-02 |
 | T2-24 | presentation 슬라이스 | `DropControllerTest` | Given X-User-Role=USER / When POST drops / Then 403 + 에러 코드 FORBIDDEN | REQ-DROP-02 |
 | T2-25 | presentation 슬라이스 | `DropControllerTest` | Given entryCapacity=0, title 누락, openAt 누락 / Then 400 | REQ-DROP-02 |
 | T2-26 | presentation 슬라이스 | `DropControllerTest` | GET /drops?status=OPEN / Then 200 + 페이지 구조, status 문자열. GET /drops/{id} 404 매핑 | REQ-DROP-03 |
@@ -828,7 +816,7 @@ public class ProductExceptionHandler {
 | 4 | application | `feat(product): 상품·드로우 등록 및 조회 유스케이스 구현`<br>- Command/Result, 에러 코드, 관리자 권한 검사<br>- DropEventPublisher 포트 |
 | 5 | application 테스트 | `test(product): 드로우 유스케이스 단위 테스트 (Fake 포트)` (T2-11~17) |
 | 6 | infrastructure 영속 | `feat(product): JPA 엔티티·매퍼·Repository 구현` |
-| 7 | infrastructure 메시징 | `feat(product): drop.created 커밋 후 발행 및 재시도 구현`<br>- 포트 구현은 Spring 이벤트 적재, AFTER_COMMIT 리스너가 Kafka 전송 |
+| 7 | infrastructure 메시징 | `feat(product): drop.created 커밋 후 발행 구현`<br>- 발행 어댑터 안에서 TransactionSynchronization.afterCommit 으로 전송 (1단계와 같은 패턴)<br>- 트랜잭션 밖(재발행)은 즉시 전송, 재시도는 producer 내부 재시도 |
 | 8 | infra 통합 테스트 | `test(product): Repository 조회 조건·이벤트 발행 통합 테스트` (T2-18~23) |
 | 9 | presentation | `feat(product): 상품·드로우 API 구현` (API 5개, 예외 매핑) |
 | 10 | presentation 테스트 | `test(product): 상품·드로우 API 슬라이스 테스트` (T2-24~27) |
@@ -838,10 +826,14 @@ public class ProductExceptionHandler {
 
 ## 6. 결정 필요 · 리스크
 
+### 결정 사항 (확정)
+| 항목 | 결정 | 포기한 대안 |
+|------|------|-------------|
+| 드로우 이벤트 발행 방식 | **발행 어댑터 안의 afterCommit 전송 + producer 내부 재시도 + 관리자 재발행 API** (2026-11-16 확정) | Transactional Outbox / Spring 이벤트 + `@TransactionalEventListener` 중계 |
+
 ### 결정 필요
 | 항목 | 기본안 (이 문서 반영) | 대안 |
 |------|----------------------|------|
-| 드로우 이벤트 발행 방식 | **AFTER_COMMIT + 3회 재시도 + 관리자 재발행 API** | Transactional Outbox |
 | openAt 최소 여유 | **등록 시각 + 1분** (`Drop.MIN_OPEN_LEAD_TIME`) | 설정값으로 외부화 |
 
 ### 구현 결정 요약
@@ -854,8 +846,8 @@ public class ProductExceptionHandler {
 - 상세 응답에 잔여 정원 미포함
 
 ### 설계 수정 필요
-- [drop-register.md](../../design/05-features/drop-register.md) 5.1 의 "openAt 최소 1분 검증 권장" → **확정 규칙**으로 3장 "등록 검증"에 추가 필요.
-- [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.2 에 `DropPage`, `Requester`, `DomainException` 및 infrastructure 의 `SpringDropEventPublisher` / `KafkaDropCreatedRelay` 2단 구조 반영 필요.
+- [drop-register.md](../../design/05-features/drop-register.md) 5.1 의 "openAt 최소 1분 검증 권장" → **확정 규칙**으로 3장 "등록 검증"에 추가 필요. → 설계 반영 완료 (2026-11-16)
+- [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.2 에 `DropPage`, `Requester`, `DomainException` 및 infrastructure 의 `KafkaDropEventPublisher`(afterCommit 발행) 반영 필요. → 설계 반영 완료 (2026-11-16)
 
 ### 리스크
 - **상태 판정 규칙 중복**: `Drop.status(now)` 와 `DropJpaRepository` JPQL 조건에 같은 경계가 두 번 존재한다. T2-19 로 일치를 고정하고, 규칙 변경 시 두 곳을 함께 수정한다.
