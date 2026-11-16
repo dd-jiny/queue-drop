@@ -295,7 +295,9 @@ public class Drop {
         return new Drop(null, productId, title, entryCapacity, winnerCount, openAt, closeAt, false, now);
     }
 
-    public static Drop restore(/* 모든 필드 */) { /* ... */ }
+    /** 영속 계층 복원 전용 (검증 없음). 인자 순서: id, productId, title, entryCapacity, winnerCount, openAt, closeAt, drawn, createdAt */
+    public static Drop restore(Long id, Long productId, String title, int entryCapacity, int winnerCount,
+                               Instant openAt, Instant closeAt, boolean drawn, Instant createdAt) { /* ... */ }
 
     /** 시각으로 상태를 계산한다. DRAWN 만 저장 값. */
     public DropStatus status(Instant now) {
