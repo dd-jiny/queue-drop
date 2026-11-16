@@ -49,4 +49,4 @@ queuedrop:
       - GET /api/rankings/users/all
       - GET /api/coupons/events/{eventId}
       - GET /api/entries/drops/{dropId}/result
-      - GET /actuator/health
+      - GET /actuator/health      # gateway 자신의 actuator 는 라우팅되지 않아 필터를 거치지 않는다. 다운스트림 health 를 경유 노출할 때를 대비한 항목

@@ -174,3 +174,166 @@
   - 선택지: (a) 위 지표를 Prometheus+Grafana 대시보드로 모은다(8단계 계획의 선택 항목을 필수로 올린다), (b) Actuator `/metrics` 를 k6 종료 시점에 스냅샷으로만 남긴다. b 는 싸지만 시계열(lag 해소 시간)을 볼 수 없다.
 - **우선순위**: 중간 — 8단계 결과의 설득력을 정한다. 4단계 구현 중에 Timer·카운터 위치를 함께 정하면 비용이 거의 들지 않는다.
 - **영향 범위**: `phase-8-load-test.md` 3.2·3.6, phase-4·6 어댑터(Timer/카운터 위치)
+
+---
+
+## phase-1 (인증: user-service, gateway) 분석 — 2026-11-16
+
+분석 범위: `git diff dev...HEAD` (`feat/phase-1-auth`, 커밋 11개). 기준 문서 `phase-1-auth.md`, `infrastructure.md`.
+측정 환경: 개발 머신 호스트 JVM(Java 21, 논리 코어 15). Docker 컨테이너 안에서 잰 값이 아니므로 8단계 환경에서는 더 느릴 수 있다.
+- BCrypt strength 10(`spring-security-crypto` 6.5.11): `matches` 평균 51.3ms, `encode` 평균 51.2ms, 15스레드 병렬 처리량 235건/초
+- JWT 검증(jjwt 0.13.0 + gson, HS256, 클레임 5개): 유효 토큰 평균 3.3µs, 서명 위조 토큰 4.7µs
+- 테스트 suite 시간(`build/test-results`): `SignupIntegrationTest` 11.7초, `AdminBootstrapIntegrationTest` 3.8초, `UserRepositoryImplTest` 0.8초, `GatewayContextTest` 1.3초, 나머지 단위 테스트 0.5초 미만
+- 재현 테스트: 저장소에 추가하지 않고 scratch 디렉터리에서 Gradle init script 로 테스트 소스만 붙여 1회 실행했다(E-14).
+
+### E-14 `createAdminIfAbsent` 동시 기동 경로가 `UnexpectedRollbackException` 으로 기동을 실패시킴
+- **처리**: 분석 중 작업 트리(커밋 전)에 개선안 1(`@Transactional` 제거)이 반영된 것을 확인했다. 같은 재현 테스트를 다시 돌려 2회차가 `false` 를 반환하는 것을 확인했다(2026-11-16). 저장소에 회귀 테스트는 아직 없다.
+- **단계/위치**: phase-1, `user-service/.../application/service/UserService.java:81-100`, `infrastructure/persistence/UserRepositoryImpl.java:22-30`
+- **현상**: `existsByEmail` 이 false 인 뒤 다른 인스턴스가 먼저 저장하면 `saveAndFlush` 에서 유니크 위반이 난다. `UserRepositoryImpl` 이 이를 `DuplicateEmailException` 으로 바꾸고 서비스가 잡아 `false` 를 반환한다. 주석은 "인스턴스 여러 대가 동시에 기동한 경우"를 처리한다고 적었다.
+- **문제/기회**: `SimpleJpaRepository.saveAndFlush` 는 자체 `@Transactional` 을 가진다. 예외가 이 프록시를 지나갈 때 바깥 트랜잭션(`createAdminIfAbsent`)에 참여 중이므로 **rollback-only 로 표시된다**. 서비스는 예외를 삼키고 정상 반환하지만 커밋 시점에 `UnexpectedRollbackException` 이 나고, `AdminAccountInitializer`(ApplicationRunner)가 실패해 **두 번째 인스턴스가 기동하지 못한다**. 의도한 "false 반환"과 반대로 동작한다. 가입 경로(`signup`)는 같은 예외를 `ApplicationException` 으로 다시 던져 롤백하므로 409 가 그대로 나가고 영향이 없다.
+- **근거**: 재현함. `@SpringBootTest` + Postgres 에서 `UserRepository` 를 spy 로 바꿔 두 번째 호출의 `existsByEmail` 만 false 로 만들었다. 결과: 1회차 `true`, 2회차 `UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only`. 기존 T1-28/T1-29 는 `InMemoryUserRepository` 를 써서 이 경로를 잡지 못하고, T1-31 은 순차 재기동이라 `existsByEmail` 이 true 인 경로만 지난다.
+- **개선안**:
+  1. `createAdminIfAbsent` 에서 `@Transactional` 을 뺀다. `existsByEmail`·`saveAndFlush` 가 각자 트랜잭션으로 돌므로 위반이 나면 그 트랜잭션만 롤백되고, 예외 번역 뒤 `false` 를 반환한다. 변경이 가장 작다. 관리자 생성은 한 건만 쓰므로 트랜잭션을 나눠도 정합성에는 영향이 없다.
+  2. 저장을 `INSERT ... ON CONFLICT (email) DO NOTHING` 네이티브 쿼리(영향 행 수로 생성 여부 판단)로 바꾼다. 예외가 생기지 않고 쿼리도 하나로 줄지만, 저장소 포트에 관리자 전용 메서드가 하나 늘어난다.
+  3. `UserRepositoryImpl.save` 를 `@Transactional(propagation = REQUIRES_NEW)` 로 감싼다. 가입 경로까지 별도 트랜잭션이 되어 커넥션을 2개 쓰므로 권하지 않는다.
+  - 어느 쪽이든 실제 DB 와 spy 로 "exists=false 인데 이미 저장됨" 경로를 검증하는 통합 테스트(T1-31 보강)를 둔다.
+- **우선순위**: 중간 — 지금 compose 는 user-service 1대라 발생 확률이 낮다. 하지만 코드와 주석이 처리한다고 주장하는 장애 경로가 정반대로 동작하고, 1단계 안에서 고치는 비용이 수 줄이다. **1단계 PR 전 수정을 권장한다**.
+- **영향 범위**: `UserService`, `phase-1-auth.md` 3장 `createAdminIfAbsent` 코드·T1-31, (2를 고르면) `UserRepository` 포트
+
+### E-15 로그인에서 없는 이메일은 BCrypt 를 건너뛰어 응답 시간으로 계정 존재 여부가 드러남
+- **처리**: ✅ 1단계에서 반영 (2026-11-16) — 이메일이 없으면 같은 인코더로 만든 더미 해시와 `matches` 1회 수행.
+- **단계/위치**: phase-1, `UserService.java:66-75`
+- **현상**: `findByEmail(...).filter(matches)` 구조라 이메일이 없으면 `matches` 를 호출하지 않는다. 응답 코드는 같다(`USER_INVALID_CREDENTIALS`).
+- **문제/기회**: 있는 이메일은 약 51ms, 없는 이메일은 DB 조회 1회(수 ms)만에 응답한다. 응답 코드를 같게 만든 목적(`phase-1-auth.md:409` "계정 존재 여부 노출 방지")이 응답 시간 차이로 무너진다. 성능 문제가 아니라 설계 의도와 어긋나는 문제다.
+- **근거**: BCrypt `matches` 51.3ms(측정). DB 조회 시간은 추정.
+- **개선안**:
+  1. 계정이 없을 때 기동 시 한 번 만든 더미 해시로 `matches` 를 호출해 시간을 맞춘다. 코드 3~4줄. 없는 이메일 요청도 BCrypt CPU 를 쓰므로 무작위 이메일 공격의 비용이 약 51ms 로 같아진다(지금은 공격자에게 더 싼 경로가 있다).
+  2. 그대로 두고 문서에 "응답 코드만 같게 하고 시간 차이는 범위 밖"이라고 적는다. 과제 범위에서 허용할 수 있다.
+- **우선순위**: 중간 — 비용이 작고 문서와 구현이 어긋난다. 1단계 PR 전에 1을 넣거나 2로 문서를 맞추는 것을 권한다.
+- **영향 범위**: `UserService.login`(또는 `PasswordEncoder` 포트에 더미 비교 메서드), `phase-1-auth.md` 409행 부근, `UserServiceTest`
+
+### E-16 BCrypt 가 트랜잭션 안에서 실행되어 DB 커넥션을 약 50ms 동안 잡음
+- **단계/위치**: phase-1, `UserService.java:39-63`(signup: `encode`), `:66-75`(login: `matches`, `readOnly` 트랜잭션)
+- **현상**: `@Transactional` 이 시작될 때 JPA 트랜잭션 매니저가 Hikari 커넥션을 가져오고, BCrypt 계산(약 51ms)이 끝나고 커밋할 때까지 쥐고 있다. 실제 SQL 은 가입 2개(exists + insert), 로그인 1개(select)이고 각각 1ms 안팎(추정)이다.
+- **문제/기회**: 커넥션 점유 시간의 90% 이상이 CPU 계산이다. Hikari 기본 풀 10개 기준 처리량 상한은 10 / 0.052s ≈ 190건/초로, 측정한 CPU 상한(호스트 15코어 235건/초)보다 먼저 걸린다. Docker 에 CPU 를 4~8개 줬다면 CPU 상한(추정 60~125건/초)이 먼저 걸리므로 풀은 병목이 아니다. 즉 **현재 구조에서는 풀보다 CPU 가 상한이고, 풀 고갈은 CPU 가 많을 때만 나타난다**. 피해 범위도 user-service 안이다(다른 서비스는 DB 가 따로다).
+- **근거**: BCrypt 측정값과 계산. Docker CPU 할당은 추정.
+- **개선안**:
+  1. 해시 계산을 트랜잭션 밖으로 뺀다. 가입은 `encode` 를 먼저 하고 짧은 트랜잭션에서 exists+insert, 로그인은 트랜잭션 없이(또는 조회만 트랜잭션으로) `findByEmail` 뒤 `matches`. 커넥션 점유가 약 1ms 로 줄어든다. 대신 중복 이메일 가입도 BCrypt 비용을 먼저 내므로 409 응답이 51ms 느려진다(exists 를 트랜잭션 전에 한 번 더 보면 피할 수 있으나 쿼리가 늘어난다).
+  2. 그대로 둔다. **현재 규모(사용자 3,000~5,200, 로그인은 오픈 전에 끝냄)에서는 CPU 가 먼저 막히므로 효과가 작다**. 8단계에서 `hikaricp.connections.pending` 이 0보다 크게 나올 때만 1을 적용한다.
+  - strength 를 낮추는 것(예: 8 → 약 13ms)은 보안 수준을 낮추므로 부하 테스트 프로필에서만 고려하고 기본값은 유지한다.
+- **우선순위**: 낮음 — 측정 전에는 2. 고치는 비용은 작지만 지금 규모에서 체감 효과가 없다.
+- **영향 범위**: `UserService`, `phase-1-auth.md` 서비스 코드, `phase-8-load-test.md` 리스크 절(관련: E-20)
+
+### E-17 `user.registered` 의 `afterCommit` 발행이 커넥션과 요청 스레드를 잡은 채로 최대 `max.block.ms` 블로킹
+- **단계/위치**: phase-1, `user-service/.../messaging/KafkaUserEventPublisher.java:28-48` (관련: E-02, E-10)
+- **현상**: 커밋 후 콜백 안에서 `kafkaTemplate.send()` 를 호출한다. 응답은 기다리지 않지만, 메타데이터가 없거나 버퍼가 차면 `send()` 자체가 최대 `max.block.ms`(1초) 동안 막힌다. 실패하면 warn 로그와 스택을 남긴다.
+- **문제/기회**:
+  - Spring 은 `triggerAfterCommit` 을 커넥션 반환(`cleanupAfterCompletion`) **전에** 호출한다. 그래서 Kafka 장애 중에는 가입 1건이 Tomcat 스레드와 **Hikari 커넥션을 약 1초** 더 쥔다. 풀 10개면 장애 중 가입·로그인 합산 처리량이 초당 10건 안팎으로 떨어진다(추정). 로그인은 Kafka 를 쓰지 않는데도 같이 느려진다.
+  - 실패마다 스택이 찍히므로 8단계 `prepare-users`(50 VU) 도중 브로커가 멈추면 E-10 과 같은 로그 폭증이 생긴다.
+  - 정상 상황(메타데이터 캐시됨)에서는 `send()` 가 수십 µs 안에 반환되므로 영향이 없다.
+- **근거**: Spring `AbstractPlatformTransactionManager.processCommit` 순서(문서/소스 기반). 장애 주입은 하지 않았다.
+- **개선안**:
+  1. `afterCommit` 대신 `afterCompletion(STATUS_COMMITTED)` 에서 보낸다. 이 콜백도 커넥션 반환 전에 실행되므로 **효과가 없다**. 고르지 않는다.
+  2. 콜백에서 전용 단일 스레드 executor(유한 큐, 꽉 차면 버리고 카운트)로 넘긴다. 요청 스레드와 커넥션이 즉시 풀린다. 유실 범위는 지금과 같다(어차피 비동기 발행이다). 대신 종료 시 큐에 남은 이벤트가 사라질 수 있다.
+  3. 그대로 두고 E-13 의 장애 주입에서 가입 p99 와 `hikaricp.connections.pending` 만 확인한다. 가입은 부하 측정 구간 밖이라 지금 규모에서는 이것으로 충분하다.
+  - 로그는 E-10 정책을 따라 `warn` 한 줄 + 카운터(`user_registered_publish_failed`)로 줄이는 것을 같이 권한다.
+- **우선순위**: 낮음 — 가입은 오픈 전에 끝나는 경로다. 3으로 두고 E-18 의 유실 대책과 함께 정한다.
+- **영향 범위**: `KafkaUserEventPublisher`, `layered-architecture.md` "커밋 후 발행" 절, `concurrency-consistency.md`(커밋 후 발행 설명)
+
+### E-18 `user.registered` 유실 시 랭킹 닉네임을 복구할 수단이 없음 (7단계 대비)
+- **단계/위치**: phase-1 `KafkaUserEventPublisher.java`, phase-7 `phase-7-ranking.md:720, 789` (`rank:user:info` HSET)
+- **현상**: 발행은 커밋 후 비동기이고, 실패하면 로그만 남긴다. 7단계는 닉네임이 없으면 `null` 로 표시하고, 리스크 절에 "닉네임은 복구 수단 없음"이라고 적었다.
+- **문제/기회**:
+  - 유실 조건: 브로커가 `delivery.timeout.ms`(3초) 넘게 응답하지 않을 때, `send()` 가 1초 안에 메타데이터를 받지 못할 때, 커밋 직후 프로세스가 죽을 때(버퍼에 있던 레코드). 그 사이 가입한 사용자는 **영구적으로 닉네임이 없다**. 예시(추정): 8단계 `prepare-users` 가 초당 수십 건씩 가입하는 중 브로커가 10초 멈추면 수백 명이 랭킹에서 `null` 로 나온다.
+  - 7단계 Redis(`rank:user:info`)가 유실되고 7일(토픽 보존 기본값)이 지나도 같은 문제가 생긴다.
+  - 원본 데이터(users 테이블)는 남아 있으므로 정합성 문제는 아니고 표시 문제다. HSET 은 덮어쓰기라 재발행해도 멱등이다.
+- **근거**: 코드와 7단계 계획 분석. 장애 주입은 하지 않았다.
+- **개선안**:
+  1. user-service 에 관리자 전용 재발행 API(예: `POST /api/users/admin/republish-registered?fromId=`)를 둔다. users 를 id 순 keyset 페이징(`where id > ? order by id limit 500`, PK 인덱스 사용)으로 읽어 다시 발행한다. 비용은 API 하나이고, product 의 `drop.created` 재발행 API 와 같은 패턴이라 운영 절차가 통일된다. 8단계 `prepare-users` 뒤에 한 번 돌리면 유실 여부와 상관없이 닉네임이 맞춰진다.
+  2. `user.registered` 를 compacted 토픽(`cleanup.policy=compact`, key=userId)으로 바꾼다. Redis 유실 시 처음부터 다시 읽으면 복구된다. 발행 유실 자체는 막지 못하므로 1과 함께 써야 한다.
+  3. Transactional Outbox. 유실이 없어지지만 테이블·폴러가 생겨 표시용 이벤트에는 과하다. 권하지 않는다.
+  4. ranking 이 닉네임이 없을 때 user-service 를 동기 조회한다. 서비스 간 동기 호출이 새로 생기고 랭킹 조회 지연이 user-service 상태에 묶이므로 권하지 않는다.
+- **우선순위**: 중간 — 7단계 랭킹 화면의 완성도와 8단계 리포트에 영향을 준다. 1은 7단계 시작 전(또는 2단계 재발행 API 와 같이) 넣으면 싸다.
+- **영향 범위**: user-service presentation/application(재발행 유스케이스), gateway 공개/관리자 경로, `phase-7-ranking.md` 리스크·복구 절, `infra/kafka/create-topics.sh`(2를 고르면), `phase-8-load-test.md` 준비 절차
+
+### E-19 가입 경로의 쿼리 수와 users 인덱스
+- **단계/위치**: phase-1, `UserService.java:42, 56`, `UserRepositoryImpl.java:25`, `V1__create_users.sql:8`
+- **현상**: 가입은 `existsByEmail`(select ... limit 1) 1회 + `saveAndFlush` insert 1회(IDENTITY 라 insert 직후 id 반환)로 왕복 2회다(begin/commit 별도). 로그인은 `findByEmail` 1회. `uk_users_email` 유니크 제약이 btree 인덱스를 만들어 두 조회 모두 인덱스를 쓴다. 다른 인덱스는 없다.
+- **문제/기회**:
+  - exists 를 빼고 유니크 위반만으로 중복을 판단하면 왕복이 1회 준다. 그러나 중복 가입마다 Postgres 에러 로그와 Hibernate `SqlExceptionHelper` ERROR 로그가 남고 IDENTITY 값이 하나씩 버려진다. 가입 1건 비용은 BCrypt 51ms 가 대부분이라 쿼리 1회(약 1ms 추정)를 줄여도 2% 미만이다.
+  - 인덱스: 조회 조건이 email 뿐이므로 지금 인덱스로 충분하다. 커버링 인덱스나 추가 인덱스는 필요 없다. users 5,200행이면 EXPLAIN 결과도 seq scan 과 차이가 없을 규모라 측정하지 않았다.
+  - `findByEmail` 이 모든 컬럼(6개, 약 200바이트)을 읽지만 로그인에 비밀번호 해시·role·id 가 모두 필요하므로 불필요한 조회가 아니다.
+- **근거**: 코드와 스키마 확인. 쿼리 시간은 추정.
+- **개선안**:
+  1. **현재 규모에서는 불필요**. 그대로 둔다.
+  2. (참고) 이메일 대소문자 정규화를 `Email` 값 객체가 하므로 `lower(email)` 함수 인덱스는 필요 없다. 다른 경로(SQL 직접 입력 등)로 대문자가 들어올 수 있다면 `CHECK (email = lower(email))` 를 추가할 수 있다.
+- **우선순위**: 낮음 — 기록용.
+- **영향 범위**: 없음
+
+### E-20 8단계에서 3,000 VU 가 동시에 로그인하면 user-service CPU 가 오픈 직전까지 포화될 수 있음
+- **단계/위치**: phase-8 `phase-8-load-test.md:384`(VU 시작 시 로그인), `:545`, `:949` 리스크 / phase-1 BCrypt (관련: E-16)
+- **현상**: 계획은 각 VU 가 시작하자마자 로그인하고 `OPEN_DELAY_SEC`(90초) 동안 기다린다. 로그인 요청은 `phase:prepare` 태그로 임계값에서 뺀다.
+- **문제/기회**:
+  - 3,000건 × 51ms = CPU 153초 분량이다. Docker 에 4코어를 주면 약 38초, 8코어면 약 19초 동안 user-service 가 CPU 를 다 쓴다(추정, 호스트 측정값 기준으로 컨테이너에서는 더 느릴 수 있다). k6 도 같은 머신에서 3,000 VU 를 띄우므로 CPU 를 나눠 쓴다.
+  - 0초에 3,000건이 몰리면 Tomcat 스레드 200개를 넘는 요청은 accept 큐에서 기다린다. 마지막 요청 대기가 k6 기본 timeout(60초)에 가까워지면 로그인 실패가 `unexpected` 로 잡혀 시나리오 전체가 실패할 수 있다.
+  - 로그인 부하는 측정 구간 밖이지만, 오픈 직전까지 CPU 가 포화되면 다른 서비스의 JIT 예열이 늦어지고 첫 몇 초의 `queue_enter` p99 가 왜곡될 수 있다.
+  - gateway 쪽 인증 비용은 문제가 아니다: JWT 검증 3.3µs × 폴링 3,000건/초 ≈ 코어 1개의 1% (E-21).
+- **근거**: BCrypt 측정값 기반 계산. Docker CPU 할당과 k6 영향은 추정.
+- **개선안**:
+  1. 토큰을 미리 발급해 파일로 넘긴다. `prepare-users.js` 끝에 (또는 별도 `issue-tokens.js`) 낮은 동시성으로 로그인해 `tokens.json` 에 저장하고, 시나리오는 `SharedArray` 로 읽는다. 로그인 부하가 시나리오에서 완전히 빠진다. TTL 을 2h 로 늘리는 계획(`phase-8-load-test.md:171`)이 이미 있으므로 재사용에 문제가 없다. 계획의 "토큰을 파일로 주고받을 필요가 없다"는 문장은 바꿔야 한다.
+  2. 지금 구조를 두고 VU 시작을 나눈다(`startTime` 을 다르게 한 시나리오 여러 개, 또는 VU 별로 `sleep(i / LOGIN_RATE)` 뒤 로그인). "오픈 전부터 대기하던 사용자" 흐름은 그대로 두면서 로그인을 초당 N건으로 평탄화한다. `OPEN_DELAY_SEC` 를 3,000 / N 보다 크게 잡아야 한다.
+  3. k6 가 `JWT_SECRET` 으로 HS256 토큰을 직접 서명한다(`k6/crypto` 의 hmac). user-service 를 전혀 거치지 않지만 `sub`(userId)를 알아야 하므로 prepare 단계에서 id 목록을 남겨야 하고, 운영 비밀키를 부하 도구에 넣게 된다. 권하지 않는다.
+  - 1을 권장한다. 로그인 자체의 처리량(초당 N건)을 리포트에 넣고 싶으면 별도 시나리오 S-login 으로 분리해 잰다.
+- **우선순위**: 중간 — 8단계 결과의 안정성에 직접 영향을 준다. 스크립트만 바꾸면 되고 프로덕션 코드 변경은 없다.
+- **영향 범위**: `phase-8-load-test.md` 3.4 설계 원칙·`drop-open-spike.js`·`prepare-users.js`·리스크 절
+
+### E-21 gateway 의 요청당 인증 비용과 이벤트 루프 블로킹 여부
+- **단계/위치**: phase-1, `gateway/.../filter/JwtAuthenticationFilter.java:34-59`, `auth/JwtVerifier.java:26-39`, `auth/PublicPathMatcher.java:27-29`, `auth/ErrorResponseWriter.java:21-27`
+- **현상**: 요청마다 (1) 헤더 제거 mutate, (2) 공개 경로 규칙 10개 선형 탐색, (3) HS256 서명 검증과 클레임 JSON 파싱, (4) 사용자 헤더 주입 mutate 를 한다. 실패 응답은 `JsonMapper` 로 작은 JSON 을 직렬화한다. 모두 CPU 작업이고 I/O 나 블로킹 호출은 없다.
+- **문제/기회**:
+  - 측정한 검증 비용은 3.3µs(위조 토큰 4.7µs)다. `PathPattern.matches` 10회는 1µs 미만(추정), 에러 JSON 직렬화도 µs 단위다. 이벤트 루프(코어 수만큼)를 막을 만한 작업은 없다. 계산(추정): S1 폴링 3,000 req/s × 약 5µs = 초당 15ms CPU. **현재 규모에서는 최적화가 불필요하다**. 토큰 검증 캐시, 규칙 trie 화 등은 권하지 않는다.
+  - 다만 `PublicPathMatcher` 는 `stream().anyMatch` 로 요청마다 스트림 객체를 만든다. 할당이 조금 있지만 측정할 만한 수준이 아니다.
+- **근거**: JWT 검증은 측정(호스트 JVM 20만 회 평균), 나머지는 추정.
+- **개선안**:
+  1. 그대로 둔다(권장).
+  2. 8단계 S4(최대 부하)에서 gateway CPU 가 먼저 포화되면 그때 async-profiler 로 확인한다. 예상되는 병목은 인증 필터가 아니라 Netty 프록시 I/O·커넥션 풀(E-22)이다.
+- **우선순위**: 낮음 — 기록용.
+- **영향 범위**: 없음
+
+### E-22 gateway 다운스트림 HTTP 클라이언트 타임아웃을 정하지 않음
+- **단계/위치**: phase-1, `gateway/src/main/resources/application.yml:7-35` (관련: E-02, E-03)
+- **현상**: 라우트 6개를 정의했지만 `spring.cloud.gateway.server.webflux.httpclient.connect-timeout`·`response-timeout`, 커넥션 풀 설정이 없다.
+- **문제/기회**: 기본값으로는 connect 는 Netty 기본(30초), 응답은 **타임아웃이 없다**(문서 기반, 측정 안 함). entry/coupon 이 E-02·E-03 장애로 응답을 늦게 주면 gateway 는 끝까지 기다리고, k6 나 클라이언트가 먼저 끊는다. gateway 는 논블로킹이라 스레드가 묶이지는 않지만 다운스트림 커넥션과 요청이 쌓이고, 장애 시 사용자는 "몇십 초 뒤 끊김"을 본다. 서비스별 응답 시간 목표(응모 p99 500ms)를 gateway 가 강제할 수단이 없다.
+- **근거**: Spring Cloud Gateway 레퍼런스 "Http timeouts configuration"(전역 `connect-timeout` ms, `response-timeout` Duration, 라우트별 `metadata` 로 덮어쓰기). 측정 안 함.
+- **개선안**:
+  1. 전역 `connect-timeout: 1000`, `response-timeout: 5s` 를 둔다. 응모·쿠폰처럼 서비스 안에서 최대 3.5초 + α 가 걸리는 경로보다 길게 잡아야 한다. 짧으면 **서비스는 응모를 처리했는데 gateway 가 504 를 주는 애매한 실패**가 생긴다(정합성: 클라이언트가 재시도하면 DUPLICATE 409 가 나므로 오버 응모는 없지만, 사용자 화면에는 실패로 보인다). 그래서 서비스 타임아웃보다 확실히 길게 잡는다.
+  2. 라우트별로 `metadata.response-timeout` 을 다르게 준다(조회성 ranking·product 는 2s, entry·coupon 은 5s). 더 정밀하지만 설정이 늘어난다.
+  - 커넥션 풀(`pool.max-connections`, `pending-acquire-timeout`)은 8단계 S4 결과를 보고 정한다. 현재 규모에서는 기본값으로 충분할 것으로 본다(추정).
+- **우선순위**: 중간 — 설정 두 줄이고 장애 시 응답 경로의 상한을 정한다. 4단계(응모 동기 경로)가 생기기 전이나 그때 함께 넣는다.
+- **영향 범위**: `gateway/application.yml`, `infrastructure.md` 4장 튜닝 표, `phase-8-load-test.md` 설정 표
+
+### E-23 인증 실패(401)와 사용자 이벤트 발행 실패를 관측할 지표가 없음
+- **단계/위치**: phase-1, `JwtAuthenticationFilter.java:39-50`(실패 시 로그·카운터 없음), `KafkaUserEventPublisher.java:32, 35`(warn 로그만) (관련: E-13)
+- **현상**: gateway 는 401 을 조용히 반환한다(로그 폭증이 없어서 좋다). 사유(MISSING/INVALID/EXPIRED)는 응답 본문에만 있다. user-service 발행 실패는 로그로만 남는다.
+- **문제/기회**: 8단계에서 토큰 TTL 이 측정 도중 끝나거나(`EXPIRED`), 두 서비스의 `JWT_SECRET` 이 어긋나면(`INVALID`) k6 에는 "401 급증"만 보이고 원인 구분이 어렵다. `http.server.requests` 는 상태 코드만 태그로 가진다.
+- **근거**: 코드 확인.
+- **개선안**:
+  1. gateway 에 `auth.rejected{reason}` 카운터를 둔다(Micrometer, 필터에서 `increment` 한 줄). 비용이 거의 없고 로그를 늘리지 않는다. user-service 에는 `user.registered.publish{result}` 카운터.
+  2. 401 마다 debug 로그를 남기고 필요할 때 레벨을 올린다. 운영 중 원인 파악은 되지만 지표로 추세를 볼 수 없다.
+  - 기동 시 두 서비스가 같은 시크릿을 쓰는지 확인할 방법은 없으므로(서로 모름), compose 에서 같은 `JWT_SECRET` 변수를 넘기는 지금 구조를 유지하고 리포트 체크리스트에 적는다.
+- **우선순위**: 낮음 — E-13 수집 목록에 추가하는 수준이다. 8단계 Actuator/Prometheus 를 붙일 때 같이 넣는다.
+- **영향 범위**: `JwtAuthenticationFilter`, `KafkaUserEventPublisher`, `phase-8-load-test.md` 3.2 관찰 메트릭
+
+### E-24 `SignupIntegrationTest` 의 고정 대기 6초와 `AdminBootstrapIntegrationTest` 의 별도 컨텍스트
+- **단계/위치**: phase-1, `user-service/src/test/java/com/queuedrop/user/SignupIntegrationTest.java:46, 136, 163`, `AdminBootstrapIntegrationTest.java:27-31, 71-83` (관련: E-08)
+- **현상**:
+  - `SignupIntegrationTest` 11.7초: "발행되지 않음"을 확인하려고 `QUIET_PERIOD` 3초를 두 테스트에서 기다린다(고정 6초). 나머지는 Kafka 컨테이너 기동과 첫 메시지 대기다.
+  - `AdminBootstrapIntegrationTest` 3.8초: `@SpringBootTest(properties=...)` 로 컨텍스트 캐시 키가 달라 **Postgres 컨테이너를 하나 더 띄우고**(E-08), 그 안에서 `SpringApplicationBuilder` 로 애플리케이션을 한 번 더 기동한다(웹 없음, Kafka 는 지연 연결이라 브로커 없이 기동됨).
+- **문제/기회**: user-service 테스트 총 시간은 약 18초로 지금은 문제가 없다. 다만 "부재 확인 = 고정 대기" 패턴이 4·6단계(보상 후 미발행 확인 등)로 복사되면 테스트마다 3초씩 늘어난다. 두 번째 기동 방식은 기동 시간이 늘어날수록(서비스가 커질수록) 비용이 커진다.
+- **근거**: 측정값(`build/test-results`). 확장 예측은 추정.
+- **개선안**:
+  1. 부재 확인은 "마커 메시지" 방식으로 바꾼다. 롤백 쪽을 발행 요청한 뒤 커밋 쪽(대조군)을 보내고, 같은 파티션(`user.registered` 는 파티션 1)이라 대조군이 도착했을 때 그보다 먼저 요청된 롤백 메시지가 없으면 부재로 판단한다. T1-17 은 이미 대조군이 있어 대기 3초를 없앨 수 있다. 다만 `send()` 순서와 파티션 순서가 같다는 전제(같은 producer, 같은 파티션)를 테스트 주석에 적어야 한다. 중복 가입 테스트도 같은 방식으로 뒤에 정상 가입 1건을 보내 마커로 쓴다.
+  2. `QUIET_PERIOD` 를 1초로 줄인다. 단순하지만 느린 CI 에서 거짓 통과(늦게 온 메시지를 놓침) 가능성이 커진다.
+  3. 관리자 재기동 검증은 두 번째 애플리케이션 대신 `AdminAccountInitializer.run()` 을 같은 컨텍스트에서 한 번 더 호출해 확인한다. 기동 1회가 빠지지만 "실제 재기동" 재현성은 떨어진다. 컨테이너 중복은 E-08 의 싱글턴 컨테이너로 해결한다.
+- **우선순위**: 낮음 — 지금 18초는 수용 가능하다. 4단계 `IntegrationTestSupport` 를 만들 때 1의 패턴을 정해 두면 비용이 가장 적다.
+- **영향 범위**: `SignupIntegrationTest`, `AdminBootstrapIntegrationTest`, phase-4·6 통합 테스트 작성 규칙

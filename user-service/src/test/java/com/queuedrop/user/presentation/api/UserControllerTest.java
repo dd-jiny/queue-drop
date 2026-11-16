@@ -169,4 +169,54 @@ class UserControllerTest {
                 .andExpect(jsonPath("$.code").value("USER_INVALID_CREDENTIALS"));
         assertThat(tokenIssuer.issuedSubjects()).isEmpty();
     }
+
+    private static final String HANGUL_24 = "가".repeat(24);   // UTF-8 3바이트 x 24 = 72바이트
+
+    private static String signupBody(String password) {
+        return """
+                {"email":"user@example.com","password":"%s","nickname":"drop"}""".formatted(password);
+    }
+
+    @Test
+    @DisplayName("[T1-14] ASCII 64자 비밀번호(64바이트)는 201")
+    void signupAscii64Password() throws Exception {
+        // Given
+        String password = "a".repeat(64);
+
+        // When / Then
+        postJson("/api/users/signup", signupBody(password)).andExpect(status().isCreated());
+    }
+
+    @Test
+    @DisplayName("[T1-14] 한글 24자 비밀번호(정확히 72바이트, BCrypt 한계)는 201")
+    void signupExactly72BytesPassword() throws Exception {
+        // When / Then
+        postJson("/api/users/signup", signupBody(HANGUL_24)).andExpect(status().isCreated());
+    }
+
+    @Test
+    @DisplayName("[T1-14] 한글 24자 + ASCII 1자(73바이트)는 400 COMMON_INVALID_INPUT + password fieldError")
+    void signup73BytesPasswordRejected() throws Exception {
+        // When
+        ResultActions result = postJson("/api/users/signup", signupBody(HANGUL_24 + "a"));
+
+        // Then
+        result.andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("COMMON_INVALID_INPUT"))
+                .andExpect(jsonPath("$.fieldErrors[*].field").value(hasItem("password")));
+        assertThat(userRepository.findAll()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T1-14] 한글 25자 비밀번호(25자지만 75바이트)는 400 COMMON_INVALID_INPUT + password fieldError")
+    void signup75BytesPasswordRejected() throws Exception {
+        // When
+        ResultActions result = postJson("/api/users/signup", signupBody("가".repeat(25)));
+
+        // Then
+        result.andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("COMMON_INVALID_INPUT"))
+                .andExpect(jsonPath("$.fieldErrors[*].field").value(hasItem("password")));
+        assertThat(userRepository.findAll()).isEmpty();
+    }
 }

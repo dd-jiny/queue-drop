@@ -106,12 +106,14 @@ class JwtAuthenticationFilterTest {
                 Arguments.of("다른 키로 서명", TestTokens.signedWithOtherKey(42L, "USER")),
                 Arguments.of("형식 깨짐", TestTokens.malformed()),
                 Arguments.of("다른 issuer", TestTokens.otherIssuer(42L, "USER")),
-                Arguments.of("role 클레임 없음", TestTokens.withoutRole(42L)));
+                Arguments.of("role 클레임 없음", TestTokens.withoutRole(42L)),
+                Arguments.of("alg=none 서명 없음", TestTokens.unsigned(42L, "ADMIN")),
+                Arguments.of("sub 가 숫자 아님", TestTokens.withSubject("abc", "USER")));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("invalidTokens")
-    @DisplayName("[T1-22] 보호 경로에 위조·형식 오류·다른 issuer·role 없는 토큰이면 401 AUTH_INVALID_TOKEN")
+    @DisplayName("[T1-22] 보호 경로에 위조·형식 오류·다른 issuer·role 없는·서명 없는(alg=none)·sub 비숫자 토큰이면 401 AUTH_INVALID_TOKEN")
     void protectedWithInvalidToken(String caseName, String token) {
         // Given
         MockServerWebExchange exchange = exchange(bearer(MockServerHttpRequest.post(PROTECTED), token));

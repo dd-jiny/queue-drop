@@ -9,6 +9,8 @@ import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.stereotype.Component;
 
+import java.nio.charset.StandardCharsets;
+
 /** 기동이라는 '입력'을 받아 application 을 호출하는 입력 어댑터 → presentation (Scheduler·Listener 와 같은 위치) */
 @Slf4j
 @Component
@@ -17,6 +19,7 @@ import org.springframework.stereotype.Component;
 class AdminAccountInitializer implements ApplicationRunner {
 
     private static final int PASSWORD_MIN = 8;
+    private static final int PASSWORD_MAX_BYTES = 72;   // BCrypt 제한
 
     private final AdminAccountProperties properties;
     private final UserService userService;
@@ -27,9 +30,12 @@ class AdminAccountInitializer implements ApplicationRunner {
             log.info("ADMIN_EMAIL not set — skip admin bootstrap");
             return;
         }
-        if (properties.password() == null || properties.password().length() < PASSWORD_MIN) {
+        String password = properties.password();
+        if (password == null || password.length() < PASSWORD_MIN
+                || password.getBytes(StandardCharsets.UTF_8).length > PASSWORD_MAX_BYTES) {
             // 기동 실패로 설정 오류를 빨리 드러낸다
-            throw new IllegalStateException("ADMIN_PASSWORD must be at least " + PASSWORD_MIN + " characters");
+            throw new IllegalStateException("ADMIN_PASSWORD must be at least " + PASSWORD_MIN
+                    + " characters and at most " + PASSWORD_MAX_BYTES + " UTF-8 bytes");
         }
         boolean created = userService.createAdminIfAbsent(
                 new CreateAdminCommand(properties.email(), properties.password(), properties.nickname()));

@@ -163,4 +163,25 @@ class SignupIntegrationTest {
         await().during(QUIET_PERIOD).atMost(QUIET_PERIOD.plusSeconds(2))
                 .until(() -> recordsWithKey(rolledBackKey).isEmpty());
     }
+
+    @Test
+    @DisplayName("[T1-16] 실제 BCrypt 로 정확히 72바이트(한글 24자) 비밀번호 가입 후 같은 비밀번호로 로그인된다")
+    void bcrypt72BytePasswordRoundTrip() throws Exception {
+        // Given
+        String email = "bcrypt-" + UUID.randomUUID() + "@example.com";
+        String password = "가".repeat(24);
+
+        // When
+        mockMvc.perform(post("/api/users/signup").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"%s","password":"%s","nickname":"bcrypt"}""".formatted(email, password)))
+                .andExpect(status().isCreated());
+
+        // Then
+        mockMvc.perform(post("/api/users/login").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"%s","password":"%s"}""".formatted(email, password)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.tokenType").value("Bearer"));
+    }
 }

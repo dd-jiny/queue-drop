@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 관리자 계정 생성(ADMIN_EMAIL / ADMIN_PASSWORD 기동 시 생성) 확정 및 구현 상세·테스트·커밋 추가, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 0단계 결과 반영: 헤더 누락 400 `COMMON_MISSING_USER_HEADER`(3.8), Lombok/R1 설명 정정, user-service Kafka 블록을 0단계 공통 설정으로, jjwt 0.13.0. Access token 만료 1시간 기본안 확정. gateway 에러 코드 접두어 `AUTH_` 는 인증 도메인 이름으로 명명 규칙 예외 |
+| v1.3 | 2026-11-16 | 단계 검증 반영: `createAdminIfAbsent` 트랜잭션 제거(동시 기동 시 UnexpectedRollbackException), 비밀번호 UTF-8 72바이트 상한(BCrypt), 3.7 gateway 구현 결정 기록, 리스크(JWT_SECRET fallback) 추가, 로그인 시 더미 해시 비교(E-15) |
 
 ---
 
@@ -475,8 +476,10 @@ public class UserService {
     /**
      * 관리자 계정이 없으면 생성한다. 기동 시 초기화 러너에서 호출.
      * @return 새로 만들었으면 true, 같은 이메일 계정이 이미 있으면 false (기존 계정의 역할은 바꾸지 않는다)
+     *
+     * 트랜잭션을 걸지 않는다: 동시 기동 경쟁에서 저장이 유니크 위반으로 실패하면 저장소 호출의 트랜잭션 안에서 롤백이 끝나고
+     * false 를 반환한다. 바깥 @Transactional 이 있으면 rollback-only 표시 때문에 커밋 시 UnexpectedRollbackException 으로 기동이 실패한다.
      */
-    @Transactional
     public boolean createAdminIfAbsent(CreateAdminCommand command) {
         Email email = toEmail(command.email(), UserErrorCode.INVALID_EMAIL);
         if (userRepository.existsByEmail(email)) {
@@ -784,7 +787,7 @@ public record LoginResponse(String accessToken, String tokenType, long expiresIn
     }
 }
 ```
-- 비밀번호 정책(8~64자)은 **입력 형식**이라 presentation `@Valid` 에서 검증한다. domain 은 원문 비밀번호를 받지 않으므로 검증할 수 없다 (구현 결정).
+- 비밀번호 정책(8~64자, **UTF-8 72바이트 이하** — BCrypt 는 72바이트 초과 `encode` 를 거부한다)은 **입력 형식**이라 presentation `@Valid`(`@MaxUtf8Bytes(72)` 커스텀 제약)에서 검증한다. 관리자 러너도 같은 기준. domain 은 원문 비밀번호를 받지 않으므로 검증할 수 없다 (구현 결정).
 - 이메일·닉네임은 presentation(형식)과 domain(규칙) 양쪽에서 검증한다. domain 검증이 최종 규칙이다.
 
 #### `UserController`
@@ -868,6 +871,14 @@ gateway 는 계층 구조를 적용하지 않는다 ([class-diagram.md](../../de
 | 2 | `JwtAuthenticationFilter` | `Ordered.HIGHEST_PRECEDENCE + 1` | 토큰 검증 → 헤더 주입 / 401 |
 
 > 제거가 검증보다 **먼저**여야 한다. 검증 필터의 어떤 경로(인증 제외 경로 포함)에서도 위조 헤더가 남지 않는다 ([sequence-diagram.md](../../design/08-sequence-diagram/sequence-diagram.md) 1장).
+> Spring Cloud Gateway 내장 `RemoveCachedBodyFilter` 도 `HIGHEST_PRECEDENCE` 라 정렬상 두 필터 사이에 올 수 있다. 캐시된 바디만 정리하고 헤더는 다루지 않으므로 영향 없음 (구현 확인).
+
+**구현 결정 (문서 코드와 다른 점)**
+- 헤더 주입은 `headers(h -> h.set(...))` — 추가가 아니라 교체. 제거 필터가 앞에 있지만 단독으로도 값이 하나만 남게 한다.
+- `role` 클레임이 없는 토큰은 `INVALID_TOKEN`.
+- `Bearer` 접두어는 대소문자 무시, `Bearer ` 뒤가 비어 있으면 토큰 없음(`TOKEN_MISSING`) 으로 본다.
+- `@EnableConfigurationProperties(AuthProperties)` 는 `config/AuthConfig` 에 둔다.
+- `JwtVerifier` 는 jjwt 기본 시스템 시각으로 만료를 판단한다. 테스트 토큰은 실행 시점 기준 ±1시간으로 만든다 (고정 Clock 규칙 예외 — 경계 시각 테스트가 필요해지면 `parser().clock(...)` 주입).
 
 #### 인증 제외 경로
 | Method | Path 패턴 | 근거 |
@@ -1177,6 +1188,8 @@ feat(gateway): JWT 검증 필터와 인증 제외 경로 추가
 - **`user.registered` 유실**: 커밋 후 비동기 발행이라 브로커 장애 시 랭킹 닉네임이 빠진다. 랭킹 조회 시 닉네임이 없으면 `"user-{id}"` 로 표시하는 대비를 7단계에 둔다. 확실하게 하려면 Outbox (범위 밖).
 - **헤더 신뢰 전제**: 내부 서비스 포트(8081~8086)에 직접 요청하면 `X-User-Id` 를 위조할 수 있다. 로컬 개발에서는 감수하고, 8단계 컨테이너화 때 gateway 만 외부 노출한다 ([infrastructure.md](../../design/03-infrastructure/infrastructure.md) 5장).
 - **JWT 비밀키 공유**: 두 서비스 기본값이 다르면 모든 요청이 401. 기본값을 한 곳(`.env.example`)에서 관리하고, 기동 시 키 길이 검증(T1-13)으로 설정 누락을 빨리 드러낸다.
+- **JWT_SECRET 기본값**: 로컬 편의를 위해 두 서비스 yml 에 공개된 fallback 값이 있다. 운영에서 환경변수를 빠뜨리면 누구나 토큰을 위조할 수 있으므로, 8단계 컨테이너 실행에서는 fallback 을 쓰지 않는다(프로파일 분리 또는 알려진 기본값이면 기동 실패).
+- **로그인 응답 시간**: 이메일이 없을 때도 더미 해시로 비교를 한 번 수행해 응답 시간으로 계정 존재가 드러나지 않게 한다 (E-15, 단계 검증 후 반영).
 - **BCrypt 비용**: 로그인·가입마다 약 수십 ms CPU 사용. 부하 테스트 시나리오(8단계)에서는 로그인을 미리 해두고 토큰을 재사용한다.
 - **라이브러리 확인**: jjwt 0.13.x API(`verifyWith`, `parseSignedClaims`), Boot 4 의 `JsonMapper` 자동 구성, `spring-boot-starter-webmvc-test` 스타터 이름은 구현 시 확인.
 

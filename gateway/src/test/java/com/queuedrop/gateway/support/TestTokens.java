@@ -101,6 +101,31 @@ public final class TestTokens {
                 .compact();
     }
 
+    /** alg=none: 서명 없는 토큰 (header.payload.) */
+    public static String unsigned(long userId, String role) {
+        Instant now = Instant.now();
+        return Jwts.builder()
+                .issuer(ISSUER)
+                .subject(String.valueOf(userId))
+                .claim("role", role)
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(now.plus(TTL)))
+                .compact();
+    }
+
+    /** 올바르게 서명됐지만 sub 가 임의 문자열인 토큰 */
+    public static String withSubject(String subject, String role) {
+        Instant now = Instant.now();
+        return Jwts.builder()
+                .issuer(ISSUER)
+                .subject(subject)
+                .claim("role", role)
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(now.plus(TTL)))
+                .signWith(key(SECRET))
+                .compact();
+    }
+
     public static String malformed() {
         return "this.is-not.a-jwt";
     }

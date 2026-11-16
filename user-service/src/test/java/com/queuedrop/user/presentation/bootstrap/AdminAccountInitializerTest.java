@@ -95,4 +95,28 @@ class AdminAccountInitializerTest {
         userService.login(new LoginCommand("admin@example.com", "12345678"));
         assertThat(tokenIssuer.issuedSubjects()).extracting(TokenSubject::role).containsExactly("ADMIN");
     }
+
+    @Test
+    @DisplayName("[T1-30] ADMIN_PASSWORD 가 UTF-8 73바이트면 IllegalStateException (BCrypt 72바이트 한계)")
+    void failsWhenPasswordOver72Bytes() {
+        // Given: 한글 24자(72바이트) + ASCII 1자
+        AdminAccountProperties properties = new AdminAccountProperties("admin@example.com", "가".repeat(24) + "a", "admin");
+
+        // When / Then
+        assertThatThrownBy(() -> run(properties)).isInstanceOf(IllegalStateException.class);
+        assertThat(userRepository.findAll()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T1-30] ADMIN_PASSWORD 가 정확히 72바이트면 관리자 계정이 생성된다 (경계값)")
+    void createsAdminWithExactly72Bytes() {
+        // Given
+        AdminAccountProperties properties = new AdminAccountProperties("admin@example.com", "가".repeat(24), "admin");
+
+        // When
+        run(properties);
+
+        // Then
+        assertThat(userRepository.findAll()).hasSize(1);
+    }
 }
