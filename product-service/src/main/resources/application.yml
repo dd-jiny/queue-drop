@@ -27,6 +27,7 @@ spring:
         enable.idempotence: true
         request.timeout.ms: 1000
         delivery.timeout.ms: 3000
+        max.block.ms: 1000         # send() 호출 자체의 블로킹 상한 (기본 60초)
     consumer:
       group-id: ${spring.application.name}
       auto-offset-reset: earliest

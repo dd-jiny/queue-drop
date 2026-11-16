@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 (0~8단계) |
 | v1.1 | 2026-11-16 | 단계별 구현 상세 문서(`phases/`) 추가 및 링크 |
 | v1.2 | 2026-11-16 | 확정 사항 반영: Flyway, 커밋 후 발행 방식(afterCommit), 동기 발행 정책(애플리케이션 재시도 없음), DLT, 관리자 계정 생성, 저장 전 Redis 확인(응모·쿠폰). 미결정 표 갱신 |
+| v1.3 | 2026-11-16 | 0단계 완료: 진행 현황·체크리스트 갱신. 에러 계약 결정(X-User-* 누락 400, `{SERVICE}_{REASON}`, 응답 메시지 고정) 4장 표에 추가 |
 
 ---
 
@@ -77,7 +78,7 @@ flowchart LR
 ### 진행 현황
 | 단계 | 브랜치 | 구현 상세 | 상태 |
 |------|--------|-----------|------|
-| 0. 공통 기반 | `chore/phase-0-foundation` | [phase-0-foundation.md](phases/phase-0-foundation.md) | ⬜ 대기 |
+| 0. 공통 기반 | `chore/phase-0-foundation` | [phase-0-foundation.md](phases/phase-0-foundation.md) | ✅ 완료 (2026-11-16) |
 | 1. 인증 | `feat/phase-1-auth` | [phase-1-auth.md](phases/phase-1-auth.md) | ⬜ 대기 |
 | 2. 드로우 | `feat/phase-2-drop` | [phase-2-drop.md](phases/phase-2-drop.md) | ⬜ 대기 |
 | 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ⬜ 대기 |
@@ -97,29 +98,29 @@ flowchart LR
 
 **작업**
 - 빌드
-  - [ ] 루트 `build.gradle`: ArchUnit, Testcontainers(PostgreSQL, Kafka, Redis) 테스트 의존성 추가
-  - [ ] `common` 에 `java-test-fixtures` 플러그인 적용
+  - [x] 루트 `build.gradle`: ArchUnit, Testcontainers(PostgreSQL, Kafka, Redis) 테스트 의존성 추가
+  - [x] `common` 에 `java-test-fixtures` 플러그인 적용
 - common
-  - [ ] 이벤트 메시지 record 5종: `UserRegistered`, `DropCreated`, `EntryCreated`, `DrawCompleted`, `CouponIssued`
-  - [ ] 토픽 이름 상수 `Topics`
-  - [ ] testFixtures: ArchUnit 규칙 R1~R7 (`LayerRules`)
-  - [ ] testFixtures: Testcontainers 공통 지원 클래스 (컨테이너 재사용 설정)
+  - [x] 이벤트 메시지 record 5종: `UserRegistered`, `DropCreated`, `EntryCreated`, `DrawCompleted`, `CouponIssued`
+  - [x] 토픽 이름 상수 `Topics`
+  - [x] testFixtures: ArchUnit 규칙 R1~R7 (`LayerRules`)
+  - [x] testFixtures: Testcontainers 공통 지원 클래스 (컨테이너 재사용 설정)
 - 각 서비스 (user, product, queue, entry, coupon, ranking)
-  - [ ] 4계층 패키지 골격 (`presentation`, `application`, `domain`, `infrastructure`)
-  - [ ] `ArchitectureTest` (공통 규칙 적용)
-  - [ ] 공통 에러 응답 형식 + `@RestControllerAdvice` 기본 틀
+  - [x] 4계층 패키지 골격 (`presentation`, `application`, `domain`, `infrastructure`)
+  - [x] `ArchitectureTest` (공통 규칙 적용)
+  - [x] 공통 에러 응답 형식 + `@RestControllerAdvice` 기본 틀
 - 인프라 (`docker-compose.yml`)
-  - [ ] Redis AOF (`appendonly yes`, `appendfsync everysec`) + 데이터 볼륨
-  - [ ] Kafka `auto.create.topics.enable=false` + 토픽 초기화 컨테이너 (파티션 수, `entry.created` 보존 30일, DLT 3종 `drop.created.DLT`·`entry.created.DLT`·`coupon.issued.DLT`)
-  - [ ] Kafka producer 공통 설정: `acks=all`, 멱등, `request.timeout.ms=1000`, `delivery.timeout.ms=3000` (동기 발행은 애플리케이션 재시도 없음)
+  - [x] Redis AOF (`appendonly yes`, `appendfsync everysec`) + 데이터 볼륨
+  - [x] Kafka `auto.create.topics.enable=false` + 토픽 초기화 컨테이너 (파티션 수, `entry.created` 보존 30일, DLT 3종 `drop.created.DLT`·`entry.created.DLT`·`coupon.issued.DLT`)
+  - [x] Kafka producer 공통 설정: `acks=all`, 멱등, `request.timeout.ms=1000`, `delivery.timeout.ms=3000` (동기 발행은 애플리케이션 재시도 없음)
 
 **확정 (2026-11-16)**
 - [x] DB 스키마 관리: **Flyway 도입**, `ddl-auto: validate`
 
 **완료 조건**
-- [ ] 모든 모듈 `./gradlew build` 통과, 각 서비스 `ArchitectureTest` 실행됨
-- [ ] 계층 규칙을 일부러 어긴 코드를 넣으면 테스트가 실패함을 확인 (규칙이 실제로 동작하는지)
-- [ ] `docker compose up -d` 후 모든 컨테이너 healthy, 토픽 5개 + DLT 3개 생성 확인 (Kafka UI)
+- [x] 모든 모듈 `./gradlew build` 통과, 각 서비스 `ArchitectureTest` 실행됨
+- [x] 계층 규칙을 일부러 어긴 코드를 넣으면 테스트가 실패함을 확인 (규칙이 실제로 동작하는지)
+- [x] `docker compose up -d` 후 모든 컨테이너 healthy, 토픽 5개 + DLT 3개 생성 확인 (Kafka UI)
 
 ---
 
@@ -334,6 +335,7 @@ flowchart LR
 | 드로우 이벤트 발행 방식 | 2단계 | 발행 어댑터 안의 afterCommit 발행 + 재발행 API | ✅ 확정 (2026-11-16) |
 | 컨슈머 저장 전 Redis 응모자 확인 | 4단계 | 확인 후 없으면 저장 스킵 | ✅ 확정 (2026-11-16) |
 | 쿠폰 저장 전 Redis 발급 확인 | 6단계 | 확인 후 없으면 저장 스킵 (초과 발급 방지) | ✅ 확정 (2026-11-16) |
+| 에러 계약 (헤더 누락 상태 코드, 코드 명명, 상세 메시지 노출) | 0단계 | `COMMON_MISSING_USER_HEADER`(400), `{SERVICE}_{REASON}`, 응답 메시지 고정·상세는 로그만 | ✅ 확정 (2026-11-16) |
 | 추첨 건수 불일치 장기화 | 5단계 | 경고 후 관리자 수동 확정 | 미결정 |
 | 인기 드로우 랭킹 범위 | 7단계 | 진행 중 드로우만 | 미결정 |
 | 랭킹 동점 처리 | 7단계 | member 사전순 | 미결정 |

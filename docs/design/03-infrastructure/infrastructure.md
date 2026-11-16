@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 (현재 docker-compose 정리 + 설계 결정에 따른 변경 예정 사항) | NFR-01 ~ 03 |
 | v1.1 | 2026-11-16 | 토픽 목록(DLT 포함)·producer 설정 확정, Flyway 확정, 환경변수(JWT·관리자 시드·튜닝 파라미터) 추가, compose 프로필 구성 추가 | phase-0·1·4·8 구현 상세 6장 |
+| v1.2 | 2026-11-16 | producer `max.block.ms=1000` 추가, `entry.created.DLT`·`coupon.issued.DLT` 파티션 6 (원본과 일치) | enhancement-backlog E-01, E-02 |
 
 ## 1. 쉬운 설명 (한눈에)
 > 개발 PC 에서 `docker compose up -d` 한 번으로 DB(PostgreSQL), 메모장(Redis), 우체통(Kafka)이 뜨고,
@@ -93,9 +94,9 @@ flowchart TB
 | 항목 | 변경 내용 | 근거 |
 |------|-----------|------|
 | Redis 영속성 | `appendonly yes`, `appendfsync everysec` + 볼륨 마운트 | 재시작 시 정원·응모자 판정 유실 → 오버 응모 방지 ([D1](../04-non-functional/concurrency-consistency.md)) |
-| Kafka 토픽 사전 생성 | `auto.create.topics.enable=false` + kafka-init 이 생성: `user.registered`·`drop.created`·`draw.completed` (파티션 1), `entry.created`·`coupon.issued` (파티션 6), DLT `drop.created.DLT`·`entry.created.DLT`·`coupon.issued.DLT` (파티션 1) | 자동 생성 토픽은 파티션 1개 → 컨슈머 병렬성 확보 불가. 자동 생성이 꺼져 있으므로 DLT 도 미리 만들어야 한다 |
+| Kafka 토픽 사전 생성 | `auto.create.topics.enable=false` + kafka-init 이 생성: `user.registered`·`drop.created`·`draw.completed` (파티션 1), `entry.created`·`coupon.issued` (파티션 6), DLT `drop.created.DLT` (파티션 1), `entry.created.DLT`·`coupon.issued.DLT` (파티션 6 — 원본과 같게. DLT recoverer 기본 동작이 원본 파티션 번호로 보내기 때문) | 자동 생성 토픽은 파티션 1개 → 컨슈머 병렬성 확보 불가. 자동 생성이 꺼져 있으므로 DLT 도 미리 만들어야 한다 |
 | `entry.created` 보존 기간 | 30일 | 랭킹 유실 시 오프셋 리셋으로 재집계 ([ranking.md](../05-features/ranking.md)) |
-| Producer 설정 | `acks=all`, `enable.idempotence=true`, `retries=MAX`, `request.timeout.ms=1000`, `delivery.timeout.ms=3000` (애플리케이션 재시도 없음) | "성공 응답 = 이벤트 기록" 불변식 + send 결과를 3초 안에 확정 ([D2](../04-non-functional/concurrency-consistency.md)) |
+| Producer 설정 | `acks=all`, `enable.idempotence=true`, `retries=MAX`, `request.timeout.ms=1000`, `delivery.timeout.ms=3000`, `max.block.ms=1000` (애플리케이션 재시도 없음) | "성공 응답 = 이벤트 기록" 불변식 + send 결과를 3초 안에 확정 ([D2](../04-non-functional/concurrency-consistency.md)). `max.block.ms` 는 `send()` 호출 자체의 블로킹(메타데이터·버퍼 대기)을 제한한다 — 이때 던지는 예외는 "기록 안 됨"이 확실하므로 보상 대상 |
 | Consumer 실패 처리 | 저장 컨슈머(entry, coupon): 3회 재시도 후 `{topic}.DLT` / ranking·queue: 3회 재시도 후 로그 | DB 저장 누락은 DLT 로 재처리 가능하게, Redis 집계는 재집계로 복구 |
 | 내부 포트 비노출 | 서비스 컨테이너화 시 gateway 만 외부 포트 노출 | 헤더 신뢰 기반 인증의 우회 방지 ([architecture.md](../02-architecture/architecture.md) 6장) |
 | DB 스키마 관리 | **Flyway 도입, `ddl-auto: validate`** (확정) | 도메인 모델·JPA 엔티티 분리 구조에서 스키마를 명시적으로 관리하고 변경 이력을 남긴다 |

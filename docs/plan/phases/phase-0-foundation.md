@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-16 | 라이브러리 확인 결과 반영: ArchUnit 1.5.1, Testcontainers 2.0.5 (`testcontainers-{module}` 아티팩트명 확인) |
 | v1.3 | 2026-11-16 | 3.4 `LayerRules`: R1 에 `lombok..` 허용(설계 v1.2), `isDomainModel` 오탐 방지(`domain.modeling` 제외), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가(설계 v1.2). 규칙 자체 검증 테스트 `LayerRulesTest` 추가 (T0-02a). 3.5: Testcontainers 2.x 패키지(`org.testcontainers.postgresql`, `org.testcontainers.kafka`) 확인 |
 | v1.4 | 2026-11-16 | 에러 계약 결정 반영(설계 layered-architecture v1.3): `CommonErrorCode` 에 `MISSING_USER_HEADER`(400)·`METHOD_NOT_ALLOWED`(405) 추가, 헤더 누락 401 → 400, `ApplicationException` javadoc "공통 부모", 3.8 핸들러에 Spring MVC 표준 예외 매핑 표와 처리 추가(400/404/405/415, `HandlerMethodValidationException`, `ErrorResponse` 4xx 정규화), 4xx `ApplicationException` warn 로그, `UNSUPPORTED_MEDIA_TYPE`(415) 추가, T0-05 시나리오 확장 |
+| v1.5 | 2026-11-16 | 0단계 종료 분석 반영: producer `max.block.ms=1000` 추가(E-02), DLT 파티션 수를 원본과 일치(`entry.created.DLT`·`coupon.issued.DLT` 6, E-01), T0-04 확장 |
 
 ---
 
@@ -807,6 +808,7 @@ spring:
         enable.idempotence: true
         request.timeout.ms: 1000
         delivery.timeout.ms: 3000
+        max.block.ms: 1000         # send() 호출 자체의 블로킹(메타데이터·버퍼 대기) 상한. 기본 60초면 get(3.5s) 전제가 깨진다
     consumer:
       group-id: ${spring.application.name}
       auto-offset-reset: earliest
@@ -933,15 +935,16 @@ create draw.completed  1
 create entry.created  6 --config retention.ms=2592000000
 create coupon.issued  6
 
-# DLT: 저장 컨슈머(entry, coupon)가 3회 재시도 후 보내는 토픽. 재처리용이라 파티션 1 (구현 결정)
+# DLT: 저장 컨슈머(entry, coupon)가 3회 재시도 후 보내는 토픽.
+# DeadLetterPublishingRecoverer 기본 동작은 원본과 같은 파티션 번호로 보내므로 파티션 수를 원본과 맞춘다.
 create drop.created.DLT  1
-create entry.created.DLT 1
-create coupon.issued.DLT 1
+create entry.created.DLT 6
+create coupon.issued.DLT 6
 
 "$TOPICS_BIN" --bootstrap-server "$BOOTSTRAP" --list
 ```
 
-(구현 결정) 파티션 수: 피크 토픽 6, 저빈도 토픽 1. 근거는 8단계 부하 테스트에서 검증하고 조정한다.
+(구현 결정) 파티션 수: 피크 토픽 6, 저빈도 토픽 1. 근거는 8단계 부하 테스트에서 검증하고 조정한다. DLT 파티션 수는 원본과 같게 둔다 (enhancement-backlog E-01).
 
 ---
 

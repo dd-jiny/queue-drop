@@ -22,9 +22,10 @@ create draw.completed  1
 create entry.created  6 --config retention.ms=2592000000
 create coupon.issued  6
 
-# DLT: 저장 컨슈머(entry, coupon)가 3회 재시도 후 보내는 토픽. 재처리용이라 파티션 1 (구현 결정)
+# DLT: 저장 컨슈머(entry, coupon)가 3회 재시도 후 보내는 토픽.
+# DeadLetterPublishingRecoverer 기본 동작은 원본과 같은 파티션 번호로 보내므로 파티션 수를 원본과 맞춘다.
 create drop.created.DLT  1
-create entry.created.DLT 1
-create coupon.issued.DLT 1
+create entry.created.DLT 6
+create coupon.issued.DLT 6
 
 "$TOPICS_BIN" --bootstrap-server "$BOOTSTRAP" --list
