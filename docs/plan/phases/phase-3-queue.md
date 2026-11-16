@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 0단계 에러 계약에 정렬: `QueueErrorCode implements ErrorCode`(코드 `QUEUE_*`), 별도 `QueueException`·`QueueExceptionHandler` 제거(`ApplicationException` + 0단계 `GlobalExceptionHandler`), 헤더 누락은 `COMMON_MISSING_USER_HEADER`(400). 도메인 불변식 위반은 `DomainException`, 잘못된 `drop.created` 는 로그·스킵. Kafka 설정은 0단계 공통 블록 유지(ErrorHandlingDeserializer). 스케줄러 on/off 속성 추가. 결정 필요 2건 기본안 확정(CLOSED 상태 없음, 키 정리 `closeAt + 1일` 구현). 커밋 계획을 테스트 포함 기능 커밋 단위로 재편 |
 | v1.3 | 2026-11-16 | 단계 검증 반영: 게이트 window = 주기의 90%(지터로 주기를 건너뛰던 문제, E-31), 입장 루프 드로우별 예외 격리, 상태 조회를 대기 → 토큰 순으로(입장 경합 시 NOT_IN_QUEUE 오표시 제거), 리스너 실패 정책을 설계(architecture.md 4장·D4)대로 1초 간격 3회 재시도 후 로그·스킵(`KafkaConsumerConfig`), `saveMeta` 를 `save_meta.lua` 로 원자화(E-36) |
+| v1.4 | 2026-11-16 | 3단계 완료: 체크리스트 갱신 (전 테스트 통과, 로컬 compose 에서 등록 → 진입 → ADMITTED 확인) |
 
 ---
 
@@ -837,6 +838,6 @@ public class EntryRemainingFixture {
 | 공통: API 가 설계 문서 API 표와 일치 | T3-23 |
 | 공통: 설계 수정 필요 항목 반영 | 6장 "설계 수정 필요" |
 
-- [ ] 위 테스트 전부 통과
-- [ ] 로컬: 2단계로 드로우 등록 → `redis-cli SET entry:{id}:remaining 100` → 대기열 진입 → 1초 내 ADMITTED 확인
-- [ ] [implementation-plan.md](../implementation-plan.md) 진행 현황 갱신
+- [x] 위 테스트 전부 통과 (queue-service 148건)
+- [x] 로컬: 2단계로 드로우 등록 → `redis-cli SET entry:{id}:remaining 100` → 대기열 진입 → 1초 내 ADMITTED 확인 (오픈 전 409, 키 없음 입장 보류, 품절 409·SOLD_OUT, 토큰 TTL 300초, 키 만료 시각도 확인)
+- [x] [implementation-plan.md](../implementation-plan.md) 진행 현황 갱신
