@@ -5,7 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 (4계층, 엄격한 DIP, 모델 비노출 원칙 합의) | 전체 |
 | v1.1 | 2026-11-16 | application 의 `common.error` 의존 허용, 커밋 후 발행 규칙(발행 어댑터 내 afterCommit), 에러 계약 위치·추가 에러 코드, domain `exception` 패키지, R3 금지 목록 확장 | phase-0·2·4 구현 상세 6장 |
-| v1.2 | 2026-11-16 | R1 허용 목록에 `lombok..` 추가 (Lombok 생성 코드의 `@lombok.Generated` 가 바이트코드에 남는 것을 확인) | phase-0 커밋 #4 |
+| v1.2 | 2026-11-16 | R1 허용 목록에 `lombok..` 추가 (Lombok 생성 코드의 `@lombok.Generated` 가 바이트코드에 남는 것을 확인), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가 | phase-0 커밋 #4 |
 
 ## 1. 쉬운 설명 (한눈에)
 > 가게로 비유하면 **창구(presentation)** 는 손님 말을 주문서로 옮겨 적고, **매니저(application)** 는 주문서를 보고 일을 지시하고,
@@ -137,7 +137,7 @@ com.queuedrop.{service}
 |---|------|------|
 | R1 | `domain..` 은 `domain..`, `java..`, `lombok..` 외에 의존하지 않는다 | domain 순수성 (Spring·JPA 의존 금지, 컴파일 타임 Lombok 허용*) |
 | R2 | `application..` 은 `presentation..`, `infrastructure..` 에 의존하지 않는다 | 상위·기술 계층 모름 |
-| R3 | `application..` 은 `jakarta.persistence..`, `org.springframework.data..`, `org.springframework.kafka..`, `org.springframework.web..`, `com.queuedrop.common.event..` 에 의존하지 않는다 | 기술 의존 금지, 메시지 계약 직접 의존 금지(4.4) |
+| R3 | `application..` 은 `jakarta.persistence..`, `org.hibernate..`, `org.springframework.data..`, `org.springframework.kafka..`, `org.springframework.web..`, `org.apache.kafka..`, `io.lettuce..`, `redis.clients..`, `com.queuedrop.common.event..` 에 의존하지 않는다 | 기술 의존 금지(Spring 추상화와 클라이언트 라이브러리 모두), 메시지 계약 직접 의존 금지(4.4) |
 | R4 | `presentation..` 은 `domain..`, `infrastructure..` 에 의존하지 않는다 | **모델 비노출** |
 | R5 | `infrastructure..` 는 `presentation..` 에 의존하지 않는다 | 역방향 금지 |
 | R6 | `application.service..` 의 public 메서드는 `domain.model..` 타입을 파라미터·반환으로 쓰지 않는다 | **모델 비노출 (메서드 시그니처 수준)** |

@@ -6,7 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | Flyway 확정, 공통 producer 설정을 4단계 기준(request 1000 / delivery 3000)으로 통일, DLT 토픽 3종 추가, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 라이브러리 확인 결과 반영: ArchUnit 1.5.1, Testcontainers 2.0.5 (`testcontainers-{module}` 아티팩트명 확인) |
-| v1.3 | 2026-11-16 | 3.4 `LayerRules`: R1 에 `lombok..` 허용(설계 v1.2), `isDomainModel` 오탐 방지(`domain.modeling` 제외). 규칙 자체 검증 테스트 `LayerRulesTest` 추가 (T0-02a) |
+| v1.3 | 2026-11-16 | 3.4 `LayerRules`: R1 에 `lombok..` 허용(설계 v1.2), `isDomainModel` 오탐 방지(`domain.modeling` 제외), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가(설계 v1.2). 규칙 자체 검증 테스트 `LayerRulesTest` 추가 (T0-02a) |
 
 ---
 
@@ -427,9 +427,13 @@ public final class LayerRules {
                             "org.springframework.data..",
                             "org.springframework.kafka..",
                             "org.springframework.web..",
+                            "org.hibernate..",
+                            "org.apache.kafka..",
+                            "io.lettuce..",
+                            "redis.clients..",
                             "com.queuedrop.common.event..")
                     .allowEmptyShould(true)
-                    .as("R3: application 은 JPA·Spring Data·Kafka·Web·이벤트 메시지에 의존하지 않는다");
+                    .as("R3: application 은 JPA·Hibernate·Spring Data·Kafka·Redis 클라이언트·Web·이벤트 메시지에 의존하지 않는다");
 
     @ArchTest
     public static final ArchRule R4_presentation_does_not_see_domain =
@@ -855,7 +859,7 @@ create coupon.issued.DLT 1
 | ID | 계층/종류 | 테스트 클래스 | 시나리오 (Given / When / Then) | 관련 REQ |
 |----|-----------|---------------|--------------------------------|----------|
 | T0-01 | 아키텍처 | `{svc}.ArchitectureTest` ×6 | Given 4계층 골격만 있는 서비스 / When ArchUnit 실행 / Then R1~R7 모두 통과 (빈 패키지 허용) | - |
-| T0-02a | 아키텍처 (자동) | common `LayerRulesTest` | Given 규칙별 위반/준수 샘플 클래스 / When R1~R7 check / Then 위반 샘플은 실패, 준수 샘플은 `allowEmptyShould(false)` 로도 통과. R3 위반 샘플은 `jakarta.persistence`·`common.event` 만 (Spring Data·Kafka·Web 은 common 에 의존성이 없어 범위 밖). 서비스 패키지 오타는 잡지 못하므로 T0-02 는 계속 필요 | - |
+| T0-02a | 아키텍처 (자동) | common `LayerRulesTest` | Given 규칙별 위반/준수 샘플 클래스 / When R1~R7 check / Then 위반 샘플은 실패, 준수 샘플은 `allowEmptyShould(false)` 로도 통과. R3 위반 샘플은 `jakarta.persistence`·`common.event` 만 (Spring Data·Kafka·Web·Hibernate·Kafka/Redis 클라이언트는 common 에 의존성이 없어 범위 밖). 서비스 패키지 오타는 잡지 못하므로 T0-02 는 계속 필요 | - |
 | T0-02 | 아키텍처 (수동) | entry-service `ArchitectureTest` | Given presentation 이 domain 모델을 반환하는 임시 클래스 / When 실행 / Then R4 실패. 같은 방식으로 R6, R1 실패 확인 후 임시 클래스 삭제 (3.7) | - |
 | T0-03 | 통합 | `{svc}.ApplicationContextTest` ×4 (user, product, entry, coupon) | Given `PostgresContainerConfig` / When 컨텍스트 기동 / Then Flyway 실행 + `ddl-auto: validate` 통과, 기동 성공 | - |
 | T0-04 | 통합 | `{svc}.ApplicationContextTest` (queue, ranking) | Given `RedisContainerConfig`, `KafkaContainerConfig` / When 기동 / Then 성공 | - |

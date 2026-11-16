@@ -58,9 +58,13 @@ public final class LayerRules {
                             "org.springframework.data..",
                             "org.springframework.kafka..",
                             "org.springframework.web..",
+                            "org.hibernate..",
+                            "org.apache.kafka..",
+                            "io.lettuce..",
+                            "redis.clients..",
                             "com.queuedrop.common.event..")
                     .allowEmptyShould(true)
-                    .as("R3: application 은 JPA·Spring Data·Kafka·Web·이벤트 메시지에 의존하지 않는다");
+                    .as("R3: application 은 JPA·Hibernate·Spring Data·Kafka·Redis 클라이언트·Web·이벤트 메시지에 의존하지 않는다");
 
     @ArchTest
     public static final ArchRule R4_presentation_does_not_see_domain =
