@@ -33,3 +33,20 @@ spring:
               uri: ${RANKING_SERVICE_URL:http://localhost:8086}
               predicates:
                 - Path=/api/rankings/**
+
+queuedrop:
+  jwt:
+    secret: ${JWT_SECRET:queue-drop-local-development-secret-key-0123456789}   # user-service 와 동일해야 함
+    issuer: queue-drop
+  auth:
+    public-paths:
+      - POST /api/users/signup
+      - POST /api/users/login
+      - GET /api/products/drops
+      - GET /api/products/drops/{dropId}
+      - GET /api/rankings/drops
+      - GET /api/rankings/users/weekly
+      - GET /api/rankings/users/all
+      - GET /api/coupons/events/{eventId}
+      - GET /api/entries/drops/{dropId}/result
+      - GET /actuator/health
