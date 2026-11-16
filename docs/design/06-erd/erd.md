@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | 전체 |
+| v1.1 | 2026-11-16 | entries.entry_seq 의미 변경 (1..M 연속 → 고유·빈 번호 허용) | NFR-03 |
 
 ## 쉬운 설명
 > 서비스마다 장부(DB)가 따로 있어요. 장부끼리는 선(외래키)으로 연결하지 않고, 번호(id)만 적어서 서로를 가리켜요.
@@ -71,7 +72,7 @@ erDiagram
         bigint id PK
         bigint drop_id "UK(drop_id, user_id), UK(drop_id, entry_seq)"
         bigint user_id
-        int entry_seq "Redis 판정 순번 1..M"
+        int entry_seq "Redis seq 카운터 발급, 드로우 내 고유, 빈 번호 허용"
         varchar status "APPLIED | WON | LOST"
         timestamp applied_at
         timestamp updated_at

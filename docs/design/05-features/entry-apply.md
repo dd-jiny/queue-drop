@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-ENTRY-01 ~ 04, 06 |
 | v1.1 | 2026-11-16 | 클래스 다이어그램을 4계층 구조로 이관 (class-diagram.md 참고) | layered-architecture.md |
+| v1.2 | 2026-11-16 | entrySeq 발급을 잔여 정원 계산에서 별도 INCR 카운터로 변경 (보상 후 번호 재사용으로 인한 응모 누락 방지) | NFR-03 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-ENTRY-01: 입장 토큰으로 응모
@@ -22,7 +23,7 @@
 ## 3. 상세 설명
 
 ### 응모 Lua 스크립트 (원자 판정)
-입력: `KEYS = [entry meta, remaining, applicants, queue token]`, `ARGV = [userId, nowEpochMs]`
+입력: `KEYS = [entry meta, remaining, applicants, seq, queue token]`, `ARGV = [userId, nowEpochMs]`
 
 | 순서 | 검사 | 실패 시 결과 |
 |------|------|--------------|
@@ -31,14 +32,16 @@
 | 3 | `SISMEMBER applicants userId` == 0 | `DUPLICATE` |
 | 4 | `GET remaining` > 0 | `SOLD_OUT` |
 | 5 | `DECR remaining`, `SADD applicants userId` | — |
-| 6 | `entrySeq = capacity - remaining` 반환 | `OK(entrySeq)` |
+| 6 | `entrySeq = INCR entry:{dropId}:seq` 반환 | `OK(entrySeq)` |
 
 - 시간 비교에 `nowEpochMs` 를 인자로 받는 이유: Lua 안에서 `TIME` 을 쓰면 복제 시 비결정적 — 애플리케이션 시각을 넘기고 판정은 한 곳(Redis)에서만.
-- `entrySeq` 는 1 ~ M 의 고유 번호 → 추첨 시 결정적 정렬 기준.
+- `entrySeq` 는 **잔여 정원과 무관한 별도 카운터**로 발급하는 드로우 내 고유 번호 → 추첨 시 결정적 정렬 기준.
+  - 카운터는 **증가만 하고 보상 시에도 되돌리지 않는다.** 보상된 응모의 번호는 빈 번호로 남고, 최댓값이 M 보다 커질 수 있다.
+  - 이유: 잔여 정원에서 번호를 계산(`M - remaining`)하면 보상(`INCR remaining`) 후 같은 번호가 다른 사용자에게 재발급되어, 유령 이벤트와 정상 이벤트가 `UNIQUE(drop_id, entry_seq)` 에서 충돌해 **정상 응모가 누락**될 수 있다 ([sequence-diagram.md](../08-sequence-diagram/sequence-diagram.md) 5.2).
 
 ### 이벤트 발행 + 보상 (D2)
 - `kafkaTemplate.send(entry.created).get(3s)`, producer `acks=all`, 재시도 2회
-- 최종 실패 → 보상 Lua: `if SREM applicants userId == 1 then INCR remaining end`
+- 최종 실패 → 보상 Lua: `if SREM applicants userId == 1 then INCR remaining end` (`seq` 는 되돌리지 않음)
 - 응답: `503 ENTRY_TEMPORARILY_FAILED` (재시도 가능)
 
 ### 저장 컨슈머 (entry-service 자기 토픽 소비)

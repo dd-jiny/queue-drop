@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 (인증, 전체 흐름, 쿠폰, 랭킹, 장애 시나리오) | 전체 |
+| v1.1 | 2026-11-16 | 5.2 응모 번호 재사용 문제 해결 반영 (별도 seq 카운터) 및 해결 후 시퀀스 추가 | NFR-03 |
 
 ## 쉬운 설명
 > 기능 문서(`05-features/`)의 시퀀스가 "창구 하나에서 무슨 일이 일어나는지"라면,
@@ -325,13 +326,38 @@ sequenceDiagram
 ```
 **읽는 법**: 컨슈머가 저장 전에 Redis 를 확인해 "보상된 응모"를 걸러낸다. 이 확인이 없으면 Redis 응모 수 < DB 응모 수가 되어 5.4 의 추첨이 영원히 대기한다. (README "확인 필요" 항목의 기본안)
 
-> ⚠️ **이 그림을 그리며 발견한 구멍**: 보상으로 `INCR remaining` 하면 그 `entrySeq` 번호가 다른 사용자에게 다시 발급된다.
-> 이때 유령 이벤트(보상된 응모)와 새 사용자의 이벤트가 **같은 entrySeq** 를 갖게 되고,
-> 같은 사용자가 보상 후 재응모하면 `SISMEMBER` 가 다시 true 가 되어 유령 이벤트가 저장될 수 있다 →
-> 새 사용자의 INSERT 가 `UNIQUE(drop_id, entry_seq)` 위반으로 "중복"으로 오인되어 **누락**된다.
-> 대응 선택지 (구현 전 결정 필요):
-> - (a) `entrySeq` 를 `DECR` 결과가 아니라 별도 `INCR entry:{id}:seq` 로 발급 → 번호 재사용 없음 (빈 번호 허용). **권장**
-> - (b) 컨슈머 확인을 `SISMEMBER` 대신 "Redis 에 userId → entrySeq 를 Hash 로 저장하고 번호까지 일치하는지" 비교
+> ✅ **응모 번호 재사용 문제 (v1.1 에서 해결)**
+> 번호를 잔여 정원으로 계산(`M - remaining`)하면 보상(`INCR remaining`) 후 같은 번호가 다른 사용자에게 재발급된다.
+> 보상된 사용자가 재응모하면 `SISMEMBER` 가 다시 true 가 되어 유령 이벤트가 저장되고, 같은 번호를 받은 다른 사용자의 INSERT 가
+> `UNIQUE(drop_id, entry_seq)` 위반으로 "중복" 오인되어 **누락**될 수 있었다.
+> → `entrySeq` 를 **되돌리지 않는 별도 카운터 `INCR entry:{dropId}:seq`** 로 발급하도록 변경. 번호가 겹치지 않으므로 유령 이벤트는
+> 같은 사용자의 정상 이벤트와 `UNIQUE(drop_id, user_id)` 에서만 충돌하고, 다른 사용자의 응모에는 영향을 주지 않는다.
+
+```mermaid
+sequenceDiagram
+    actor A as 사용자 A
+    actor B as 사용자 B
+    participant R as Redis
+    participant K as Kafka
+    participant C as Consumer
+    participant DB as entry_db
+
+    A->>R: 응모 → seq=1, remaining 99
+    Note over K: (A, 1) 기록됐지만 ack 유실
+    R->>R: 보상: SREM A, INCR remaining → 100 (seq 는 그대로 1)
+    B->>R: 응모 → seq=2, remaining 99
+    B->>K: (B, 2)
+    A->>R: 재응모 → seq=3, remaining 98
+    A->>K: (A, 3)
+    K->>C: (A, 1) 유령 → SISMEMBER A = true
+    C->>DB: INSERT (A, 1) 성공
+    K->>C: (B, 2)
+    C->>DB: INSERT (B, 2) 성공 ✅ 번호 충돌 없음
+    K->>C: (A, 3)
+    C->>DB: UNIQUE(drop_id, user_id) 위반 → 스킵
+    Note over R,DB: Redis 응모자 {A, B} = 2, DB = 2 → 추첨 가능
+```
+**읽는 법**: A 는 유령 이벤트의 번호(1)로 저장되지만 응모 1건은 정확히 남는다. 번호는 추첨 정렬 기준일 뿐 당첨은 시드 셔플로 정해지므로 공정성에 영향이 없다.
 
 ### 5.3 컨슈머 재전달 (중복 이벤트)
 ```mermaid

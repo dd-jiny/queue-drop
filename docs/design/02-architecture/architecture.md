@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | 전체 |
 | v1.1 | 2026-11-16 | 서비스 내부 계층 구조 문서 링크 추가 | layered-architecture.md |
+| v1.2 | 2026-11-16 | Redis 키 `entry:{dropId}:seq` 추가 | NFR-03 |
 
 ---
 
@@ -92,6 +93,7 @@ flowchart LR
 | `entry:{dropId}:meta` | Hash | entry | entry | state(OPEN/CLOSED), capacity, openAt, closeAt |
 | `entry:{dropId}:remaining` | String | entry | entry, **queue** | 잔여 응모 정원 |
 | `entry:{dropId}:applicants` | Set | entry | entry | 응모자 userId (중복 방지) |
+| `entry:{dropId}:seq` | String | entry | entry | 응모 번호 발급 카운터 (증가만, 보상 시에도 되돌리지 않음) |
 | `coupon:{eventId}:meta` | Hash | coupon | coupon | issueStartAt |
 | `coupon:{eventId}:remaining` | String | coupon | coupon | 잔여 수량 |
 | `coupon:{eventId}:issued` | Set | coupon | coupon | 발급 userId (중복 방지) |

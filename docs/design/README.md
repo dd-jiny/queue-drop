@@ -74,7 +74,6 @@ flowchart LR
 | 랭킹 동점 처리 | [ranking.md](05-features/ranking.md) 6장 | member 사전순 (정책 없음) |
 | 추첨 건수 불일치 장기화 시 | [draw.md](05-features/draw.md) 6장 | 경고 후 관리자 수동 확정 |
 | 발행 타임아웃 후 실제 성공 케이스 | [entry-apply.md](05-features/entry-apply.md) 6장 | 컨슈머가 Redis SISMEMBER 확인 후 저장 |
-| 보상 후 entrySeq 재사용 문제 | [sequence-diagram.md](08-sequence-diagram/sequence-diagram.md) 5.2 | entrySeq 를 별도 INCR 카운터로 발급 |
 | 드로우 이벤트 발행 방식 | [concurrency-consistency.md](04-non-functional/concurrency-consistency.md) D4 | AFTER_COMMIT + 재발행 API (Outbox 미사용) |
 
 ## 문서 작성 규칙
