@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 (4계층, 엄격한 DIP, 모델 비노출 원칙 합의) | 전체 |
+| v1.1 | 2026-11-16 | application 의 `common.error` 의존 허용, 커밋 후 발행 규칙(발행 어댑터 내 afterCommit), 에러 계약 위치·추가 에러 코드, domain `exception` 패키지, R3 금지 목록 확장 | phase-0·2·4 구현 상세 6장 |
 
 ## 1. 쉬운 설명 (한눈에)
 > 가게로 비유하면 **창구(presentation)** 는 손님 말을 주문서로 옮겨 적고, **매니저(application)** 는 주문서를 보고 일을 지시하고,
@@ -38,7 +39,7 @@ flowchart TB
 | 계층 | 책임 | 의존 허용 | 의존 금지 | 주요 클래스 |
 |------|------|-----------|-----------|-------------|
 | **presentation** | 입력 수신·검증, 형식 변환 (Request→Command, Result→Response, 이벤트 메시지→Command) | application, Spring Web, `common` 이벤트 메시지 | domain, infrastructure | `XxxController`, `XxxRequest`, `XxxResponse`, `XxxEventListener`, `XxxScheduler` |
-| **application** | 유스케이스 흐름 조율, 트랜잭션 경계, 도메인 모델 → Result 변환 | domain, `spring-context`·`spring-tx` (어노테이션만) | presentation, infrastructure, JPA, Redis, Kafka | `XxxService`, `XxxCommand`, `XxxResult`, 외부 연동 포트 |
+| **application** | 유스케이스 흐름 조율, 트랜잭션 경계, 도메인 모델 → Result 변환 | domain, `common.error`(에러 계약, 순수 Java), `spring-context`·`spring-tx` (어노테이션만) | presentation, infrastructure, JPA, Redis, Kafka, Spring Web, `common.event` | `XxxService`, `XxxCommand`, `XxxResult`, 외부 연동 포트 |
 | **domain** | 비즈니스 규칙, 상태 전이, 불변식 | **순수 Java 만** | Spring, JPA(jakarta.persistence), 다른 모든 계층 | 모델, 값 객체, enum, 도메인 서비스, `XxxRepository`(인터페이스) |
 | **infrastructure** | 기술 구현 (DB, Redis, Kafka), 포트 구현, 설정 | domain, application(포트), 모든 기술 라이브러리, `common` | presentation | `XxxJpaEntity`, `XxxJpaRepository`, `XxxRepositoryImpl`, `XxxMapper`, `RedisXxx`, `KafkaXxxPublisher` |
 
@@ -84,15 +85,21 @@ flowchart LR
 - `common` 모듈의 이벤트(`EntryCreated` 등)는 **서비스 간 계약(메시지 DTO)** 이지 도메인 모델이 아니다.
 - **발행**: application 은 포트 `EntryEventPublisher.publishCreated(EntryCreatedPayload)` 만 호출 → infrastructure 의 `KafkaEntryEventPublisher` 가 `common` 메시지로 변환해 전송.
   - application 이 `common` 메시지에 직접 의존하지 않도록, 포트 파라미터는 application 자체 DTO 로 둔다.
+- **커밋 후 발행** (user `user.registered`, product `drop.created`): application 은 포트만 호출하고 **발행 시점을 모른다**. infrastructure 발행 어댑터가 `TransactionSynchronizationManager.registerSynchronization(afterCommit)` 으로 커밋 후 발행을 등록하고, 활성 트랜잭션이 없으면 즉시 발행한다. application 이 Spring 이벤트 API(`ApplicationEventPublisher`, `@TransactionalEventListener`)에 의존하지 않는다.
+- **동기 발행** (entry `entry.created`, coupon `coupon.issued`): 어댑터가 `send().get()` 으로 수신 확인까지 기다리고, 실패는 application 포트 예외로 바꿔 던진다. 재시도는 producer 내부 재시도만 쓴다 ([D2](../04-non-functional/concurrency-consistency.md)).
 - **수신**: presentation 의 `XxxEventListener`(`@KafkaListener`)가 메시지를 받아 **Command 로 변환 후 application 호출**. 컨트롤러와 같은 "입력 어댑터" 위치.
 - 스케줄러(`@Scheduled`)도 같은 이유로 presentation 에 둔다 — 시간이 보내는 요청을 받는 입력 어댑터.
 
 ### 4.5 예외·에러 코드
 - presentation 은 domain 을 볼 수 없으므로, domain 의 판정 결과(`ApplyOutcome.SOLD_OUT` 등)를 그대로 HTTP 로 매핑할 수 없다.
-- **application 이 에러 코드를 정의**하고(`application/dto/ErrorCode` 또는 `application/exception`), 도메인 결과를 application 예외로 변환해 던진다.
+- **에러 계약은 `common.error`** 에 순수 Java 로 둔다: `ErrorCode`(interface: code, HTTP 상태), `ApplicationException`, `ErrorResponse`(응답 바디 형식). 서비스별 에러 코드 enum 은 **application** 의 `application/exception` 에 두고 `ErrorCode` 를 구현한다.
+- **application 이 에러 코드를 정의**하고, 도메인 결과를 application 예외로 변환해 던진다.
   - 예: `ApplyOutcome.SOLD_OUT` → `throw new EntryApplyException(EntryErrorCode.SOLD_OUT)`
 - presentation 의 `@RestControllerAdvice` 가 application 예외 → HTTP 상태·응답 바디로 매핑한다.
-- domain 의 불변식 위반(예: `Drop` 생성 시 M < K)은 domain 예외(`DomainException`, 순수 Java)로 던지고, application 이 받아 에러 코드로 변환한다.
+- domain 의 불변식 위반(예: `Drop` 생성 시 M < K)은 domain 예외(`DomainException`, 순수 Java, `domain/exception`)로 던지고, application 이 받아 에러 코드로 변환한다.
+  - 리스너 경로도 같다: 수신 메시지가 불변식을 어기면 application 이 예외를 변환해 던지고(예: `InvalidDropSnapshotException`), 리스너 재시도 후 DLT 로 간다.
+- `X-User-Id` 누락(Gateway 우회 등)은 presentation 이 `MISSING_USER_HEADER`(400) 로 처리한다.
+- `@RestControllerAdvice` 는 Spring Web 의존이 있어 `common` 에 두지 않고 서비스마다 같은 형태로 둔다.
 
 ## 5. 패키지 구조 (서비스 공통)
 
@@ -105,11 +112,13 @@ com.queuedrop.{service}
 ├── application
 │   ├── service        # XxxService (유스케이스)
 │   ├── dto            # XxxCommand, XxxResult
-│   └── port           # 외부 연동 포트 (interface)
+│   ├── port           # 외부 연동 포트 (interface)
+│   └── exception      # 서비스별 에러 코드 enum (common.error.ErrorCode 구현), application 예외
 ├── domain
 │   ├── model          # 도메인 모델, 값 객체, enum
 │   ├── service        # 도메인 서비스 (예: Drawer)
-│   └── repository     # 영속성 포트 (interface)
+│   ├── repository     # 영속성 포트 (interface)
+│   └── exception      # 도메인 예외 (DomainException, 순수 Java)
 └── infrastructure
     ├── persistence    # XxxJpaEntity, XxxJpaRepository, XxxRepositoryImpl, XxxMapper
     ├── redis          # RedisXxx (포트 구현), Lua 스크립트 로더
@@ -127,7 +136,7 @@ com.queuedrop.{service}
 |---|------|------|
 | R1 | `domain..` 은 `domain..`, `java..` 외에 의존하지 않는다 | domain 순수성 (Spring·JPA·Lombok 런타임 의존 금지*) |
 | R2 | `application..` 은 `presentation..`, `infrastructure..` 에 의존하지 않는다 | 상위·기술 계층 모름 |
-| R3 | `application..` 은 `jakarta.persistence..`, `org.springframework.data..`, `org.springframework.kafka..` 에 의존하지 않는다 | 기술 의존 금지 |
+| R3 | `application..` 은 `jakarta.persistence..`, `org.springframework.data..`, `org.springframework.kafka..`, `org.springframework.web..`, `com.queuedrop.common.event..` 에 의존하지 않는다 | 기술 의존 금지, 메시지 계약 직접 의존 금지(4.4) |
 | R4 | `presentation..` 은 `domain..`, `infrastructure..` 에 의존하지 않는다 | **모델 비노출** |
 | R5 | `infrastructure..` 는 `presentation..` 에 의존하지 않는다 | 역방향 금지 |
 | R6 | `application.service..` 의 public 메서드는 `domain.model..` 타입을 파라미터·반환으로 쓰지 않는다 | **모델 비노출 (메서드 시그니처 수준)** |

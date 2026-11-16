@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-ENTRY-01 ~ 04, 06 |
 | v1.1 | 2026-11-16 | 클래스 다이어그램을 4계층 구조로 이관 (class-diagram.md 참고) | layered-architecture.md |
 | v1.2 | 2026-11-16 | entrySeq 발급을 잔여 정원 계산에서 별도 INCR 카운터로 변경 (보상 후 번호 재사용으로 인한 응모 누락 방지) | NFR-03 |
+| v1.3 | 2026-11-16 | 발행 재시도를 producer 내부 멱등 재시도로 변경, 저장 전 Redis 확인 확정, 저장 방식(ON CONFLICT)·DLT, 조회 보완 범위(단건만), 에러 코드 추가, meta 없음 → CLOSED | phase-4 구현 상세 6장 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-ENTRY-01: 입장 토큰으로 응모
@@ -27,7 +28,7 @@
 
 | 순서 | 검사 | 실패 시 결과 |
 |------|------|--------------|
-| 1 | meta.state == OPEN 그리고 openAt ≤ now < closeAt | `CLOSED` |
+| 1 | meta 존재, meta.state == OPEN 그리고 openAt ≤ now < closeAt | `CLOSED` (meta 없음 = 드로우 정보 미수신도 `CLOSED`) |
 | 2 | `EXISTS token` | `NO_TOKEN` |
 | 3 | `SISMEMBER applicants userId` == 0 | `DUPLICATE` |
 | 4 | `GET remaining` > 0 | `SOLD_OUT` |
@@ -40,14 +41,20 @@
   - 이유: 잔여 정원에서 번호를 계산(`M - remaining`)하면 보상(`INCR remaining`) 후 같은 번호가 다른 사용자에게 재발급되어, 유령 이벤트와 정상 이벤트가 `UNIQUE(drop_id, entry_seq)` 에서 충돌해 **정상 응모가 누락**될 수 있다 ([sequence-diagram.md](../08-sequence-diagram/sequence-diagram.md) 5.2).
 
 ### 이벤트 발행 + 보상 (D2)
-- `kafkaTemplate.send(entry.created).get(3s)`, producer `acks=all`, 재시도 2회
-- 최종 실패 → 보상 Lua: `if SREM applicants userId == 1 then INCR remaining end` (`seq` 는 되돌리지 않음)
-- 응답: `503 ENTRY_TEMPORARILY_FAILED` (재시도 가능)
+- `kafkaTemplate.send(entry.created).get(3.5s)` 로 동기 확인
+- producer: `acks=all`, `enable.idempotence=true`, `retries=MAX`, `request.timeout.ms=1000`, `delivery.timeout.ms=3000`
+- **애플리케이션 재시도 없음** — 같은 내용을 다시 send 하면 별개 레코드가 되어 유령 이벤트를 늘린다 ([D2](../04-non-functional/concurrency-consistency.md))
+- 실패 → 보상 Lua: `if SREM applicants userId == 1 then INCR remaining end` (`seq` 는 되돌리지 않음)
+- 응답: `503 TEMPORARILY_FAILED` (재시도 가능)
 
 ### 저장 컨슈머 (entry-service 자기 토픽 소비)
-- `entry.created` 소비 → `INSERT entries (drop_id, user_id, entry_seq, status=APPLIED, applied_at)`
-- `UNIQUE(drop_id, user_id)` 위반 → 이미 저장된 것으로 보고 무시 (멱등)
-- 배치 리스너 + bulk insert 로 DB 쓰기 평탄화 가능 (구현 시 선택)
+1. `entry.created` 소비
+2. **저장 전 Redis 확인 (확정)**: `SISMEMBER applicants userId` 가 0 이면 보상된 응모(유령 이벤트)로 보고 저장하지 않는다
+3. `INSERT entries (...) ON CONFLICT (drop_id, user_id) DO NOTHING` — 이미 저장된 응모면 0건 반영으로 끝난다 (멱등)
+   - 예외(`DataIntegrityViolationException`)를 잡아 무시하는 방식은 쓰지 않는다: 트랜잭션이 rollback-only 가 되고 세션을 다시 쓸 수 없다
+   - 충돌 대상을 `(drop_id, user_id)` 로만 지정한다. `entry_seq` 충돌은 정상이라면 일어나지 않는 버그이므로 예외로 드러낸다
+4. DB 장애 등 처리 실패 → 1초 간격 3회 재시도 후 `entry.created.DLT`
+- 수동 커밋(`ack-mode=record`). 배치 리스너 + bulk insert 는 부하 측정 후 검토
 
 ### API
 | Method | Path | 설명 |
@@ -56,7 +63,20 @@
 | GET | `/api/entries/me` | 내 응모 목록 (상태: APPLIED/WON/LOST) |
 | GET | `/api/entries/drops/{dropId}/me` | 특정 드로우 내 응모·결과 |
 
-- 응답이 `202` 인 이유: 판정은 확정이지만 DB 저장은 비동기. 직후 `/me` 조회 시 아직 없을 수 있으므로, 조회 API 는 DB 에 없으면 Redis `SISMEMBER` 로 보완해 `APPLIED` 로 응답한다.
+- 응답이 `202` 인 이유: 판정은 확정이지만 DB 저장은 비동기. 직후 조회 시 아직 없을 수 있으므로, **단건 조회(`/drops/{dropId}/me`)만** DB 에 없으면 Redis `SISMEMBER` 로 보완해 `APPLIED` 로 응답한다. 목록(`/me`)은 DB 만 조회한다 (드로우마다 Redis 를 확인하는 비용을 피함).
+
+### 에러 코드
+| 코드 | HTTP | 발생 |
+|------|------|------|
+| `CLOSED` | 409 | 오픈 전·마감 후·드로우 정보 미수신 |
+| `NO_TOKEN` | 409 | 입장 토큰 없음·만료 |
+| `DUPLICATE` | 409 | 이미 응모함 |
+| `SOLD_OUT` | 409 | 정원 소진 |
+| `TEMPORARILY_FAILED` | 503 | 이벤트 발행 실패 → 보상 완료, 재시도 가능 |
+| `ENTRY_NOT_FOUND` | 404 | 단건 조회 시 DB·Redis 모두 없음 |
+| `MISSING_USER_HEADER` | 400 | `X-User-Id` 누락 (Gateway 우회 등) |
+
+- `drop.created` 의 데이터가 도메인 불변식을 어기면(예: M < K) application 이 `InvalidDropSnapshotException` 으로 바꿔 던지고, 리스너 재시도 후 `drop.created.DLT` 로 간다.
 
 ## 4. 설계 결정
 | 결정점 | 선택 | 이유 / 포기한 것 |
@@ -105,7 +125,7 @@ sequenceDiagram
         ES-->>U: 409 + 사유
     else OK(entrySeq)
         R-->>ES: entrySeq
-        ES->>K: send(entry.created).get(3s), 재시도 2회
+        ES->>K: send(entry.created).get(3.5s) (producer 내부 재시도만)
         alt 발행 성공
             K-->>ES: ack
             ES-->>U: 202 {entrySeq}
@@ -117,7 +137,8 @@ sequenceDiagram
 
     par 저장
         K->>C: entry.created
-        C->>DB: INSERT entries (UNIQUE 위반 무시)
+        C->>R: SISMEMBER applicants (없으면 스킵)
+        C->>DB: INSERT ... ON CONFLICT DO NOTHING
     and 랭킹
         K->>RS: entry.created
     end
@@ -127,6 +148,7 @@ sequenceDiagram
 - 동기 경계는 **Redis Lua + Kafka 발행**까지다. DB 저장과 랭킹 집계는 응답 이후 일이다.
 - 실패 분기는 두 종류다: **비즈니스 실패(409)** 는 Redis 에서 아무것도 바뀌지 않았고, **기술 실패(503)** 는 보상으로 되돌린 상태다.
 - 저장 컨슈머와 랭킹 컨슈머는 서로 독립이다. 랭킹이 늦어도 응모 저장에는 영향이 없다.
+- 저장 컨슈머가 Redis 를 먼저 확인하는 이유: 503 으로 보상된 응모의 이벤트가 뒤늦게 Kafka 에 기록되어 있을 수 있기 때문이다 (유령 이벤트).
 
 ### 5.3 클래스 다이어그램
 4계층 구조의 상세 다이어그램은 [class-diagram.md](../07-class-diagram/class-diagram.md) 1.1 (응모) 참고.
@@ -140,7 +162,8 @@ sequenceDiagram
 [erd.md](../06-erd/erd.md) 의 entry_db (`entries`) 참고.
 
 ## 6. 잠재 리스크
-- **Kafka 발행 타임아웃 후 실제로는 성공**: 보상으로 Redis 에서 빠졌는데 DB 에는 저장됨 → Redis 응모 수 < DB 응모 수. 추첨 건수 비교(D6)에서 불일치로 드러난다. 선택지: 컨슈머가 저장 전 `SISMEMBER` 로 확인해 없으면 스킵.
+- **Kafka 발행 타임아웃 후 실제로는 성공**: 보상으로 Redis 에서 빠졌는데 Kafka 에는 기록됨 → 저장 컨슈머의 저장 전 `SISMEMBER` 확인으로 걸러낸다 (확정). `delivery.timeout.ms` 로 send 결과를 3초 안에 확정시켜 이런 경우 자체를 줄인다.
+- **응답 지연 상한**: Kafka 가 느리면 응모 응답이 최대 약 3.5초까지 늘 수 있다.
 - **응답 지연**: 피크 시 Kafka 왕복이 응답 시간을 좌우 → 부하 테스트로 측정 필요 (`linger.ms`, `batch.size` 튜닝 지점).
 - **Redis 재시작**: AOF 없으면 remaining/applicants 유실 → 오버 응모 가능. **AOF everysec 필수**, 그래도 최대 1초 유실 가능성은 남음.
 - **긴 Lua 스크립트**: 현재 O(1) 명령만 사용해 문제 없음. 스크립트에 반복문이 들어가면 Redis 전체가 멈추므로 금지.

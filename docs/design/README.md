@@ -68,13 +68,20 @@ flowchart LR
 ```
 
 ## 확인 필요 (미결정 정책)
-| 항목 | 문서 | 기본안 |
-|------|------|--------|
-| 인기 드로우 랭킹 범위 (전체 누적 vs 진행 중만) | [ranking.md](05-features/ranking.md) 6장 | 진행 중 드로우만 필터 |
-| 랭킹 동점 처리 | [ranking.md](05-features/ranking.md) 6장 | member 사전순 (정책 없음) |
-| 추첨 건수 불일치 장기화 시 | [draw.md](05-features/draw.md) 6장 | 경고 후 관리자 수동 확정 |
-| 발행 타임아웃 후 실제 성공 케이스 | [entry-apply.md](05-features/entry-apply.md) 6장 | 컨슈머가 Redis SISMEMBER 확인 후 저장 |
-| 드로우 이벤트 발행 방식 | [concurrency-consistency.md](04-non-functional/concurrency-consistency.md) D4 | AFTER_COMMIT + 재발행 API (Outbox 미사용) |
+| 항목 | 결정 시점 | 문서 | 기본안 |
+|------|-----------|------|--------|
+| 대기열 상태 조회에 마감 후 `CLOSED` 상태를 둘지 | 3단계 | [queue-enter.md](05-features/queue-enter.md), phase-3 6장 | 두지 않음 (드로우 상세로 판단) |
+| 마감된 드로우의 queue 키 정리 시점 | 3단계 | phase-3 6장 | `closeAt + 1일` 로 EXPIRE |
+| 추첨 건수 불일치 장기화 시 (관리자 수동 확정 API 포함 여부) | 5단계 | [draw.md](05-features/draw.md) 6장, phase-5 D5-1 | 경고 후 관리자 수동 확정 |
+| 추첨 요약 API 공개 범위 | 5단계 | [architecture.md](02-architecture/architecture.md) 6장, phase-5 D5-2 | 공개 (시드로 결과 검증 가능) |
+| E2E 테스트 실행 방식 | 5단계 | phase-5 D5-3 | 별도 e2e 모듈 + bootRun, 8단계 이후 compose 기반 |
+| 응모·쿠폰 판정 코드 공통화 | 6단계 | [coupon-issue.md](05-features/coupon-issue.md) 4장, phase-6 D6-1 | 서비스별 각자 구현 |
+| 매진 후 요청 사전 차단 | 6~8단계 | [coupon-issue.md](05-features/coupon-issue.md) 6장, phase-6 D6-2 | 그대로 Lua 실행, 부하 테스트 후 결정 |
+| 쿠폰 발급 직후 `/me` 미반영 보완 | 6단계 | phase-6 D6-3 | DB 만 조회 |
+| 인기 드로우 랭킹 범위 (전체 누적 vs 진행 중만) | 7단계 | [ranking.md](05-features/ranking.md) 6장 | 진행 중 드로우만 필터 |
+| 랭킹 동점 처리 | 7단계 | [ranking.md](05-features/ranking.md) 6장 | member 사전순 (정책 없음) |
+
+> 확정되어 표에서 제외한 항목: 저장 전 Redis 확인(응모·쿠폰), 드로우 이벤트 발행 방식(발행 어댑터 내 afterCommit + 재발행 API), Kafka 발행 재시도(producer 내부만), DLT, 관리자 계정(환경변수 시드), Flyway 도입.
 
 ## 문서 작성 규칙
 - 모든 문서 상단에 **변경 이력** 표를 두고, 수정 시 버전·날짜·변경 내용·관련 요구사항을 추가한다.
