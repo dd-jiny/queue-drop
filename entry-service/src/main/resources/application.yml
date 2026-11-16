@@ -20,6 +20,7 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+      timeout: 1s                # 명령 타임아웃 (Lettuce 기본 60초). 응모 응답 경로가 Redis 장애에 오래 묶이지 않게
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
