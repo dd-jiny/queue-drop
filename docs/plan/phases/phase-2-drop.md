@@ -585,7 +585,7 @@ public class DropRepositoryImpl implements DropRepository {
     }
 }
 ```
-> 쿼리 조건이 `Drop.status(now)` 와 **같은 경계**(`[openAt, closeAt)`, drawn 우선)를 쓰는지 T2-13 에서 검증한다. 도메인 규칙이 JPQL 에 중복된다는 점은 6장 리스크 참고.
+> 쿼리 조건이 `Drop.status(now)` 와 **같은 경계**(`[openAt, closeAt)`, drawn 우선)를 쓰는지 T2-19 에서 검증한다. 도메인 규칙이 JPQL 에 중복된다는 점은 6장 리스크 참고.
 
 `ProductJpaEntity`, `ProductMapper`, `ProductJpaRepository`, `ProductRepositoryImpl` 은 같은 패턴 (생략).
 
