@@ -457,3 +457,149 @@
   - E-28 개선안 2(상세 캐시)를 도입하면 이 메서드에서 무효화해야 한다.
 - **우선순위**: 낮음(성능) / 문서 수정은 5단계 착수 전 필수.
 - **영향 범위**: `phase-5-draw.md` 3.5, (2 선택 시) `DropRepository`, `DropJpaRepository`
+
+---
+
+## phase-3 (대기열: queue-service) 분석 — 2026-11-16
+
+분석 범위: `git diff dev..HEAD` (`feat/phase-3-queue`, 커밋 5개). 기준 문서 `phase-3-queue.md` v1.2, `queue-enter.md` v1.2.
+- **측정 환경**: 로컬 `queuedrop-redis`(redis:7.4)에 임시 키(dropId 999999991)를 만들어 측정하고 바로 지웠다. 게이트는 scratch Python 스크립트가 RESP 로 `SET key NX PX {interval}` 을 고정 주기(절대 시각 기준, `fixedRate` 와 같은 방식)로 보내 통과 횟수를 셌다. `admit.lua` 실행 시간은 `SLOWLOG`(측정 동안만 임계값 0, 이후 10000 으로 복구)로 확인했다. 메모리는 `MEMORY USAGE`.
+- 각 항목의 **구분**: "버그 성격"(이번 단계에서 반영 권장) / "고도화"(나중 단계).
+
+### E-31 게이트 TTL 을 주기와 같게 잡아 단일 인스턴스에서도 약 40% 주기를 건너뜀
+- **구분**: 버그 성격 (설계 목표 처리량 "1초마다 N명" 미달, 정합성 영향 없음) — 이번 단계 반영 권장
+- **처리**: ✅ 3단계에서 반영 (2026-11-16) — 개선안 1 채택: `AdmissionProperties.gateWindowMs()` = 주기의 90%(최소 1ms). 설계 문서의 처리량 표현을 "상한 초당 약 1.11N명"으로 갱신. 회귀 테스트: `AdmissionServiceTest`.
+- **단계/위치**: phase-3, `RedisSchedulerGate.java:32-34`, `AdmissionService.java:31`, `AdmissionScheduler.java:17` (`fixedRate = interval`, 게이트 `PX = interval`)
+- **현상**: 게이트 키는 `SET NX PX 1000` 시점부터 정확히 1000ms 뒤에 만료된다. 같은 인스턴스의 다음 실행도 1000ms 뒤에 오는데, 이번 SET 의 도착 지연(스케줄러 깨어남 + 네트워크)이 지난번보다 조금이라도 짧으면 키가 아직 살아 있어 `tryPass` 가 false 다. 그 주기에는 아무도 입장하지 않고, 다음 주기(2초 뒤)에야 통과한다.
+- **문제/기회**: 설계 문서(6장 리스크, `queue-enter.md` 리스크)는 흔들림을 "다중 인스턴스에서 1~2초"로만 적었지만 **인스턴스 1개에서도 같은 일이 생긴다**. 실제 입장 속도가 설계값의 60% 안팎이고 실행마다 달라서, 8단계에서 "오픈 후 정원 소진 시간"과 응모 TPS 측정값이 N 설정과 맞지 않게 된다. 테스트(T3-20·21)는 `admit()` 을 직접 부르므로 잡지 못한다.
+- **근거**: **측정** — 인스턴스 1개 모사, 주기 1000ms × 60회 → **36회 통과(60%)**, 주기 200ms × 150회 → 94회 통과(63%). Java `scheduleAtFixedRate` 도 예정 시각 기준이라 같은 경향일 것으로 본다(추정, JVM 으로는 측정 안 함).
+- **개선안**:
+  1. 게이트 window 를 주기보다 조금 짧게 잡는다: `window = interval - margin`(예: `max(interval × 0.9, interval - 100ms)`). 한 줄 수정이고 단일 인스턴스는 매 주기 통과한다. 대가: 다중 인스턴스에서 최악의 경우 900ms 마다 한 번 통과할 수 있어 상한이 "초당 약 1.11N 명"이 된다. 문서의 "초당 N명 이하" 표현을 "주기당 N명, 최소 간격 0.9×주기"로 바꿔야 한다.
+  2. 주기 버킷 키: `SET queue:admission:gate:{floor(now/interval)} NX PX {2×interval}`. 다중 인스턴스에서도 버킷당 정확히 1회지만, 인스턴스 시계 차이에 의존하고, 실행 위상이 버킷 경계 근처에 있으면 단일 인스턴스에서도 같은 버킷에 두 번 들어가 건너뛸 수 있다. `now` 를 Redis `TIME` 으로 받으면 시계 문제는 사라지지만 왕복이 1회 늘어난다.
+  3. 그대로 두고 8단계 리포트에 실효 처리량(약 0.6N/s)을 기록한다. 권하지 않는다 — 설정값과 실제가 어긋나 튜닝 근거가 흐려진다.
+  - 1을 권장. 회귀 테스트는 `RedisSchedulerGateTest` 에 "window 만큼 기다린 뒤 같은 인스턴스가 다시 통과" 같은 경계 케이스로 고정한다(장원영).
+- **우선순위**: 높음 — 수정 비용이 작고, 대기열의 핵심 수치(초당 입장 인원)가 설정과 맞지 않는다.
+- **영향 범위**: `AdmissionService`(window 계산) 또는 `RedisSchedulerGate`, `queue-enter.md` 4장·리스크, `phase-3-queue.md` 3.3 게이트 설명·6장 리스크, `RedisSchedulerGateTest`
+
+### E-32 폴링 GET 1회에 Redis 왕복 4번, 진입 POST 는 3번 (현재 규모에서는 불필요)
+- **구분**: 고도화 (현재 규모에서는 불필요)
+- **단계/위치**: phase-3, `QueueService.java:28-46`, `RedisWaitingQueueRepository.java:44-72`, `RedisRemainingCapacityReader.java:17-20`, `enqueue.lua:22-28`
+- **현상**:
+  - `status`: `HGETALL meta`(존재 확인용) → `GET entry:{id}:remaining` → `EXISTS token` → `ZRANK waiting` 을 차례로 보낸다(4 RTT).
+  - `enter`: `HGETALL meta` → `GET remaining` → `EVALSHA enqueue.lua`(3 RTT). 신규 진입이면 Lua 안에서 `EXISTS, ZRANK, INCR, ZADD, HGET, PEXPIREAT×2, ZRANK` 8개 명령을 실행한다. `PEXPIREAT` 2개와 `HGET` 은 신규 진입마다 같은 값으로 다시 건다.
+- **문제/기회**: 8단계 S1(사용자 3,000)에서 대기 3,000명, N=100 이면 대기열이 30초 안에 빠진다. 폴링 간격 1/3/5초를 따르면 상태 조회는 약 100 + 300 + 400 ≈ 800 req/s, 최악(모두 1초)으로 3,000 req/s → Redis 명령 3,200~12,000/s 다(추정). 단일 Redis 처리량(수만~10만 ops/s)에 비해 작다. 요청 지연은 순차 왕복 4회라 로컬 RTT 0.1~0.3ms 기준 0.5~1ms 수준(추정)으로 응답 시간 목표 안에 든다. **지금은 바꿀 필요가 없다.**
+- **근거**: 코드 기반 명령 수 계산, 요청량은 추정(사용자가 `nextPollAfterMs` 를 따른다는 가정).
+- **개선안**:
+  1. 그대로 둔다(권장). 8단계에서 queue p99 나 Redis CPU 가 상위 병목으로 보일 때만 다시 본다.
+  2. `QueueMeta` 로컬 캐시(Caffeine, 만료 = `closeAt`): meta 는 등록 후 바뀌지 않아 정합성 문제가 없다. GET 3 RTT, POST 2 RTT 로 줄고 E-33 의 스케줄러 조회도 함께 줄어든다. 주의: "없음"(DROP_NOT_FOUND)은 캐시하면 안 된다 — `drop.created` 가 늦게 도착한 드로우가 계속 404 가 된다.
+  3. `status.lua` 하나로 묶는다(1 RTT, 우선순위 판정을 Lua 로 옮김). 왕복은 가장 적지만 상태 우선순위 규칙이 application 에서 Lua 로 새고, entry 소유 키를 읽는 Lua 가 하나 더 늘어 E-39(Cluster) 부담이 커진다.
+  - `enqueue.lua` 의 `PEXPIREAT` 재설정은 `seq == 1` 이거나 `PTTL == -1` 일 때만 걸도록 줄일 수 있지만, ZPOPMIN 으로 키가 비었다가 다시 생기는 경우를 놓치기 쉬워 권하지 않는다(효과도 명령 2개).
+- **우선순위**: 낮음 — 현재 규모에서 측정상 문제가 될 근거가 없다.
+- **영향 범위**: (2) `RedisWaitingQueueRepository.findMeta` 또는 infrastructure 캐시 데코레이터. (3) `scripts/status.lua`, `QueueService.status`
+
+### E-33 스케줄러가 매 주기 등록된 모든 미마감 드로우의 meta 를 HGETALL 로 다시 읽음
+- **구분**: 고도화 (현재 규모에서는 불필요)
+- **단계/위치**: phase-3, `AdmissionService.java:33-42`, `RedisWaitingQueueRepository.java:85-94`
+- **현상**: 주기당 명령은 `SET gate` + `ZREMRANGEBYSCORE` + `ZRANGEBYSCORE active-drops` + 드로우마다 `HGETALL meta`, 그리고 열린 드로우마다 `EVALSHA admit.lua` 다. `queue:active-drops` 의 score 는 `closeAt` 이라 **아직 열리지 않은(SCHEDULED) 드로우도 매초 조회**한 뒤 `isOpen` 에서 건너뛴다. 모든 호출은 순차 왕복이다.
+- **문제/기회**: 드로우를 며칠 앞서 수백 건 등록하면 매초 수백 번의 HGETALL 과 그만큼의 왕복 시간(수백 × 0.1~0.3ms ≈ 수십 ms, 추정)이 스케줄러 한 주기에 들어간다. 주기 1초보다 충분히 짧아 처리량 문제는 없다. 현재 규모(동시에 등록된 드로우 수십 건 이하, 추정)에서는 **불필요**.
+- **근거**: 코드 기반 명령 수 계산. 등록 드로우 수는 E-26 의 추정(SCHEDULED 100건)을 따름.
+- **개선안**:
+  1. 그대로 둔다(권장).
+  2. E-32 개선안 2(meta 로컬 캐시)를 넣으면 HGETALL 이 사라진다.
+  3. `active-drops` 에 넣을 때 openAt 기준 ZSet(`queue:scheduled-drops`)을 하나 더 두고 오픈 시각이 지난 것만 옮긴다. 조회는 정확해지지만 키가 늘고, 옮기는 단계가 실패하면 열린 드로우가 입장 대상에서 빠지는 새 장애 경로가 생긴다.
+  - 열린 드로우가 여러 개면 드로우마다 `admit.lua` 를 따로 부른다. 동시 오픈 드로우가 많아지면 파이프라인으로 묶을 수 있지만 현재 시나리오는 1~2개다.
+- **우선순위**: 낮음
+- **영향 범위**: (3) `RedisWaitingQueueRepository.saveMeta`·`findActiveDropIds`, `architecture.md` 5장 키 표
+
+### E-34 잔여 정원과 무관하게 매 주기 N명에게 토큰 발급 — 소진 직전 대량 입장, 응모 완료자 재진입이 입장 슬롯을 씀
+- **구분**: 고도화 (설계 결정 사항, 4단계 연동 때 판단)
+- **단계/위치**: phase-3, `admit.lua:10-21` (관련: E-31)
+- **현상**:
+  - `remaining > 0` 이면 남은 수와 관계없이 `ZPOPMIN N` 을 한다. 잔여 1개여도 100명이 대기열에서 빠져 토큰을 받는다. 이들은 대기열 자리를 잃고, 응모하면 4단계 Lua 에서 SOLD_OUT 으로 거절된다.
+  - 토큰은 응모 성공 후에도 TTL(5분)까지 남는다. 만료되면 상태가 NOT_IN_QUEUE 가 되어, 이미 응모한 사용자가 다시 진입해 줄 끝에서 입장 슬롯 1개를 쓰고 응모 시 DUPLICATE 를 받는다.
+- **문제/기회**: 정합성은 4단계 Lua 가 지키므로 오버 응모는 없다. 다만 소진 직전에는 "순서대로 1명씩"이 아니라 "N명이 동시에 경쟁"이 되어 대기열의 공정성 의미가 약해지고, 불필요한 토큰·응모 요청이 생긴다. 정원 1,000 / N=100 에서는 마지막 한 배치 정도라 영향이 작다(추정).
+- **근거**: 코드 분석. 응모 후 재진입 빈도는 클라이언트 동작에 달려 있어 추정 불가.
+- **개선안**:
+  1. 그대로 둔다(현재 설계). 8단계에서 소진 직전 SOLD_OUT 응답 수만 관찰한다.
+  2. `admit.lua` 에서 `n = min(N, remaining)` 으로 줄인다. 한 줄이고 소진 직전 대량 입장이 줄어든다. 다만 아직 응모하지 않은 토큰 보유자 수를 빼지 않으므로 여전히 초과 발급은 있다. 토큰 보유자가 응모하지 않으면 정원 채우는 속도가 느려진다. 설계 문서의 "주기당 N명"이 바뀌므로 사용자 결정.
+  3. 응모 완료자 재진입 차단: queue 가 entry 의 응모 기록(`entry:{dropId}:...`)을 읽어 진입을 막거나, entry 가 응모 성공 시 토큰을 지운다. 둘 다 서비스 간 키 소유권(D3)을 넓히므로 권하지 않는다. 클라이언트가 응모 성공 후 폴링을 멈추는 것으로 충분하다.
+- **우선순위**: 낮음 — 정합성 문제가 아니고 S1 규모 영향이 작다. 4단계에서 응모 Lua 와 함께 검토.
+- **영향 범위**: (2) `admit.lua`, `queue-enter.md` 4장, `phase-3-queue.md` 3.3, `RedisWaitingQueueRepositoryTest`
+
+### E-35 마감 후에도 WAITING 사용자에게 `nextPollAfterMs` 1~5초를 계속 돌려줌
+- **구분**: 고도화 (폴링 부하, API 상태값은 그대로)
+- **단계/위치**: phase-3, `QueueService.java:40-46` (`findMeta` 결과를 쓰지 않음)
+- **현상**: 마감 후에는 스케줄러가 입장을 멈추므로 남은 대기자의 순번은 더 줄지 않는다. 그런데 `status` 는 `closeAt` 을 보지 않고 WAITING + 1~5초를 돌려준다. 정원이 다 팔리면 SOLD_OUT(폴링 중단)으로 끝나지만, **정원이 남은 채 마감된 드로우**는 meta 가 만료되는 `closeAt + 1일` 까지 또는 클라이언트가 스스로 멈출 때까지 폴링이 이어진다.
+- **문제/기회**: 대기자 수천 명이 남은 채 마감되면 마감 후에도 초당 수백~수천 건의 의미 없는 요청이 남는다(추정). v1.2 기본안("별도 CLOSED 상태 없음, 클라이언트는 product 로 판단")은 상태 종류를 늘리지 않으려는 결정인데, `nextPollAfterMs = 0`(폴링 중단)은 기존 응답 형식 안에서 표현할 수 있다.
+- **근거**: 코드 분석. 요청 수는 추정.
+- **개선안**:
+  1. 마감 후(`meta.isClosed(now)`)에는 상태는 그대로 두고 `nextPollAfterMs = 0` 을 준다. 이미 읽은 meta 를 쓰므로 Redis 호출이 늘지 않는다. "0 = 폴링 중단" 계약은 이미 있다. 단, 클라이언트가 WAITING 인데 0 을 받는 경우를 화면에서 처리해야 하므로 `queue-enter.md` 3장에 한 줄 추가가 필요하다.
+  2. v1.2 결정을 바꿔 `CLOSED` 상태를 추가한다. 의미가 분명하지만 상태 우선순위·응답 계약이 바뀐다(사용자 결정).
+  3. 그대로 두고 8단계 시나리오에서 마감 후 폴링을 멈추게 한다. 서버 쪽 보호는 없다.
+- **우선순위**: 낮음 — 비용이 작으니 다른 수정과 함께 넣을 만하다. 8단계 전에 정하면 된다.
+- **영향 범위**: `QueueService.status`, `QueueServiceTest`, `queue-enter.md` 3장, `phase-3-queue.md` 3.2
+
+### E-36 `drop.created` 처리 실패 시 기본 에러 핸들러가 즉시 10회 재시도 후 버림 — Redis 일시 장애가 드로우 전체 장애로 이어짐
+- **구분**: 고도화 (장애 경로, E-29 의 수신 측 버전) — 4단계 전에 반영 권장
+- **처리**: ✅ 3단계에서 반영 (2026-11-16) — 설계(architecture.md 4장·D4)대로 `KafkaConsumerConfig` 에 `DefaultErrorHandler(FixedBackOff(1000ms, 3회))`, `saveMeta` 를 `save_meta.lua` 하나로 원자화. Redis 명령 타임아웃(E-03)은 기존 백로그대로 보류.
+- **단계/위치**: phase-3, `DropCreatedListener.java:18-21`, `QueueMetaRegisterService.java:19-28`, `RedisWaitingQueueRepository.java:34-42`, `application.yml` (관련: E-03, E-29)
+- **현상**:
+  - queue 에는 `CommonErrorHandler` 빈이 없어 Spring Kafka 기본 `DefaultErrorHandler`(`FixedBackOff(0, 9)`, 간격 없이 총 10회)가 쓰인다. Redis 연결이 몇 초만 끊겨도 10회가 바로 실패하고 ERROR 로그 후 오프셋이 커밋된다. queue 는 그 드로우의 meta 를 영영 갖지 못한다.
+  - `saveMeta` 는 `HSET` → `EXPIREAT` → `ZADD active-drops` 3번의 독립 왕복이다. HSET 뒤에 실패하면 TTL 없는 meta 가 남거나, meta 는 있는데 `active-drops` 에 없어 진입은 되는데 **입장이 영영 안 되는** 상태가 된다(재전달되면 복구되지만 위 기본 핸들러는 재시도를 금방 소진한다).
+  - Redis 타임아웃이 기본 60초(E-03)라, Redis 가 응답 없이 멈추면 한 번 시도에 60초를 쓴다.
+- **문제/기회**: 오픈 최소 여유 1분 안에 이 경로가 실패하면 오픈 시각에 진입이 404 `QUEUE_DROP_NOT_FOUND` 가 된다. 수신 측은 멱등(덮어쓰기)이라 길게 재시도해도 안전하다.
+- **근거**: Spring Kafka 문서 기준 기본값(측정 안 함). 부분 실패 상태는 코드 분석.
+- **개선안**:
+  1. queue 에 `DefaultErrorHandler(new ExponentialBackOff(...))` 를 둔다(예: 0.5초 시작, 최대 간격 10초, 최대 경과 5분). 파티션 1개라 재시도 동안 뒤의 `drop.created` 도 밀리지만 등록 빈도가 낮아 문제없다. 역직렬화 실패는 재시도해도 소용없으므로 not-retryable 로 둔다. 설정 몇 줄.
+  2. `saveMeta` 를 `MULTI/EXEC` 또는 Lua 하나로 묶어 부분 실패 상태를 없앤다. 순서를 `ZADD active-drops` 를 마지막이 아니라 처음으로 두는 것만으로는 해결되지 않는다(스케줄러가 meta 없음으로 건너뛰므로 위험은 줄지만 TTL 없는 키 문제는 남음).
+  3. E-29 개선안 1(오픈 전 자동 재발행)과 같이 두면 수신 측이 놓친 경우까지 메워진다.
+  - 1+2 를 권장. E-03(Redis 타임아웃 1초)이 같이 들어가야 재시도 간격이 의미가 있다.
+- **우선순위**: 중간 — 발생 빈도는 낮지만 드로우 전체 실패로 이어지고 수정 비용이 작다. 4단계 entry 도 같은 `drop.created` 를 받으므로 그때 공통 방식으로 정하면 좋다.
+- **영향 범위**: queue `infrastructure/config`(Kafka 에러 핸들러), `RedisWaitingQueueRepository.saveMeta`, `DropCreatedListenerIntegrationTest`, `phase-3-queue.md` 6장, `concurrency-consistency.md` D4
+
+### E-37 입장 스케줄러 — 한 드로우의 예외가 그 주기 전체를 멈추고, 실패가 매초 ERROR 스택으로 남음
+- **구분**: 고도화 (장애 격리·로그)
+- **처리**: ✅ 3단계에서 반영 (2026-11-16) — 드로우별 try/catch, 실패는 스택 없이 `log.error` 1줄. 회귀 테스트: `AdmissionServiceTest`.
+- **단계/위치**: phase-3, `AdmissionService.java:36-42`, `AdmissionScheduler.java:17-20` (관련: E-03, E-10)
+- **현상**: 드로우 루프에 예외 처리가 없다. 어느 드로우에서든 Redis 예외가 나면 뒤 드로우는 그 주기에 입장하지 못하고, `@Scheduled` 기본 핸들러가 ERROR + 스택 트레이스를 남긴다. Redis 장애 동안 1초마다 반복된다. 게이트는 이미 잡힌 상태라 그 주기는 다른 인스턴스도 실행하지 않는다.
+- **문제/기회**: 동시 오픈 드로우가 1~2개인 지금은 영향이 작다. Redis 가 멈추면(E-03, 60초 타임아웃) 단일 스케줄러 스레드가 60초 동안 묶이고, 풀리면 `fixedRate` 가 밀린 실행을 연달아 돌린다 — 게이트가 연속 실행을 막으므로 입장이 몰리지는 않는다.
+- **근거**: 코드 분석, 스케줄러 동작은 Spring 문서 기준(측정 안 함).
+- **개선안**:
+  1. 드로우 단위로 `try/catch` 해서 warn 한 줄(dropId, 예외 메시지) + 실패 카운터를 남기고 다음 드로우로 넘어간다. 한 드로우의 문제가 다른 드로우를 막지 않는다.
+  2. 그대로 두고 E-03(Redis 타임아웃 1초)만 넣는다. 예외 전파는 그대로지만 묶이는 시간이 1초로 줄어든다.
+  - 1+2 를 권장. 로그 정책은 E-10 과 맞춘다.
+- **우선순위**: 낮음 — 현재 동시 오픈 드로우 수가 적다. 8단계 장애 주입 전에 넣으면 충분하다.
+- **영향 범위**: `AdmissionService`, `AdmissionServiceTest`
+
+### E-38 대기열 관측 지표가 없음 — 게이트 통과율·입장 수·대기 인원·주기 소요 시간
+- **구분**: 고도화 (관측성, 8단계 준비) (관련: E-13, E-31)
+- **단계/위치**: phase-3 전체. 현재는 `AdmissionService.java:41` 의 debug 로그(입장 인원) 하나뿐이다. Actuator 의존성도 아직 없다(8단계에서 추가 예정, `phase-8-load-test.md` 3.2 에 `queue.admitted` 카운터만 계획).
+- **현상**: 입장 처리량이 설정과 맞는지(E-31), 대기열이 얼마나 쌓였는지, 진입이 신규인지 재진입인지 알 수 없다.
+- **문제/기회**: E-31 같은 문제는 지표가 있었다면 바로 보였을 것이다. 8단계에서 "오픈 후 정원 소진 시간"을 해석하려면 입장 속도와 대기 인원 추이가 필요하다.
+- **근거**: 코드 확인.
+- **개선안** (8단계 계획의 "커스텀 메트릭은 infrastructure 어댑터에서" 규칙을 따름):
+  - `queue.gate{result=pass|skip}` 카운터 — `RedisSchedulerGate`. 비용 0, E-31 수정 검증용.
+  - `queue.admitted{dropId}` 카운터 — 8단계 계획에 있음. dropId 태그는 드로우 수만큼 시계열이 생기므로 드로우가 수십 개를 넘으면 태그를 빼야 한다.
+  - `queue.admission.cycle` Timer — 주기 소요 시간(E-33 판단 근거).
+  - `queue.waiting.size` 게이지 — 열린 드로우마다 `ZCARD` 가 1회씩 더 든다. 스케줄러가 이미 `admit` 을 부르므로 `admit.lua` 가 `ZCARD` 를 함께 돌려주게 하면 추가 왕복이 없다(반환 형식 변경).
+  - `queue.enter{result=new|rejoin|admitted}` 카운터 — 재진입 비율(E-34 판단 근거). Lua 반환값을 구분해야 하므로 비용이 조금 있다.
+  - 대안: 지표 없이 `log.info` 로 주기별 요약(드로우별 입장 수·대기 수)을 남긴다. 8단계만 보면 충분하지만 추세 그래프를 그릴 수 없다.
+- **우선순위**: 중간 — 게이트 카운터와 입장 카운터는 8단계 전에 필요하다. 나머지는 낮음.
+- **영향 범위**: `RedisSchedulerGate`, `RedisWaitingQueueRepository.admit`, (게이지) `admit.lua` 반환 형식, `phase-8-load-test.md` 3.2 메트릭 표
+
+### E-39 키 설계·메모리와 Redis Cluster 비호환 — 현재 규모에서는 문제없음, Cluster 전환 시 재설계 범위
+- **구분**: 고도화 (현재 규모에서는 불필요, 문서화된 리스크의 구체화)
+- **단계/위치**: phase-3, `QueueKeys.java`, `admit.lua:19`(토큰 키를 스크립트 안에서 조합), `admit.lua:10`(entry 소유 키), 4단계 응모 Lua(`queue:{dropId}:token:{userId}` 를 entry Lua 가 읽음)
+- **현상·메모리**:
+  - 토큰 키 1개 **72B**(측정, `MEMORY USAGE`). 드로우당 동시에 살아 있는 토큰은 최대 `N × TTL / 주기` = 100 × 300 = 3만 개 ≈ 2.2MB(계산).
+  - `waiting` ZSet 10만 명 **9.7MB**(측정). S1(3,000명)은 1MB 미만(계산).
+  - 만료: meta·waiting·seq 는 `closeAt + 1일`, 토큰은 자체 TTL, `active-drops` 는 스케줄러가 정리 — 마감 드로우 키가 무한히 남는 경로는 E-36 의 부분 실패(TTL 없는 meta) 외에는 없다.
+  - Cluster: `admit.lua` 는 KEYS 에 선언하지 않은 토큰 키에 쓰고, `queue:1:waiting` 과 `entry:1:remaining` 은 서로 다른 슬롯이다. 4단계 응모 Lua 도 queue 토큰 키를 읽는다.
+- **문제/기회**: 메모리는 정원 수만·대기 수십만 규모에서도 수십 MB 수준이라 **현재 규모에서는 손댈 이유가 없다**. Cluster 는 단일 Redis 전제가 설계 결정이고, 전환하지 않는 한 문제가 아니다.
+- **근거**: 메모리는 측정 + 계산, Cluster 규칙은 Redis 문서 기준.
+- **개선안** (Cluster 전환이 필요해질 때):
+  1. 해시 태그로 드로우 단위 슬롯을 맞춘다: `queue:{1}:waiting`, `entry:{1}:remaining`, `queue:{1}:token:{userId}`. 같은 드로우의 키가 한 슬롯에 모이므로 미선언 키 접근은 Cluster 에서 실제로 동작한다(Redis 는 선언을 권장할 뿐, 같은 슬롯이면 실행된다). 대가: 인기 드로우 하나가 한 노드에 몰려 핫 슬롯이 되며, Cluster 의 이점이 "드로우 간 분산"으로 한정된다. 키 이름이 바뀌므로 queue·entry 를 동시에 배포해야 한다.
+  2. 토큰을 드로우당 Hash 하나(`queue:{1}:tokens`, field = userId)에 담고 Redis 7.4 의 필드 TTL(`HEXPIRE`)을 쓴다. 키를 KEYS 로 선언할 수 있고 키 수가 드로우당 1개로 준다. 대가: 3만 필드 빅키(수 MB), entry 응모 Lua 의 토큰 검사가 `HEXISTS` 로 바뀌는 계약 변경, 필드 TTL 은 7.4 이상 전용.
+  - 지금은 아무것도 하지 않는다(권장). 키 이름을 바꾸는 작업은 4단계가 queue 키를 읽기 시작하기 **전**이 가장 싸므로, Cluster 가능성이 조금이라도 있다면 4단계 착수 전에 1번(해시 태그)만 정하는 것을 검토한다.
+- **우선순위**: 낮음 — 단일 Redis 전제가 유지되는 한 효과가 없다.
+- **영향 범위**: (1) `QueueKeys`, entry 키 상수, `architecture.md` 5장 키 표, 3·4단계 문서 Lua 주석

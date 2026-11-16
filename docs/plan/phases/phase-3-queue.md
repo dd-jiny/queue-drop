@@ -5,6 +5,9 @@
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 설계 반영 완료 표시 |
+| v1.2 | 2026-11-16 | 0단계 에러 계약에 정렬: `QueueErrorCode implements ErrorCode`(코드 `QUEUE_*`), 별도 `QueueException`·`QueueExceptionHandler` 제거(`ApplicationException` + 0단계 `GlobalExceptionHandler`), 헤더 누락은 `COMMON_MISSING_USER_HEADER`(400). 도메인 불변식 위반은 `DomainException`, 잘못된 `drop.created` 는 로그·스킵. Kafka 설정은 0단계 공통 블록 유지(ErrorHandlingDeserializer). 스케줄러 on/off 속성 추가. 결정 필요 2건 기본안 확정(CLOSED 상태 없음, 키 정리 `closeAt + 1일` 구현). 커밋 계획을 테스트 포함 기능 커밋 단위로 재편 |
+| v1.3 | 2026-11-16 | 단계 검증 반영: 게이트 window = 주기의 90%(지터로 주기를 건너뛰던 문제, E-31), 입장 루프 드로우별 예외 격리, 상태 조회를 대기 → 토큰 순으로(입장 경합 시 NOT_IN_QUEUE 오표시 제거), 리스너 실패 정책을 설계(architecture.md 4장·D4)대로 1초 간격 3회 재시도 후 로그·스킵(`KafkaConsumerConfig`), `saveMeta` 를 `save_meta.lua` 로 원자화(E-36) |
+| v1.4 | 2026-11-16 | 3단계 완료: 체크리스트 갱신 (전 테스트 통과, 로컬 compose 에서 등록 → 진입 → ADMITTED 확인) |
 
 ---
 
@@ -43,6 +46,8 @@ queue-service/
     │   │   │   │   ├── QueueMeta.java
     │   │   │   │   ├── QueueState.java
     │   │   │   │   └── EnqueueResult.java
+    │   │   │   ├── exception
+    │   │   │   │   └── DomainException.java                 # v1.2
     │   │   │   └── repository
     │   │   │       └── WaitingQueueRepository.java
     │   │   ├── application
@@ -62,8 +67,7 @@ queue-service/
     │   │   │   ├── config
     │   │   │   │   └── AdmissionProperties.java
     │   │   │   └── exception
-    │   │   │       ├── QueueErrorCode.java
-    │   │   │       └── QueueException.java
+    │   │   │       └── QueueErrorCode.java                  # common.error.ErrorCode 구현 (v1.2)
     │   │   ├── infrastructure
     │   │   │   ├── redis
     │   │   │   │   ├── QueueKeys.java
@@ -73,21 +77,22 @@ queue-service/
     │   │   │   └── config
     │   │   │       ├── ClockConfig.java
     │   │   │       ├── RedisScriptConfig.java
+    │   │   │       ├── KafkaConsumerConfig.java             # v1.3 리스너 재시도 정책
     │   │   │       └── SchedulingConfig.java
     │   │   └── presentation
     │   │       ├── api
     │   │       │   ├── QueueController.java
+    │   │       │   ├── GlobalExceptionHandler.java          # 0단계에서 생성됨 (수정 없음)
     │   │       │   └── response/QueueStatusResponse.java
     │   │       ├── listener
     │   │       │   └── DropCreatedListener.java
-    │   │       ├── scheduler
-    │   │       │   └── AdmissionScheduler.java
-    │   │       └── advice
-    │   │           └── QueueExceptionHandler.java
+    │   │       └── scheduler
+    │   │           └── AdmissionScheduler.java
     │   └── resources
     │       ├── application.yml                          # (수정) 입장 설정, consumer 역직렬화
     │       └── scripts
     │           ├── enqueue.lua
+    │           ├── save_meta.lua                         # v1.3
     │           └── admit.lua
     └── test/java/com/queuedrop/queue
         ├── ArchitectureTest.java
@@ -96,6 +101,7 @@ queue-service/
         │   ├── QueueServiceTest.java
         │   ├── AdmissionServiceTest.java
         │   ├── PollIntervalPolicyTest.java
+        │   ├── QueueMetaRegisterServiceTest.java        # v1.2 (T3-26)
         │   └── fake
         │       ├── FakeWaitingQueueRepository.java
         │       ├── FakeRemainingCapacityReader.java
@@ -126,49 +132,29 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-kafka'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-kafka-test'
-    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis-test'   // @DataRedisTest 슬라이스
     testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
-    testImplementation testFixtures(project(':common'))
+    // testFixtures(project(':common')) 은 루트 build.gradle 이 4계층 서비스에 일괄 추가 (0단계)
 }
 ```
 
-**application.yml**
+**application.yml** — v1.2: Kafka·Redis 블록은 0단계에서 만든 공통 설정(`ErrorHandlingDeserializer` + Jackson delegate, `group-id: ${spring.application.name}`)을 그대로 쓰고 아래 `queue.admission` 만 추가한다.
 ```yaml
-server:
-  port: 8083
-
-spring:
-  application:
-    name: queue-service
-  data:
-    redis:
-      host: ${REDIS_HOST:localhost}
-      port: ${REDIS_PORT:6379}
-  kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-    consumer:
-      group-id: queue-service
-      auto-offset-reset: earliest
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
-      properties:
-        spring.json.trusted.packages: com.queuedrop.common.event
-
 queue:
   admission:
-    interval-ms: 1000        # 입장 주기
-    batch-size: 100          # 주기당 입장 인원 N
-    token-ttl-seconds: 300   # 입장 토큰 TTL
+    interval-ms: 1000         # 입장 주기
+    batch-size: 100           # 주기당 입장 인원 N (1~1000)
+    token-ttl-seconds: 300    # 입장 토큰 TTL
+    scheduler-enabled: true   # false 면 AdmissionScheduler 빈을 만들지 않는다 (테스트에서 직접 admit() 호출)
 ```
-> 역직렬화 클래스명은 Spring Kafka 4.x 기준. **구현 시 클래스명 확인**, 0단계 공통 설정이 있으면 그것을 따른다.
 
 ### 3.0.1 Redis 키 (queue 소유 + 읽기 전용 1개)
 
 | 키 | 타입 | 쓰기 | 값 | 비고 |
 |----|------|------|-----|------|
-| `queue:{dropId}:meta` | Hash | queue | `openAt`, `closeAt` (epoch ms) | `drop.created` 수신 시 HSET |
-| `queue:{dropId}:seq` | String | queue | 진입 순번 카운터 | `enqueue.lua` 에서 INCR |
-| `queue:{dropId}:waiting` | ZSet | queue | member=userId, score=seq | |
+| `queue:{dropId}:meta` | Hash | queue | `openAt`, `closeAt` (epoch ms) | `drop.created` 수신 시 HSET, `PEXPIREAT closeAt + 1일` (v1.2) |
+| `queue:{dropId}:seq` | String | queue | 진입 순번 카운터 | `enqueue.lua` 에서 INCR, `PEXPIREAT closeAt + 1일` (v1.2) |
+| `queue:{dropId}:waiting` | ZSet | queue | member=userId, score=seq | `enqueue.lua` 에서 `PEXPIREAT closeAt + 1일` (v1.2) |
 | `queue:{dropId}:token:{userId}` | String (TTL) | queue | 발급 시각 epoch ms | 존재 = 유효 토큰, entry 가 읽음 |
 | `queue:active-drops` | ZSet | queue | member=dropId, score=closeAt | **신규 (설계 수정 필요)** 스케줄러 대상 조회 |
 | `queue:admission:gate` | String (PX) | queue | 인스턴스 ID | **신규 (설계 수정 필요)** 주기당 1회 실행 게이트 |
@@ -184,10 +170,13 @@ queue:
 ```java
 package com.queuedrop.queue.domain.model;
 
+/** 시각은 epoch ms 로 저장되므로 생성 시 밀리초로 내림한다 (DropCreated 는 µs 정밀도, 차이 < 1ms) */
 public record QueueMeta(Long dropId, Instant openAt, Instant closeAt) {
     public QueueMeta {
-        if (dropId == null || openAt == null || closeAt == null) throw new IllegalArgumentException("필수 값 누락");
-        if (!openAt.isBefore(closeAt)) throw new IllegalArgumentException("openAt < closeAt 이어야 합니다");
+        if (dropId == null || openAt == null || closeAt == null) throw new DomainException("필수 값 누락");
+        openAt = openAt.truncatedTo(ChronoUnit.MILLIS);
+        closeAt = closeAt.truncatedTo(ChronoUnit.MILLIS);
+        if (!openAt.isBefore(closeAt)) throw new DomainException("openAt < closeAt 이어야 합니다");
     }
     /** openAt <= now < closeAt */
     public boolean isOpen(Instant now) { return !now.isBefore(openAt) && now.isBefore(closeAt); }
@@ -246,12 +235,12 @@ public record QueueEnterCommand(Long dropId, Long userId) {}
 public record QueueStatusQuery(Long dropId, Long userId) {}
 public record QueueMetaRegisterCommand(Long dropId, Instant openAt, Instant closeAt) {}
 
-/** state 는 String (presentation 이 domain enum 을 보지 않도록) */
+/** state 는 String (presentation 이 domain enum 을 보지 않도록). 값은 QueueState.name() 에서 만든다 */
 public record QueueStatusResult(String state, Long aheadCount, long nextPollAfterMs) {
-    public static QueueStatusResult waiting(long ahead, long poll) { return new QueueStatusResult("WAITING", ahead, poll); }
-    public static QueueStatusResult admitted() { return new QueueStatusResult("ADMITTED", null, 0); }
-    public static QueueStatusResult soldOut() { return new QueueStatusResult("SOLD_OUT", null, 0); }
-    public static QueueStatusResult notInQueue() { return new QueueStatusResult("NOT_IN_QUEUE", null, 0); }
+    public static QueueStatusResult waiting(long ahead, long poll) { return new QueueStatusResult(QueueState.WAITING.name(), ahead, poll); }
+    public static QueueStatusResult admitted() { return new QueueStatusResult(QueueState.ADMITTED.name(), null, 0); }
+    public static QueueStatusResult soldOut() { return new QueueStatusResult(QueueState.SOLD_OUT.name(), null, 0); }
+    public static QueueStatusResult notInQueue() { return new QueueStatusResult(QueueState.NOT_IN_QUEUE.name(), null, 0); }
 }
 ```
 - `nextPollAfterMs` 를 **응답에 포함한다** (queue-enter.md 6장 폴링 부하 완화). `0` = 폴링 중단. **(구현 결정)**
@@ -280,17 +269,20 @@ public interface SchedulerGate {
 
 > 이유: 두 서비스의 `drop.created` 소비 순서는 보장되지 않는다. 키가 없을 때 진입을 막으면 오픈 직후 정상 사용자가 거절될 수 있고, 반대로 입장까지 시키면 토큰을 받았는데 응모가 실패한다. "줄은 세우되 입장은 보류"가 양쪽 위험을 모두 피한다.
 
-#### 에러 코드
+#### 에러 코드 (v1.2: 0단계 에러 계약)
 ```java
-public enum QueueErrorCode {
-    DROP_NOT_FOUND(404, "대기열 정보가 없는 드로우입니다"),   // meta 없음 (drop.created 미수신 포함)
-    NOT_OPEN(409, "아직 오픈 전입니다"),
-    CLOSED(409, "응모가 마감되었습니다"),
-    SOLD_OUT(409, "응모 정원이 모두 찼습니다");
-    // httpStatus, defaultMessage
+package com.queuedrop.queue.application.exception;
+
+public enum QueueErrorCode implements ErrorCode {
+    DROP_NOT_FOUND("QUEUE_DROP_NOT_FOUND", 404, "대기열 정보가 없는 드로우입니다."),   // meta 없음 (drop.created 미수신 포함)
+    NOT_OPEN("QUEUE_NOT_OPEN", 409, "아직 오픈 전입니다."),
+    CLOSED("QUEUE_CLOSED", 409, "응모가 마감되었습니다."),
+    SOLD_OUT("QUEUE_SOLD_OUT", 409, "응모 정원이 모두 찼습니다.");
+    // code, status, message
 }
-public class QueueException extends RuntimeException { /* QueueErrorCode 보유 */ }
 ```
+- 예외는 `throw new ApplicationException(QueueErrorCode.X)`. 별도 `QueueException`·`QueueExceptionHandler` 는 두지 않는다 — 0단계 `presentation/api/GlobalExceptionHandler` 가 `ErrorCode.status()` 로 매핑한다.
+- `X-User-Id` 누락 → `COMMON_MISSING_USER_HEADER`(400), 숫자가 아님 → `COMMON_INVALID_INPUT`(400).
 
 #### `PollIntervalPolicy` — 다음 폴링 간격 (구현 결정)
 ```java
@@ -316,11 +308,11 @@ public class QueueService {
 
     public QueueStatusResult enter(QueueEnterCommand cmd) {
         QueueMeta meta = queueRepository.findMeta(cmd.dropId())
-                .orElseThrow(() -> new QueueException(QueueErrorCode.DROP_NOT_FOUND));
+                .orElseThrow(() -> new ApplicationException(QueueErrorCode.DROP_NOT_FOUND));
         Instant now = clock.instant();
-        if (meta.isBeforeOpen(now)) throw new QueueException(QueueErrorCode.NOT_OPEN);
-        if (meta.isClosed(now)) throw new QueueException(QueueErrorCode.CLOSED);
-        if (isSoldOut(cmd.dropId())) throw new QueueException(QueueErrorCode.SOLD_OUT);
+        if (meta.isBeforeOpen(now)) throw new ApplicationException(QueueErrorCode.NOT_OPEN);
+        if (meta.isClosed(now)) throw new ApplicationException(QueueErrorCode.CLOSED);
+        if (isSoldOut(cmd.dropId())) throw new ApplicationException(QueueErrorCode.SOLD_OUT);
 
         EnqueueResult r = queueRepository.enqueue(cmd.dropId(), cmd.userId());
         return r.admitted() ? QueueStatusResult.admitted()
@@ -329,13 +321,12 @@ public class QueueService {
 
     public QueueStatusResult status(QueueStatusQuery q) {
         queueRepository.findMeta(q.dropId())
-                .orElseThrow(() -> new QueueException(QueueErrorCode.DROP_NOT_FOUND));
+                .orElseThrow(() -> new ApplicationException(QueueErrorCode.DROP_NOT_FOUND));
         if (isSoldOut(q.dropId())) return QueueStatusResult.soldOut();          // 1순위
-        if (queueRepository.hasToken(q.dropId(), q.userId())) return QueueStatusResult.admitted();
+        // v1.3: 대기 → 토큰 순. 토큰·대기는 서로 배타라 결과는 같고, 두 조회 사이에 입장이 끼어도 ADMITTED 를 NOT_IN_QUEUE 로 알리지 않는다
         OptionalLong rank = queueRepository.rank(q.dropId(), q.userId());
-        return rank.isPresent()
-                ? QueueStatusResult.waiting(rank.getAsLong(), pollPolicy.nextPollAfterMs(rank.getAsLong()))
-                : QueueStatusResult.notInQueue();
+        if (rank.isPresent()) return QueueStatusResult.waiting(rank.getAsLong(), pollPolicy.nextPollAfterMs(rank.getAsLong()));
+        return queueRepository.hasToken(q.dropId(), q.userId()) ? QueueStatusResult.admitted() : QueueStatusResult.notInQueue();
     }
 
     private boolean isSoldOut(Long dropId) {
@@ -363,11 +354,12 @@ public class AdmissionService {
 
     /** @return 이번 주기에 입장한 총 인원 (게이트 미통과 시 0) */
     public int admit() {
-        if (!schedulerGate.tryPass(GATE_NAME, Duration.ofMillis(props.intervalMs()))) return 0;
+        if (!schedulerGate.tryPass(GATE_NAME, Duration.ofMillis(props.gateWindowMs()))) return 0;   // v1.3
         Instant now = clock.instant();
         queueRepository.removeExpiredDrops(now);
         int total = 0;
         for (Long dropId : queueRepository.findActiveDropIds(now)) {
+            // v1.3: 드로우마다 try/catch — 한 드로우의 실패(Redis 일시 오류, entry 키 형식 오류)가 다른 드로우 입장을 막지 않게 한다 (log.error, 스택 없음)
             QueueMeta meta = queueRepository.findMeta(dropId).orElse(null);
             if (meta == null || !meta.isOpen(now)) continue;
             List<Long> admitted = queueRepository.admit(dropId, props.batchSize(),
@@ -385,7 +377,10 @@ public class AdmissionService {
 #### `AdmissionProperties`
 ```java
 /** application 계층 설정 값 객체. 바인딩(@ConfigurationProperties)은 infrastructure/config 에서 수행 */
-public record AdmissionProperties(long intervalMs, int batchSize, long tokenTtlSeconds) {}
+public record AdmissionProperties(long intervalMs, int batchSize, long tokenTtlSeconds) {
+    /** v1.3: 게이트 유지 시간 = 주기의 90% (최소 1ms). 3.3 게이트 설명 참고 */
+    public long gateWindowMs() { return Math.max(1, intervalMs * 9 / 10); }
+}
 ```
 > `@ConfigurationProperties` 는 Spring Boot 어노테이션이므로 application 에 두지 않는다. infrastructure 의 설정 클래스가 `queue.admission.*` 을 읽어 이 record 를 Bean 으로 등록. **(구현 결정)**
 
@@ -396,11 +391,20 @@ public record AdmissionProperties(long intervalMs, int batchSize, long tokenTtlS
 public class QueueMetaRegisterService {
     private final WaitingQueueRepository queueRepository;
 
+    /** 불변식을 어긴 메시지(필수 값 누락, openAt ≥ closeAt)는 재시도해도 같으므로 warn 로그 후 스킵한다 (v1.2) */
     public void register(QueueMetaRegisterCommand cmd) {
-        queueRepository.saveMeta(new QueueMeta(cmd.dropId(), cmd.openAt(), cmd.closeAt()));
+        QueueMeta meta;
+        try {
+            meta = new QueueMeta(cmd.dropId(), cmd.openAt(), cmd.closeAt());
+        } catch (DomainException e) {
+            log.warn("invalid drop.created skipped: dropId={} - {}", cmd.dropId(), e.getMessage());
+            return;
+        }
+        queueRepository.saveMeta(meta);
     }
 }
 ```
+- queue 는 저장 컨슈머가 아니므로 DLT 를 쓰지 않는다 (phase-0 DLT 정책: 저장 컨슈머 entry·coupon 만). Redis 장애로 `saveMeta` 가 실패하면 예외를 올리고, `KafkaConsumerConfig` 의 `DefaultErrorHandler(FixedBackOff(1000ms, 3회))` 가 재시도 후 로그·스킵한다 (v1.3, architecture.md 4장·D4 "Redis 만 쓰는 컨슈머는 1초 간격 3회 재시도 후 로그"). 스킵된 드로우는 product 재발행 API 로 복구한다. 역직렬화 실패는 0단계 `ErrorHandlingDeserializer` 가 로그·스킵한다.
 
 ---
 
@@ -410,12 +414,13 @@ public class QueueMetaRegisterService {
 ```java
 public final class QueueKeys {
     public static final String ACTIVE_DROPS = "queue:active-drops";
-    public static final String ADMISSION_GATE_PREFIX = "queue:";   // queue:{name}:gate
     public static String meta(Long dropId)    { return "queue:" + dropId + ":meta"; }
     public static String seq(Long dropId)     { return "queue:" + dropId + ":seq"; }
     public static String waiting(Long dropId) { return "queue:" + dropId + ":waiting"; }
     public static String tokenPrefix(Long dropId) { return "queue:" + dropId + ":token:"; }
     public static String token(Long dropId, Long userId) { return tokenPrefix(dropId) + userId; }
+    /** 스케줄러 게이트 queue:{name}:gate (v1.2) */
+    public static String gate(String name) { return "queue:" + name + ":gate"; }
     /** entry-service 소유 — 읽기 전용 */
     public static String entryRemaining(Long dropId) { return "entry:" + dropId + ":remaining"; }
 }
@@ -426,7 +431,9 @@ public final class QueueKeys {
 -- KEYS[1] = queue:{dropId}:waiting
 -- KEYS[2] = queue:{dropId}:seq
 -- KEYS[3] = queue:{dropId}:token:{userId}
+-- KEYS[4] = queue:{dropId}:meta
 -- ARGV[1] = userId
+-- ARGV[2] = 키 보존 기간 ms (closeAt 이후, 기본 86400000 = 1일)
 -- return: -1 = 이미 토큰 보유(ADMITTED), 0 이상 = 0-based rank (내 앞 인원 수)
 
 if redis.call('EXISTS', KEYS[3]) == 1 then
@@ -440,6 +447,14 @@ end
 
 local seq = redis.call('INCR', KEYS[2])
 redis.call('ZADD', KEYS[1], 'NX', seq, ARGV[1])
+
+-- v1.2 키 정리: waiting·seq 는 closeAt + 보존 기간에 만료 (ZPOPMIN 으로 비면 키가 사라지므로 신규 등록마다 다시 건다)
+local closeAt = redis.call('HGET', KEYS[4], 'closeAt')
+if closeAt then
+    local expireAt = tonumber(closeAt) + tonumber(ARGV[2])
+    redis.call('PEXPIREAT', KEYS[1], expireAt)
+    redis.call('PEXPIREAT', KEYS[2], expireAt)
+end
 return redis.call('ZRANK', KEYS[1], ARGV[1])
 ```
 > 설계(queue-enter.md 5.2)는 `INCR → ZADD NX` 2개 명령을 허용했지만, **토큰 보유 확인 → 대기 확인 → 신규 등록을 하나의 Lua 로 묶는다.** 효과: (1) 동시 중복 요청에서 seq 낭비 없음, (2) "hasToken 확인 직후 입장되어 다시 줄을 서는" 경합 제거, (3) 왕복 1회. **(구현 결정, 설계 수정 필요)**
@@ -495,13 +510,16 @@ public class RedisWaitingQueueRepository implements WaitingQueueRepository {
     private final RedisScript<Long> enqueueScript;
     private final RedisScript<List> admitScript;
 
+    /** 보존 기간: closeAt 이후 queue 키(meta·waiting·seq)를 남겨 두는 시간 (v1.2, 기본안 1일) */
+    static final Duration RETENTION_AFTER_CLOSE = Duration.ofDays(1);
+
     @Override
     public void saveMeta(QueueMeta meta) {
-        redis.opsForHash().putAll(QueueKeys.meta(meta.dropId()), Map.of(
-                "openAt", String.valueOf(meta.openAt().toEpochMilli()),
-                "closeAt", String.valueOf(meta.closeAt().toEpochMilli())));
-        redis.opsForZSet().add(QueueKeys.ACTIVE_DROPS, String.valueOf(meta.dropId()),
-                meta.closeAt().toEpochMilli());
+        // v1.3: HSET + PEXPIREAT(closeAt + 1일, 지났으면 즉시 삭제) + ZADD active-drops 를 save_meta.lua 하나로 (중간 실패로 어긋나지 않게)
+        redis.execute(saveMetaScript, List.of(QueueKeys.meta(meta.dropId()), QueueKeys.ACTIVE_DROPS),
+                String.valueOf(meta.dropId()), String.valueOf(meta.openAt().toEpochMilli()),
+                String.valueOf(meta.closeAt().toEpochMilli()),
+                String.valueOf(meta.closeAt().plus(RETENTION_AFTER_CLOSE).toEpochMilli()));
     }
 
     @Override
@@ -516,8 +534,9 @@ public class RedisWaitingQueueRepository implements WaitingQueueRepository {
     @Override
     public EnqueueResult enqueue(Long dropId, Long userId) {
         Long r = redis.execute(enqueueScript,
-                List.of(QueueKeys.waiting(dropId), QueueKeys.seq(dropId), QueueKeys.token(dropId, userId)),
-                String.valueOf(userId));
+                List.of(QueueKeys.waiting(dropId), QueueKeys.seq(dropId), QueueKeys.token(dropId, userId),
+                        QueueKeys.meta(dropId)),
+                String.valueOf(userId), String.valueOf(RETENTION_AFTER_CLOSE.toMillis()));
         return r == -1 ? EnqueueResult.alreadyAdmitted() : EnqueueResult.waiting(r);
     }
 
@@ -579,16 +598,17 @@ public class RedisSchedulerGate implements SchedulerGate {
     private final StringRedisTemplate redis;
     private final String instanceId = UUID.randomUUID().toString();
 
-    /** SET queue:{name}:gate {instanceId} NX PX {window}. 해제하지 않고 만료에 맡긴다. */
+    /** SET queue:{name}:gate {instanceId} NX PX {window}. 해제하지 않고 만료에 맡긴다. window = 주기의 90% (v1.3) */
     @Override
     public boolean tryPass(String name, Duration window) {
         return Boolean.TRUE.equals(redis.opsForValue()
-                .setIfAbsent("queue:" + name + ":gate", instanceId, window));
+                .setIfAbsent(QueueKeys.gate(name), instanceId, window));
     }
 }
 ```
 > **락을 해제(DEL)하지 않는 이유 (구현 결정)**: 일반 분산 락처럼 작업 후 해제하면, A 가 50ms 만에 끝내고 해제한 직후 B 의 주기가 와서 다시 실행 → 1초에 2N 명이 입장한다. 게이트를 **주기 길이(1초) 동안 유지**하면 인스턴스 수와 무관하게 "전체에서 1초당 1회"가 보장된다. 즉 락이 아니라 **전역 레이트 게이트**다.
 > 결과적으로 키 이름은 `queue:admission:gate` (3.0.1 표).
+> **window 를 주기보다 짧게 두는 이유 (v1.3, 단계 검증·E-31)**: Redis 는 `now > expireAt` 일 때만 키를 만료로 본다. window = 주기면 같은 인스턴스의 다음 틱이 지난번보다 1ms 라도 일찍 도착할 때 게이트가 남아 있어 그 주기를 건너뛴다 — 측정상 단일 인스턴스에서 주기의 약 40% 손실. window 를 주기의 90% 로 두면 단일 인스턴스는 매 주기 통과하고, 다중 인스턴스 상한은 "0.9 × 주기당 1회"(초당 최대 약 1.11N명)가 된다.
 
 #### 설정 클래스
 ```java
@@ -604,6 +624,7 @@ public class SchedulingConfig {
             @Value("${queue.admission.batch-size}") int batchSize,
             @Value("${queue.admission.token-ttl-seconds}") long ttl) {
         if (batchSize < 1 || batchSize > 1000) throw new IllegalStateException("batch-size 는 1~1000");
+        if (intervalMs < 1 || ttl < 1) throw new IllegalStateException("interval-ms·token-ttl-seconds 는 1 이상");
         return new AdmissionProperties(intervalMs, batchSize, ttl);
     }
 }
@@ -648,14 +669,15 @@ public class QueueController {
 ```
 | Method | Path | 성공 | 실패 |
 |--------|------|------|------|
-| POST | `/api/queue/drops/{dropId}` | 200 (WAITING / ADMITTED) | 404 DROP_NOT_FOUND, 409 NOT_OPEN / CLOSED / SOLD_OUT, 400 헤더 누락 |
-| GET | `/api/queue/drops/{dropId}` | 200 (WAITING / ADMITTED / SOLD_OUT / NOT_IN_QUEUE) | 404 DROP_NOT_FOUND |
+| POST | `/api/queue/drops/{dropId}` | 200 (WAITING / ADMITTED) | 404 `QUEUE_DROP_NOT_FOUND`, 409 `QUEUE_NOT_OPEN` / `QUEUE_CLOSED` / `QUEUE_SOLD_OUT`, 400 `COMMON_MISSING_USER_HEADER` |
+| GET | `/api/queue/drops/{dropId}` | 200 (WAITING / ADMITTED / SOLD_OUT / NOT_IN_QUEUE) | 404 `QUEUE_DROP_NOT_FOUND`, 400 `COMMON_MISSING_USER_HEADER` |
 
 > 진입 응답은 새로 줄을 서든 기존 순번을 돌려주든 **200** 으로 통일 (멱등 진입). **(구현 결정)**
 
 #### `AdmissionScheduler` — 시간이 보내는 요청을 받는 입력 어댑터
 ```java
 @Component
+@ConditionalOnProperty(name = "queue.admission.scheduler-enabled", havingValue = "true", matchIfMissing = true)
 @RequiredArgsConstructor
 public class AdmissionScheduler {
     private final AdmissionService admissionService;
@@ -666,7 +688,7 @@ public class AdmissionScheduler {
     }
 }
 ```
-> 테스트에서는 `@Scheduled` 를 끄고(`spring.task.scheduling` 비활성 또는 프로필) `AdmissionService.admit()` 을 직접 호출한다.
+> 테스트에서는 `queue.admission.scheduler-enabled=false` 로 스케줄러 빈을 만들지 않고 `AdmissionService.admit()` 을 직접 호출한다 (v1.2).
 
 #### `DropCreatedListener`
 ```java
@@ -675,7 +697,7 @@ public class AdmissionScheduler {
 public class DropCreatedListener {
     private final QueueMetaRegisterService registerService;
 
-    @KafkaListener(topics = Topics.DROP_CREATED, groupId = "queue-service")
+    @KafkaListener(topics = Topics.DROP_CREATED)   // group-id 는 0단계 공통 설정 ${spring.application.name}
     public void on(DropCreated message) {
         registerService.register(new QueueMetaRegisterCommand(
                 message.dropId(), message.openAt(), message.closeAt()));
@@ -684,8 +706,8 @@ public class DropCreatedListener {
 ```
 - 멱등: 같은 메시지 재수신 시 HSET/ZADD 가 같은 값으로 덮어쓴다. 대기열(`waiting`, `seq`)은 건드리지 않는다.
 
-#### `QueueExceptionHandler`
-`QueueException` → `QueueErrorCode.httpStatus` + 0단계 공통 `ErrorResponse`. `MissingRequestHeaderException` → 400.
+#### 예외 매핑 (v1.2)
+0단계 `GlobalExceptionHandler` 를 그대로 쓴다. `ApplicationException(QueueErrorCode.*)` → `ErrorCode.status()`, `X-User-Id` 누락 → 400 `COMMON_MISSING_USER_HEADER`, 숫자가 아닌 `X-User-Id` → 400 `COMMON_INVALID_INPUT`, 숫자가 아닌 dropId → 404 `COMMON_NOT_FOUND`(경로 정규식 불일치).
 
 ---
 
@@ -717,8 +739,8 @@ public class EntryRemainingFixture {
 | ID | 계층/종류 | 테스트 클래스 | 시나리오 (Given / When / Then) | 관련 REQ |
 |----|-----------|---------------|-------------------------------|----------|
 | T3-01 | domain 단위 | `QueueMetaTest` | Given openAt=10:00, closeAt=12:00 / When isOpen(09:59:59.999)=false, (10:00)=true, (11:59:59.999)=true, (12:00)=false | REQ-QUEUE-02 |
-| T3-02 | domain 단위 | `QueueMetaTest` | openAt ≥ closeAt 로 생성 → 예외 | REQ-QUEUE-01 |
-| T3-03 | application 단위 | `QueueServiceTest` | Given meta 없음 / When enter·status / Then DROP_NOT_FOUND | REQ-QUEUE-01 |
+| T3-02 | domain 단위 | `QueueMetaTest` | openAt ≥ closeAt 로 생성 → `DomainException`, 필수 값 null → `DomainException`, µs 시각 → ms 내림 (v1.2) | REQ-QUEUE-01 |
+| T3-03 | application 단위 | `QueueServiceTest` | Given meta 없음 / When enter·status / Then `ApplicationException(DROP_NOT_FOUND)` | REQ-QUEUE-01 |
 | T3-04 | application 단위 | `QueueServiceTest` | Given 오픈 전 / When enter / Then NOT_OPEN. 마감 후 → CLOSED | REQ-QUEUE-02 |
 | T3-05 | application 단위 | `QueueServiceTest` | Given 잔여 0 / When enter / Then SOLD_OUT 예외. status → SOLD_OUT (토큰 보유자도) | REQ-QUEUE-03 |
 | T3-06 | application 단위 | `QueueServiceTest` | Given 잔여 키 없음 / When enter / Then WAITING (진입 허용) | REQ-QUEUE-02 |
@@ -738,26 +760,26 @@ public class EntryRemainingFixture {
 | T3-20 | infra 통합 (Redis) | `RedisSchedulerGateTest` | Given window 1초 / When 같은 이름으로 2회 tryPass / Then true, false. 1.1초 후 다시 true | REQ-QUEUE-04 |
 | T3-21 | 통합 (Redis, 다중 인스턴스) | `AdmissionConcurrencyIntegrationTest` | **Given 대기 500명, n=100, AdmissionService 2개(서로 다른 Gate 인스턴스 ID) / When 동시에 admit / Then 이번 주기 입장 총 100명** | REQ-QUEUE-04 |
 | T3-22 | 통합 (Redis+Kafka) | `DropCreatedListenerIntegrationTest` | Given `drop.created` 발행 / Then meta Hash·active-drops 등록. 같은 메시지 재발행 → 값 동일, 기존 waiting 유지 | REQ-QUEUE-01 |
-| T3-23 | presentation 슬라이스 | `QueueControllerTest` | QueueException 각 코드 → 404/409 매핑, `X-User-Id` 누락 → 400, 응답 필드(state, aheadCount, nextPollAfterMs) | REQ-QUEUE-02, 03 |
+| T3-23 | presentation 슬라이스 | `QueueControllerTest` | `ApplicationException(QueueErrorCode.*)` 각 코드 → 404/409 + `code`·고정 `message`, `X-User-Id` 누락 → 400 `COMMON_MISSING_USER_HEADER`, 응답 필드(state, aheadCount, nextPollAfterMs) | REQ-QUEUE-02, 03 |
 | T3-24 | 아키텍처 | `ArchitectureTest` | R1~R7 통과 (presentation 이 `QueueState` 미참조, application 에 Spring Data Redis 미참조) | — |
+| T3-25 | infra 통합 (Redis) | `RedisWaitingQueueRepositoryTest` | (v1.2 키 정리) saveMeta 후 meta 의 만료 시각 = closeAt + 1일, enqueue 후 waiting·seq 도 같은 만료 시각. 대기열이 비었다가 다시 enqueue 해도 만료가 다시 걸림 | REQ-QUEUE-01 |
+| T3-26 | application 단위 | `QueueMetaRegisterServiceTest` | (v1.2) 정상 명령 → saveMeta 1회. openAt ≥ closeAt 또는 null 필드 → 예외 없이 저장 안 함 | REQ-QUEUE-01 |
 
 ---
 
 ## 5. 커밋 계획
 
-| # | 커밋 단위 | 커밋 메시지 |
-|---|-----------|-------------|
-| 1 | 설정 | `chore(queue): 입장 스케줄러 설정과 Kafka consumer 역직렬화 설정 추가` |
-| 2 | domain | `feat(queue): 대기열 도메인 모델과 저장소 포트 정의`<br>- QueueMeta(isOpen), QueueState, EnqueueResult<br>- WaitingQueueRepository |
-| 3 | domain 테스트 | `test(queue): QueueMeta 경계값 단위 테스트` (T3-01, 02) |
-| 4 | application | `feat(queue): 대기열 진입·상태 조회·입장 유스케이스 구현`<br>- 상태 판정 우선순위, 잔여 정원 키 없음 정책<br>- RemainingCapacityReader, SchedulerGate 포트, 폴링 간격 정책 |
-| 5 | application 테스트 | `test(queue): 대기열 유스케이스 단위 테스트 (Fake 포트)` (T3-03~11) |
-| 6 | infrastructure | `feat(queue): Redis 대기열 저장소와 진입·입장 Lua 구현`<br>- enqueue.lua (토큰·대기 확인 + 순번 발급 원자 처리)<br>- admit.lua (잔여 정원 확인 + ZPOPMIN + 토큰 발급)<br>- 활성 드로우 인덱스 |
-| 7 | infrastructure | `feat(queue): 입장 스케줄러 전역 게이트 구현` (SET NX PX, 미해제) |
-| 8 | infra 통합 테스트 | `test(queue): 대기열 Redis 통합 테스트` (T3-12~21) |
-| 9 | presentation | `feat(queue): 대기열 API, 입장 스케줄러, drop.created 리스너 구현` |
-| 10 | presentation 테스트 | `test(queue): 대기열 API 슬라이스·리스너 통합 테스트` (T3-22, 23) |
-| 11 | 문서 | `docs: 3단계 완료 반영 및 대기열 설계 문서 갱신` (6장 설계 수정 항목) |
+> v1.2: 1·2단계와 같이 TDD 사이클(장원영 Red → 카리나 Green) 단위로, 테스트와 구현을 한 커밋에 넣는다. 신민아 검증은 단계 끝에 한 번 (1~3단계 합의).
+
+| # | 커밋 단위 | 커밋 메시지 | 테스트 ID |
+|---|-----------|-------------|-----------|
+| 1 | domain | `feat(queue): 대기열 도메인 모델과 저장소 포트 추가`<br>- QueueMeta(isOpen, ms 내림), QueueState, EnqueueResult, DomainException<br>- WaitingQueueRepository | T3-01, 02 |
+| 2 | application | `feat(queue): 대기열 진입·상태 조회·입장 유스케이스 추가`<br>- 상태 판정 우선순위, 잔여 정원 키 없음 정책, QueueErrorCode<br>- RemainingCapacityReader·SchedulerGate 포트, 폴링 간격 정책, 잘못된 drop.created 스킵 | T3-03~11, 26 |
+| 3 | infrastructure Redis | `feat(queue): Redis 대기열 저장소와 진입·입장 Lua 추가`<br>- enqueue.lua (토큰·대기 확인 + 순번 발급 + 만료 원자 처리)<br>- admit.lua (잔여 정원 확인 + ZPOPMIN + 토큰 발급)<br>- 활성 드로우 인덱스, 설정(`queue.admission`) 바인딩 | T3-12~19, 25 |
+| 4 | infrastructure 게이트 | `feat(queue): 입장 스케줄러 전역 게이트 추가` (SET NX PX, 미해제) | T3-20, 21 |
+| 5 | presentation | `feat(queue): 대기열 API·입장 스케줄러·drop.created 리스너 추가` | T3-22, 23 |
+| 6 | 검증 반영 | `fix(queue): ...` (신민아·한지민 지적 중 명백한 버그가 있을 때만) | — |
+| 7 | 문서 | `docs: 3단계 완료 표시` (플랜 진행 현황, 결정 사항) | — |
 
 ---
 
@@ -768,7 +790,9 @@ public class EntryRemainingFixture {
 |------|------|
 | 진입 처리 | `enqueue.lua` 하나로 토큰 확인 + 대기 확인 + seq 발급 + ZADD (원자) |
 | 활성 드로우 조회 | `queue:active-drops` ZSet (score=closeAt). `KEYS`/`SCAN` 미사용 |
-| 스케줄러 중복 방지 | `queue:admission:gate` `SET NX PX {interval}` **미해제** 전역 레이트 게이트 |
+| 스케줄러 중복 방지 | `queue:admission:gate` `SET NX PX {0.9 × interval}` **미해제** 전역 레이트 게이트 (v1.3) |
+| 입장 루프 실패 (v1.3) | 드로우별 격리, 실패 드로우만 이번 주기 건너뜀 |
+| 리스너 실패 (v1.3) | 1초 간격 3회 재시도 후 로그·스킵 (DLT 없음), meta 저장은 `save_meta.lua` 원자 처리 |
 | 잔여 정원 키 없음 | 진입 허용, 입장 보류 |
 | 잔여 정원 확인 위치 | `admit.lua` 안 (원자) + 진입·상태 조회 시 `RemainingCapacityReader` |
 | 상태 우선순위 | SOLD_OUT > ADMITTED > WAITING > NOT_IN_QUEUE |
@@ -776,6 +800,9 @@ public class EntryRemainingFixture {
 | 배치 크기 | 드로우별 N 적용, 최대 1,000 |
 | 진입 응답 코드 | 신규·재진입 모두 200 |
 | 설정 바인딩 | `AdmissionProperties` record 는 application, 바인딩은 infrastructure |
+| 에러 계약 (v1.2) | `QueueErrorCode implements ErrorCode` + `ApplicationException`, 0단계 `GlobalExceptionHandler` |
+| 잘못된 `drop.created` (v1.2) | 도메인 불변식 위반은 warn 로그 후 스킵 (queue 는 저장 컨슈머가 아니므로 DLT 없음) |
+| 시각 정밀도 (v1.2) | queue meta 는 epoch ms. `DropCreated` 의 µs 는 ms 로 내림 (오픈·마감 판정이 product 보다 최대 1ms 이르다) |
 
 ### 설계 수정 필요
 - [architecture.md](../../design/02-architecture/architecture.md) 5장 Redis 키 표에 `queue:active-drops`(ZSet), `queue:admission:gate`(String PX) 추가. → 설계 반영 완료 (2026-11-16)
@@ -783,12 +810,12 @@ public class EntryRemainingFixture {
 - [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.3: `EnqueueResult`, `QueueMetaRegisterService`, `SchedulerGate` 포트, `PollIntervalPolicy` 추가. `WaitingQueueRepository` 메서드 시그니처(`saveMeta`, `findMeta`, `findActiveDropIds`, `removeExpiredDrops`) 반영. → 설계 반영 완료 (2026-11-16)
 
 ### 결정 필요
-- [ ] 상태 조회에서 마감 후(`closeAt` 경과) 별도 `CLOSED` 상태를 둘지 (현재: 없음, 드로우 상세로 판단)
-- [ ] 마감된 드로우의 queue 키(`waiting`, `seq`, `meta`) 정리 시점 — 기본안: `drop.created` 처리 시 `closeAt + 1일` 로 EXPIRE 설정 (이 단계에서 구현할지 결정)
+- [x] 상태 조회에서 마감 후(`closeAt` 경과) 별도 `CLOSED` 상태를 둘지 → **확정(기본안)**: 두지 않는다. 클라이언트는 드로우 상세(product)로 판단 (v1.2)
+- [x] 마감된 드로우의 queue 키(`waiting`, `seq`, `meta`) 정리 시점 → **확정(기본안)**: 이 단계에서 구현. `meta` 는 `saveMeta`, `waiting`·`seq` 는 `enqueue.lua` 에서 `PEXPIREAT closeAt + 1일` (v1.2, T3-25). 토큰 키는 자체 TTL, `active-drops` 는 `removeExpiredDrops` 가 정리
 
 ### 리스크
 - **Redis Cluster 비호환**: `admit.lua` 가 토큰 키를 스크립트 안에서 조합하고, entry 소유 키를 함께 다룬다. 단일 Redis 전제이며, Cluster 전환 시 해시 태그(`{drop:1}`)로 키 재설계 필요.
-- **게이트 시간 오차**: 게이트 TTL(1초)과 `fixedRate` 주기가 인스턴스별로 어긋나면 실제 입장 간격이 1~2초 사이로 흔들릴 수 있다. 처리량이 "초당 N명 이하"로만 보장된다는 점을 8단계 리포트에 기록.
+- **게이트 시간 오차**: (v1.3) window 를 주기의 90% 로 두어 단일 인스턴스의 주기 손실은 없앴다. 다중 인스턴스에서는 실행 위상에 따라 실제 입장 간격이 0.9~2초 사이로 흔들릴 수 있고, 상한은 초당 약 1.11N명이다. 8단계 리포트에 실측 입장 속도를 기록.
 - **입장 후 미응모**: 토큰 TTL(5분) 동안 응모하지 않는 사용자만큼 입장 슬롯이 낭비된다. 정원이 남아 있는 한 스케줄러가 계속 입장시키므로 정원은 결국 채워지지만, 오픈 직후 응모 속도는 느려질 수 있다.
 - **잔여 정원 키 공유**: entry 가 키 이름·형식을 바꾸면 queue 가 조용히 "키 없음"으로 판단해 입장이 멈춘다. 4단계에서 두 서비스가 같은 키를 쓰는지 통합 테스트로 고정한다.
 - **폴링 부하**: 대기자 × (1/폴링 간격) 만큼 GET 요청. `nextPollAfterMs` 를 클라이언트가 지키지 않으면 효과 없음 → 8단계 부하 테스트 시나리오가 이 값을 따르도록 작성.
@@ -811,6 +838,6 @@ public class EntryRemainingFixture {
 | 공통: API 가 설계 문서 API 표와 일치 | T3-23 |
 | 공통: 설계 수정 필요 항목 반영 | 6장 "설계 수정 필요" |
 
-- [ ] 위 테스트 전부 통과
-- [ ] 로컬: 2단계로 드로우 등록 → `redis-cli SET entry:{id}:remaining 100` → 대기열 진입 → 1초 내 ADMITTED 확인
-- [ ] [implementation-plan.md](../implementation-plan.md) 진행 현황 갱신
+- [x] 위 테스트 전부 통과 (queue-service 148건)
+- [x] 로컬: 2단계로 드로우 등록 → `redis-cli SET entry:{id}:remaining 100` → 대기열 진입 → 1초 내 ADMITTED 확인 (오픈 전 409, 키 없음 입장 보류, 품절 409·SOLD_OUT, 토큰 TTL 300초, 키 만료 시각도 확인)
+- [x] [implementation-plan.md](../implementation-plan.md) 진행 현황 갱신

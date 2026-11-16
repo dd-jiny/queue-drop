@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 서비스 내부 계층 구조 문서 링크 추가 | layered-architecture.md |
 | v1.2 | 2026-11-16 | Redis 키 `entry:{dropId}:seq` 추가 | NFR-03 |
 | v1.3 | 2026-11-16 | DLT 토픽·컨슈머 실패 정책, Redis 키(`queue:active-drops`, `queue:admission:gate`, `rank:drop:closeAt`) 추가, 인증 제외 경로 구체화·JWT 세부·관리자 시드 추가 | phase-1·3·4·7·8 구현 상세 6장, REQ-USER-04 |
+| v1.4 | 2026-11-16 | queue 키(`meta`·`seq`·`waiting`) 만료 시각 `closeAt + 1일` 명시 | phase-3 구현 상세 v1.2 |
 
 ---
 
@@ -89,9 +90,9 @@ flowchart LR
 
 | 키 | 타입 | 쓰기 소유자 | 읽기 | 설명 |
 |----|------|-------------|------|------|
-| `queue:{dropId}:meta` | Hash | queue | queue | openAt, closeAt |
-| `queue:{dropId}:seq` | String | queue | queue | 대기열 진입 순번 발급 카운터 |
-| `queue:{dropId}:waiting` | ZSet | queue | queue | member=userId, score=진입 순번 |
+| `queue:{dropId}:meta` | Hash | queue | queue | openAt, closeAt (`closeAt + 1일` 만료) |
+| `queue:{dropId}:seq` | String | queue | queue | 대기열 진입 순번 발급 카운터 (`closeAt + 1일` 만료) |
+| `queue:{dropId}:waiting` | ZSet | queue | queue | member=userId, score=진입 순번 (`closeAt + 1일` 만료) |
 | `queue:{dropId}:token:{userId}` | String(TTL) | queue | **entry** | 입장 토큰 (존재 = 유효) |
 | `queue:active-drops` | ZSet | queue | queue | member=dropId, score=closeAt — 입장 스케줄러 대상 조회용 인덱스 (`KEYS`/`SCAN` 금지) |
 | `queue:admission:gate` | String(PX) | queue | queue | 입장 스케줄러 주기당 1회 실행 게이트 (`SET NX PX`, 해제하지 않음) |

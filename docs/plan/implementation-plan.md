@@ -9,6 +9,7 @@
 | v1.3 | 2026-11-16 | 0단계 완료: 진행 현황·체크리스트 갱신. 에러 계약 결정(X-User-* 누락 400, `{SERVICE}_{REASON}`, 응답 메시지 고정) 4장 표에 추가 |
 | v1.4 | 2026-11-16 | 1단계 완료: 진행 현황·체크리스트 갱신 |
 | v1.5 | 2026-11-16 | 2단계 완료: 진행 현황·체크리스트 갱신. 드로우 등록 상한(오픈 365일·기간 30일) 기본안 확정 4장 표에 추가 |
+| v1.6 | 2026-11-16 | 3단계 완료: 진행 현황·체크리스트 갱신. 대기열 기본안 3건(마감 후 CLOSED 상태 없음, queue 키 `closeAt + 1일` 만료, 입장 게이트 유지 시간 = 주기의 90%) 4장 표에 추가 |
 
 ---
 
@@ -83,7 +84,7 @@ flowchart LR
 | 0. 공통 기반 | `chore/phase-0-foundation` | [phase-0-foundation.md](phases/phase-0-foundation.md) | ✅ 완료 (2026-11-16) |
 | 1. 인증 | `feat/phase-1-auth` | [phase-1-auth.md](phases/phase-1-auth.md) | ✅ 완료 (2026-11-16) |
 | 2. 드로우 | `feat/phase-2-drop` | [phase-2-drop.md](phases/phase-2-drop.md) | ✅ 완료 (2026-11-16) |
-| 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ⬜ 대기 |
+| 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ✅ 완료 (2026-11-16) |
 | 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ⬜ 대기 |
 | 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ⬜ 대기 |
 | 6. 쿠폰 | `feat/phase-6-coupon` | [phase-6-coupon.md](phases/phase-6-coupon.md) | ⬜ 대기 |
@@ -179,20 +180,20 @@ flowchart LR
 **참고**: [queue-enter.md](../design/05-features/queue-enter.md), [class-diagram.md](../design/07-class-diagram/class-diagram.md) 2.3
 
 **작업**
-- [ ] domain: `QueueMeta`(`isOpen(now)`), `QueueState`, `WaitingQueueRepository`(I)
-- [ ] application: `QueueService`(enter, status), `AdmissionService`(admit), 포트 `RemainingCapacityReader`
-- [ ] infrastructure: `RedisWaitingQueueRepository` (진입 `INCR` + `ZADD NX`, 입장 **Lua: `ZPOPMIN` + `SET token EX`**), `RedisRemainingCapacityReader`, 스케줄러 분산 락
-- [ ] presentation: `QueueController`, `AdmissionScheduler`, `DropCreatedListener`
+- [x] domain: `QueueMeta`(`isOpen(now)`), `QueueState`, `WaitingQueueRepository`(I)
+- [x] application: `QueueService`(enter, status), `AdmissionService`(admit), 포트 `RemainingCapacityReader`
+- [x] infrastructure: `RedisWaitingQueueRepository` (진입 `INCR` + `ZADD NX`, 입장 **Lua: `ZPOPMIN` + `SET token EX`**), `RedisRemainingCapacityReader`, 스케줄러 분산 락
+- [x] presentation: `QueueController`, `AdmissionScheduler`, `DropCreatedListener`
 
 > 이 단계에서는 entry-service 가 아직 없으므로, 잔여 정원 키(`entry:{dropId}:remaining`)는 테스트에서 직접 넣는다.
 
 **완료 조건**
-- [ ] 단위: `QueueMeta.isOpen` 경계값, 상태 판정 분기
-- [ ] 통합: 같은 사용자가 동시에 10번 진입 → 순번 1개
-- [ ] 통합: 대기 250명, 배치 100 → 3번 실행 후 전원 토큰 보유, 순서 유지
-- [ ] 통합: 토큰 TTL 만료 후 `NOT_IN_QUEUE`
-- [ ] 통합: 잔여 정원 0 → 입장 중단, 상태 `SOLD_OUT`
-- [ ] 통합: 스케줄러 2개 동시 실행 → 한 주기에 N명만 입장 (분산 락 동작)
+- [x] 단위: `QueueMeta.isOpen` 경계값, 상태 판정 분기
+- [x] 통합: 같은 사용자가 동시에 10번 진입 → 순번 1개
+- [x] 통합: 대기 250명, 배치 100 → 3번 실행 후 전원 토큰 보유, 순서 유지
+- [x] 통합: 토큰 TTL 만료 후 `NOT_IN_QUEUE`
+- [x] 통합: 잔여 정원 0 → 입장 중단, 상태 `SOLD_OUT`
+- [x] 통합: 스케줄러 2개 동시 실행 → 한 주기에 N명만 입장 (분산 락 동작)
 
 ---
 
@@ -336,6 +337,9 @@ flowchart LR
 | 관리자 계정 생성 | 1단계 | 기동 시 `ADMIN_EMAIL`/`ADMIN_PASSWORD` 로 없으면 생성 | ✅ 확정 (2026-11-16) |
 | 드로우 이벤트 발행 방식 | 2단계 | 발행 어댑터 안의 afterCommit 발행 + 재발행 API | ✅ 확정 (2026-11-16) |
 | 드로우 등록 상한 | 2단계 | 오픈은 등록 후 365일 이내, 응모 기간 30일 이내 (범위 밖 시각 500 방지) | ✅ 확정(기본안) (2026-11-16) |
+| 대기열 마감 후 상태 | 3단계 | 별도 CLOSED 상태 없음, 마감 여부는 드로우 상세로 판단 | ✅ 확정(기본안) (2026-11-16) |
+| 대기열 키 정리 | 3단계 | `meta`·`waiting`·`seq` 를 `closeAt + 1일` 에 만료 | ✅ 확정(기본안) (2026-11-16) |
+| 입장 게이트 유지 시간 | 3단계 | 주기의 90% (지터로 주기를 건너뛰는 문제 방지, 다중 인스턴스 상한 초당 약 1.11N명) | ✅ 확정(기본안) (2026-11-16) |
 | 컨슈머 저장 전 Redis 응모자 확인 | 4단계 | 확인 후 없으면 저장 스킵 | ✅ 확정 (2026-11-16) |
 | 쿠폰 저장 전 Redis 발급 확인 | 6단계 | 확인 후 없으면 저장 스킵 (초과 발급 방지) | ✅ 확정 (2026-11-16) |
 | 에러 계약 (헤더 누락 상태 코드, 코드 명명, 상세 메시지 노출) | 0단계 | `COMMON_MISSING_USER_HEADER`(400), `{SERVICE}_{REASON}`, 응답 메시지 고정·상세는 로그만 | ✅ 확정 (2026-11-16) |
