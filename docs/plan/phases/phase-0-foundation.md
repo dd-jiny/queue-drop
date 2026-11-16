@@ -6,7 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | Flyway 확정, 공통 producer 설정을 4단계 기준(request 1000 / delivery 3000)으로 통일, DLT 토픽 3종 추가, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 라이브러리 확인 결과 반영: ArchUnit 1.5.1, Testcontainers 2.0.5 (`testcontainers-{module}` 아티팩트명 확인) |
-| v1.3 | 2026-11-16 | 3.4 `LayerRules`: R1 에 `lombok..` 허용(설계 v1.2), `isDomainModel` 오탐 방지(`domain.modeling` 제외), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가(설계 v1.2). 규칙 자체 검증 테스트 `LayerRulesTest` 추가 (T0-02a) |
+| v1.3 | 2026-11-16 | 3.4 `LayerRules`: R1 에 `lombok..` 허용(설계 v1.2), `isDomainModel` 오탐 방지(`domain.modeling` 제외), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가(설계 v1.2). 규칙 자체 검증 테스트 `LayerRulesTest` 추가 (T0-02a). 3.5: Testcontainers 2.x 패키지(`org.testcontainers.postgresql`, `org.testcontainers.kafka`) 확인 |
 
 ---
 
@@ -498,7 +498,7 @@ package com.queuedrop.common.test.container;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
-import org.testcontainers.postgresql.PostgreSQLContainer;   // Testcontainers 2.x 패키지, 구현 시 확인
+import org.testcontainers.postgresql.PostgreSQLContainer;   // Testcontainers 2.x 패키지 (구 org.testcontainers.containers 는 deprecated)
 
 @TestConfiguration(proxyBeanMethods = false)
 public class PostgresContainerConfig {
@@ -506,7 +506,7 @@ public class PostgresContainerConfig {
     @Bean
     @ServiceConnection
     PostgreSQLContainer postgres() {
-        return new PostgreSQLContainer("postgres:17");
+        return new PostgreSQLContainer("postgres:17");   // docker-compose 와 같은 이미지
     }
 }
 ```
@@ -525,7 +525,7 @@ public class RedisContainerConfig {
     @Bean
     @ServiceConnection(name = "redis")
     GenericContainer<?> redis() {
-        return new GenericContainer<>("redis:7.4").withExposedPorts(6379);
+        return new GenericContainer<>("redis:7.4").withExposedPorts(6379);   // docker-compose 와 같은 이미지
     }
 }
 ```
