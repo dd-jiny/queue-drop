@@ -44,6 +44,13 @@ public class InMemoryUserRepository implements UserRepository {
         return store.containsKey(email);
     }
 
+    /** 컨텍스트에 싱글턴으로 올린 경우 테스트 간 상태를 비운다. */
+    public void clear() {
+        store.clear();
+        sequence.set(0);
+        throwDuplicateOnSave = false;
+    }
+
     public List<User> findAll() {
         return new ArrayList<>(store.values());
     }

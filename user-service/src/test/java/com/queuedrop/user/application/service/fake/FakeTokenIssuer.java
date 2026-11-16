@@ -19,6 +19,10 @@ public class FakeTokenIssuer implements TokenIssuer {
         return new IssuedToken("token-for-" + subject.userId(), EXPIRES_IN_SECONDS);
     }
 
+    public void clear() {
+        issuedSubjects.clear();
+    }
+
     public List<TokenSubject> issuedSubjects() {
         return List.copyOf(issuedSubjects);
     }

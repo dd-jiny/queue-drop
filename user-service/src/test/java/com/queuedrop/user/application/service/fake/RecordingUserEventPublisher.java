@@ -15,6 +15,10 @@ public class RecordingUserEventPublisher implements UserEventPublisher {
         registered.add(payload);
     }
 
+    public void clear() {
+        registered.clear();
+    }
+
     public List<UserRegisteredPayload> registered() {
         return List.copyOf(registered);
     }
