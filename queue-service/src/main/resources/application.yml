@@ -10,6 +10,20 @@ spring:
       port: ${REDIS_PORT:6379}
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3)
+      acks: all
+      retries: 2147483647          # 횟수가 아니라 delivery.timeout.ms 로 전체 시간을 제한
+      properties:
+        enable.idempotence: true
+        request.timeout.ms: 1000
+        delivery.timeout.ms: 3000
     consumer:
-      group-id: queue-service
+      group-id: ${spring.application.name}
       auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.trusted.packages: com.queuedrop.common.event

@@ -800,7 +800,7 @@ spring:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3), 구현 시 확인
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3)
       acks: all
       retries: 2147483647          # 횟수가 아니라 delivery.timeout.ms 로 전체 시간을 제한
       properties:
@@ -953,7 +953,7 @@ create coupon.issued.DLT 1
 | T0-02a | 아키텍처 (자동) | common `LayerRulesTest` | Given 규칙별 위반/준수 샘플 클래스 / When R1~R7 check / Then 위반 샘플은 실패, 준수 샘플은 `allowEmptyShould(false)` 로도 통과. R3 위반 샘플은 `jakarta.persistence`·`common.event` 만 (Spring Data·Kafka·Web·Hibernate·Kafka/Redis 클라이언트는 common 에 의존성이 없어 범위 밖). 서비스 패키지 오타는 잡지 못하므로 T0-02 는 계속 필요 | - |
 | T0-02 | 아키텍처 (수동) | entry-service `ArchitectureTest` | Given presentation 이 domain 모델을 반환하는 임시 클래스 / When 실행 / Then R4 실패. 같은 방식으로 R6, R1 실패 확인 후 임시 클래스 삭제 (3.7) | - |
 | T0-03 | 통합 | `{svc}.ApplicationContextTest` ×4 (user, product, entry, coupon) | Given `PostgresContainerConfig` / When 컨텍스트 기동 / Then Flyway 실행 + `ddl-auto: validate` 통과, 기동 성공 | - |
-| T0-04 | 통합 | `{svc}.ApplicationContextTest` (queue, ranking) | Given `RedisContainerConfig`, `KafkaContainerConfig` / When 기동 / Then 성공 | - |
+| T0-04 | 통합 | `{svc}.ApplicationContextTest` (queue, ranking) | Given `RedisContainerConfig`, `KafkaContainerConfig` / When 기동 / Then 성공 + Producer·ConsumerFactory 에 3.9 설정이 실제 적용(acks, 멱등, 타임아웃, 직렬화기, trusted.packages, group.id) + Redis PING + `DropCreated` 발행·수신 왕복(`__TypeId__` 헤더, Instant ISO-8601) | NFR-02 |
 | T0-05 | 슬라이스 | presentation `GlobalExceptionHandlerTest` (entry-service 1곳) | Given 예외를 던지는 테스트 컨트롤러 / When 호출 / Then `ApplicationException(NOT_FOUND)` → 404 + `code=COMMON_NOT_FOUND` · 검증 실패 → 400 + fieldErrors · `X-User-Id` 누락 → 400 `COMMON_MISSING_USER_HEADER` · 깨진 JSON·타입 불일치 → 400 `COMMON_INVALID_INPUT` · 없는 경로 → 404 · 지원하지 않는 메서드 → 405 · `@RequestParam @Min` 위반 → 400 + fieldErrors · Content-Type 미지원 → 415 · `ResponseStatusException(409)` 등 표준 4xx → 400 정규화 · 다른 필수 헤더 누락 → 400 `COMMON_INVALID_INPUT` · `ApplicationException` 하위 예외(503 코드) → 503 + 해당 code · 예상 못한 예외 → 500 `COMMON_INTERNAL_ERROR`(메시지 고정) | - |
 | T0-06 | 인프라 (수동) | - | Given `docker compose up -d` / When `docker compose ps` / Then postgres·redis·kafka healthy, kafka-init exit 0 | NFR-03 |
 | T0-07 | 인프라 (수동) | - | When `docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic entry.created` / Then PartitionCount 6, `retention.ms=2592000000` | REQ-RANK-03 |
