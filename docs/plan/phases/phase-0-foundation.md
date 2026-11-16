@@ -790,6 +790,8 @@ spring:
     baseline-on-migrate: false
 ```
 product / entry / coupon 은 포트·이름·DB 명만 다르다 (기존 값 유지).
+- 마이그레이션 SQL 은 **DB 이름·role 에 독립적으로** 작성한다 (`user_db`, `GRANT ... TO queuedrop` 등 금지). 통합 테스트의 `PostgreSQLContainer` 는 DB·사용자 이름이 `test` 이고, Flyway·Hibernate 는 schema(`public`) 단위로 동작하므로 이 규칙만 지키면 결과가 같다.
+- T0-03 은 Postgres 만 Import 한다. 기동 시 Redis(Lettuce 지연 연결)·Kafka(Listener·NewTopic 없음)에 접속하지 않기 때문. Listener 가 생기는 단계부터 해당 서비스 테스트에 `KafkaContainerConfig` 를 추가한다.
 
 #### Kafka 서비스 (product, queue, entry, coupon, ranking) — `spring.kafka` 공통 블록
 ```yaml
