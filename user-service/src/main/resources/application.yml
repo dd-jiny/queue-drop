@@ -16,3 +16,25 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: false
+  kafka:                          # 0단계 3.9 공통 producer 블록 (user-service 는 발행만 한다)
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      acks: all
+      retries: 2147483647
+      properties:
+        enable.idempotence: true
+        request.timeout.ms: 1000
+        delivery.timeout.ms: 3000
+        max.block.ms: 1000
+
+queuedrop:
+  jwt:
+    secret: ${JWT_SECRET:queue-drop-local-development-secret-key-0123456789}   # gateway 와 동일해야 함
+    issuer: queue-drop
+    access-token-ttl: 1h
+  admin:
+    email: ${ADMIN_EMAIL:}            # 비어 있으면 관리자 생성 건너뜀
+    password: ${ADMIN_PASSWORD:}
+    nickname: ${ADMIN_NICKNAME:admin}
