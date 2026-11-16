@@ -71,4 +71,41 @@ class ProductTest {
         assertThat(product.getImageUrl()).isEqualTo("https://img.example.com/a.png");
         assertThat(product.getCreatedAt()).isEqualTo(createdAt);
     }
+
+    @Test
+    @DisplayName("[T2-10] 상품명 100자, 이미지 URL 500자는 생성된다 (경계)")
+    void acceptsMaxLengths() {
+        // Given
+        String name = "가".repeat(100);
+        String imageUrl = "https://img.example.com/" + "a".repeat(500 - "https://img.example.com/".length());
+
+        // When
+        Product product = Product.create(name, null, imageUrl, NOW);
+
+        // Then
+        assertThat(product.getName()).isEqualTo(name);
+        assertThat(product.getImageUrl()).hasSize(500);
+    }
+
+    @Test
+    @DisplayName("[T2-10] 상품명이 101자면 DomainException")
+    void rejectsTooLongName() {
+        // Given
+        String name = "가".repeat(101);
+
+        // When / Then
+        assertThatThrownBy(() -> Product.create(name, null, null, NOW))
+                .isInstanceOf(DomainException.class);
+    }
+
+    @Test
+    @DisplayName("[T2-10] 이미지 URL 이 501자면 DomainException")
+    void rejectsTooLongImageUrl() {
+        // Given
+        String imageUrl = "https://img.example.com/" + "a".repeat(501 - "https://img.example.com/".length());
+
+        // When / Then
+        assertThatThrownBy(() -> Product.create("상품", null, imageUrl, NOW))
+                .isInstanceOf(DomainException.class);
+    }
 }

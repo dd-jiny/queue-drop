@@ -5,6 +5,7 @@ import lombok.Getter;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 
 /**
  * 드로우. 생성 규칙(M ≥ K ≥ 1, openAt < closeAt, 오픈 1분 여유)과 시각 기반 상태 계산을 책임진다.
@@ -15,6 +16,11 @@ public class Drop {
 
     /** 등록 시각 대비 오픈까지 최소 여유 (drop.created 전파 시간 확보) — drop-register.md 5.1 */
     public static final Duration MIN_OPEN_LEAD_TIME = Duration.ofMinutes(1);
+    /** 등록 시각 대비 오픈까지 최대 여유 (기본안) — 범위 밖 시각이 DB·수신 측 TTL 에서 문제를 일으키지 않게 한다 */
+    public static final Duration MAX_OPEN_LEAD_TIME = Duration.ofDays(365);
+    /** 응모 기간(closeAt − openAt) 최대 (기본안) */
+    public static final Duration MAX_ENTRY_PERIOD = Duration.ofDays(30);
+    public static final int TITLE_MAX_LENGTH = 100;
 
     private final Long id;              // 저장 전 null
     private final Long productId;
@@ -47,6 +53,9 @@ public class Drop {
         if (title == null || title.isBlank()) {
             throw new DomainException("드로우 제목은 필수입니다");
         }
+        if (title.length() > TITLE_MAX_LENGTH) {
+            throw new DomainException("드로우 제목은 " + TITLE_MAX_LENGTH + "자 이하여야 합니다");
+        }
         if (winnerCount < 1) {
             throw new DomainException("당첨 수량은 1 이상이어야 합니다");
         }
@@ -56,11 +65,21 @@ public class Drop {
         if (openAt == null || closeAt == null) {
             throw new DomainException("오픈·마감 시각은 필수입니다");
         }
+        // 저장(PostgreSQL 마이크로초) 전후로 값이 달라지지 않도록 먼저 내림하고, 내림한 값으로 검증한다
+        now = now.truncatedTo(ChronoUnit.MICROS);
+        openAt = openAt.truncatedTo(ChronoUnit.MICROS);
+        closeAt = closeAt.truncatedTo(ChronoUnit.MICROS);
         if (!openAt.isBefore(closeAt)) {
             throw new DomainException("오픈 시각은 마감 시각보다 앞서야 합니다");
         }
         if (openAt.isBefore(now.plus(MIN_OPEN_LEAD_TIME))) {
             throw new DomainException("오픈 시각은 현재로부터 최소 1분 이후여야 합니다");
+        }
+        if (openAt.isAfter(now.plus(MAX_OPEN_LEAD_TIME))) {
+            throw new DomainException("오픈 시각은 현재로부터 365일 이내여야 합니다");
+        }
+        if (Duration.between(openAt, closeAt).compareTo(MAX_ENTRY_PERIOD) > 0) {
+            throw new DomainException("응모 기간은 30일 이내여야 합니다");
         }
         return new Drop(null, productId, title, entryCapacity, winnerCount, openAt, closeAt, false, now);
     }

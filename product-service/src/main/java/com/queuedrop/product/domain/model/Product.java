@@ -9,6 +9,9 @@ import java.time.Instant;
 @Getter
 public class Product {
 
+    public static final int NAME_MAX_LENGTH = 100;
+    public static final int IMAGE_URL_MAX_LENGTH = 500;
+
     private final Long id;              // 저장 전 null
     private final String name;
     private final String description;
@@ -26,6 +29,12 @@ public class Product {
     public static Product create(String name, String description, String imageUrl, Instant now) {
         if (name == null || name.isBlank()) {
             throw new DomainException("상품명은 필수입니다");
+        }
+        if (name.length() > NAME_MAX_LENGTH) {
+            throw new DomainException("상품명은 " + NAME_MAX_LENGTH + "자 이하여야 합니다");
+        }
+        if (imageUrl != null && imageUrl.length() > IMAGE_URL_MAX_LENGTH) {
+            throw new DomainException("이미지 URL 은 " + IMAGE_URL_MAX_LENGTH + "자 이하여야 합니다");
         }
         return new Product(null, name, description, imageUrl, now);
     }

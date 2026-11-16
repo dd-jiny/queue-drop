@@ -237,4 +237,84 @@ class DropServiceTest {
         assertThat(eventPublisher.created()).hasSize(1);
         assertThat(eventPublisher.created().getFirst().dropId()).isEqualTo(open.getId());
     }
+
+    @Test
+    @DisplayName("[T2-15] republish 를 두 번 호출하면 같은 payload 가 두 번 발행된다 (멱등은 수신 측 책임, 저장 상태는 그대로)")
+    void republishTwice() {
+        // Given
+        Drop saved = givenSavedDrop();
+
+        // When
+        dropService.republish(ADMIN, saved.getId());
+        dropService.republish(ADMIN, saved.getId());
+
+        // Then
+        DropCreatedPayload expected = new DropCreatedPayload(saved.getId(), productId, TITLE, 100, 10, OPEN_AT, CLOSE_AT);
+        assertThat(eventPublisher.created()).containsExactly(expected, expected);
+        assertThat(dropRepository.findAll()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("[T2-11] 오픈 여유가 정확히 1분이어도 등록되고, 결과 status 는 주입된 Clock(now) 기준 SCHEDULED 다")
+    void registerResultStatusUsesNow() {
+        // Given: NOW=09:00, openAt=09:01:00
+        Instant openAt = Instant.parse("2026-11-16T09:01:00Z");
+        DropRegisterCommand command = new DropRegisterCommand(ADMIN, productId, TITLE, 10, 10, openAt, CLOSE_AT);
+
+        // When
+        DropResult result = dropService.register(command);
+
+        // Then
+        assertThat(result.status()).isEqualTo("SCHEDULED");
+        assertThat(result.createdAt()).isEqualTo(NOW);
+        assertThat(eventPublisher.created()).hasSize(1);
+    }
+
+    static Stream<Arguments> limitViolations() {
+        return Stream.of(
+                Arguments.of("openAt 이 now+365일 초과", TITLE,
+                        NOW.plus(java.time.Duration.ofDays(366)), NOW.plus(java.time.Duration.ofDays(366)).plusSeconds(3600)),
+                Arguments.of("응모 기간 30일 초과", TITLE, OPEN_AT, OPEN_AT.plus(java.time.Duration.ofDays(31))),
+                Arguments.of("제목 101자", "가".repeat(101), OPEN_AT, CLOSE_AT));
+    }
+
+    @ParameterizedTest(name = "[T2-14] {0}")
+    @MethodSource("limitViolations")
+    @DisplayName("[T2-14] 기간·길이 규칙 위반은 PRODUCT_INVALID_DROP, cause 는 DomainException, 저장·발행 없음")
+    void limitViolationsAreInvalidDrop(String label, String title, Instant openAt, Instant closeAt) {
+        // Given
+        DropRegisterCommand command = new DropRegisterCommand(ADMIN, productId, title, 100, 10, openAt, closeAt);
+
+        // When / Then
+        assertThatExceptionOfType(ApplicationException.class)
+                .isThrownBy(() -> dropService.register(command))
+                .satisfies(e -> {
+                    assertThat(e.errorCode()).isEqualTo(ProductErrorCode.INVALID_DROP);
+                    assertThat(e.getCause()).isInstanceOf(DomainException.class);
+                });
+        assertThat(dropRepository.findAll()).isEmpty();
+        assertThat(eventPublisher.created()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T2-11] 나노초가 섞인 시각으로 등록하면 저장 값·결과·발행 payload 모두 마이크로초로 내림된 같은 값이다")
+    void nanosTruncatedConsistently() {
+        // Given
+        Instant openAt = Instant.parse("2026-11-16T10:00:00.123456789Z");
+        Instant closeAt = Instant.parse("2026-11-16T12:00:00.987654321Z");
+        Instant openMicros = Instant.parse("2026-11-16T10:00:00.123456Z");
+        Instant closeMicros = Instant.parse("2026-11-16T12:00:00.987654Z");
+
+        // When
+        DropResult result = dropService.register(new DropRegisterCommand(ADMIN, productId, TITLE, 100, 10, openAt, closeAt));
+
+        // Then
+        Drop saved = dropRepository.findAll().getFirst();
+        assertThat(saved.getOpenAt()).isEqualTo(openMicros);
+        assertThat(saved.getCloseAt()).isEqualTo(closeMicros);
+        assertThat(result.openAt()).isEqualTo(openMicros);
+        assertThat(result.closeAt()).isEqualTo(closeMicros);
+        assertThat(eventPublisher.created().getFirst().openAt()).isEqualTo(openMicros);
+        assertThat(eventPublisher.created().getFirst().closeAt()).isEqualTo(closeMicros);
+    }
 }

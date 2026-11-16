@@ -123,4 +123,33 @@ class ProductServiceTest {
                 .isThrownBy(() -> productService.create(command))
                 .satisfies(e -> assertThat(e.errorCode()).isEqualTo(CommonErrorCode.FORBIDDEN));
     }
+
+    @Test
+    @DisplayName("[T2-17] 상품명 101자면 PRODUCT_INVALID_PRODUCT, cause 는 DomainException, 저장 없음")
+    void tooLongNameIsInvalidProduct() {
+        // Given
+        ProductCreateCommand command = new ProductCreateCommand(ADMIN, "가".repeat(101), null, null);
+
+        // When / Then
+        assertThatExceptionOfType(ApplicationException.class)
+                .isThrownBy(() -> productService.create(command))
+                .satisfies(e -> {
+                    assertThat(e.errorCode()).isEqualTo(ProductErrorCode.INVALID_PRODUCT);
+                    assertThat(e.getCause()).isInstanceOf(DomainException.class);
+                });
+        assertThat(productRepository.findAll()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T2-17] 이미지 URL 501자면 PRODUCT_INVALID_PRODUCT, 저장 없음")
+    void tooLongImageUrlIsInvalidProduct() {
+        // Given
+        ProductCreateCommand command = new ProductCreateCommand(ADMIN, "상품", null, "h".repeat(501));
+
+        // When / Then
+        assertThatExceptionOfType(ApplicationException.class)
+                .isThrownBy(() -> productService.create(command))
+                .satisfies(e -> assertThat(e.errorCode()).isEqualTo(ProductErrorCode.INVALID_PRODUCT));
+        assertThat(productRepository.findAll()).isEmpty();
+    }
 }

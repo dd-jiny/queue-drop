@@ -45,8 +45,9 @@ public class FakeDropRepository implements DropRepository {
                 .filter(d -> status == null || d.status(now) == status)
                 .sorted(Comparator.comparing(Drop::getOpenAt).thenComparing(Drop::getId))
                 .toList();
-        int from = Math.min(page * size, filtered.size());
-        int to = Math.min(from + size, filtered.size());
+        long offset = (long) page * size;   // int 곱셈 오버플로 방지
+        int from = (int) Math.min(offset, filtered.size());
+        int to = (int) Math.min((long) from + size, filtered.size());
         return new DropPage(filtered.subList(from, to), filtered.size(), page, size);
     }
 

@@ -325,4 +325,81 @@ class DropRepositoryImplTest {
                         + "values (999999, '드로우', 10, 5, '2026-11-16T10:00:00Z', '2026-11-16T12:00:00Z', now())"))
                 .isInstanceOf(DataIntegrityViolationException.class);
     }
+
+    // ---------------------------------------------------------------- 단계 끝 보강
+
+    @ParameterizedTest(name = "[T2-19] now=NOW+{0}ns")
+    @org.junit.jupiter.params.provider.ValueSource(longs = {1, 499, 500, 501, 999})
+    @DisplayName("[T2-19] now 에 마이크로초 미만(나노초) 값이 있어도 search 분류가 Drop.status(now) 와 같다")
+    void subMicroNowMatchesDomain(long nanos) {
+        // Given: openAt=NOW+1µs(마이크로초 정밀도로 저장), closeAt=NOW+1µs 인 두 드로우
+        Long productId = givenProductId();
+        Drop opening = dropRepository.save(newDrop(productId, "오픈경계", NOW.plus(MICRO), NOW.plusSeconds(3600), false));
+        Drop closing = dropRepository.save(newDrop(productId, "마감경계", NOW.minusSeconds(3600), NOW.plus(MICRO), false));
+        entityManager.flush();
+        entityManager.clear();
+        Instant now = NOW.plusNanos(nanos);   // 시스템 Clock 은 나노초 단위 값을 줄 수 있다
+
+        // When / Then: 도메인 기준 두 드로우 모두 아직 경계 전 (opening=SCHEDULED, closing=OPEN)
+        assertThat(opening.status(now)).isEqualTo(DropStatus.SCHEDULED);
+        assertThat(closing.status(now)).isEqualTo(DropStatus.OPEN);
+        assertThat(dropRepository.search(DropStatus.SCHEDULED, now, 0, 20).content())
+                .extracting(Drop::getId).containsExactly(opening.getId());
+        assertThat(dropRepository.search(DropStatus.OPEN, now, 0, 20).content())
+                .extracting(Drop::getId).containsExactly(closing.getId());
+        assertThat(dropRepository.search(DropStatus.CLOSED, now, 0, 20).content()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T2-19] size=100(API 상한)이면 100건씩 나뉘고 다음 페이지에 나머지가 온다")
+    void maxPageSize() {
+        // Given: 101건
+        Long productId = givenProductId();
+        for (int i = 0; i < 101; i++) {
+            dropRepository.save(newDrop(productId, "d" + i, NOW.plusSeconds(60L + i), NOW.plusSeconds(7200), false));
+        }
+        entityManager.flush();
+        entityManager.clear();
+
+        // When
+        DropPage first = dropRepository.search(null, NOW, 0, 100);
+        DropPage second = dropRepository.search(null, NOW, 1, 100);
+
+        // Then
+        assertThat(first.content()).hasSize(100);
+        assertThat(second.content()).hasSize(1);
+        assertThat(first.totalElements()).isEqualTo(101);
+        assertThat(second.content().getFirst().getTitle()).isEqualTo("d100");
+    }
+
+    @Test
+    @DisplayName("[T2-19] page 가 매우 커서 offset 이 int 범위를 넘어도 예외 없이 빈 페이지와 실제 건수를 돌려준다 (API 상한과 별개인 저장소 방어)")
+    void hugePageReturnsEmpty() {
+        // Given
+        Long productId = givenProductId();
+        dropRepository.save(newDrop(productId, "d", NOW.plusSeconds(60), NOW.plusSeconds(7200), false));
+        entityManager.flush();
+        entityManager.clear();
+
+        // When
+        DropPage page = dropRepository.search(null, NOW, Integer.MAX_VALUE, 100);
+
+        // Then
+        assertThat(page.content()).isEmpty();
+        assertThat(page.totalElements()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("[T2-18] 한글 100자 제목(VARCHAR(100) 경계)이 왕복된다")
+    void hundredCharTitleRoundTrip() {
+        // Given
+        Long productId = givenProductId();
+        String title = "가".repeat(100);
+        Drop saved = dropRepository.save(newDrop(productId, title, NOW.plusSeconds(60), NOW.plusSeconds(7200), false));
+        entityManager.flush();
+        entityManager.clear();
+
+        // When / Then
+        assertThat(dropRepository.findById(saved.getId()).orElseThrow().getTitle()).isEqualTo(title);
+    }
 }

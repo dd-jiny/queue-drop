@@ -430,4 +430,97 @@ class DropControllerTest {
                     .andExpect(jsonPath("$.code").value("PRODUCT_DROP_NOT_FOUND"));
         }
     }
+
+    @Nested
+    @DisplayName("경로·형식 경계 (단계 끝 보강)")
+    class Boundaries {
+
+        @Test
+        @DisplayName("[T2-26] 숫자가 아닌 productId 로 POST /api/products/abc/drops 하면 404 COMMON_NOT_FOUND, 서비스는 호출되지 않는다")
+        void nonNumericProductId() throws Exception {
+            // When
+            ResultActions result = register("abc", "7", "ADMIN", VALID_BODY);
+
+            // Then
+            result.andExpect(status().isNotFound())
+                    .andExpect(jsonPath("$.code").value("COMMON_NOT_FOUND"));
+            verifyNoInteractions(dropService);
+        }
+
+        @Test
+        @DisplayName("[T2-26] 숫자가 아닌 dropId 로 republish 하면 404 COMMON_NOT_FOUND")
+        void nonNumericRepublishDropId() throws Exception {
+            // When
+            ResultActions result = mockMvc.perform(post("/api/products/drops/abc/republish")
+                    .header("X-User-Id", "7").header("X-User-Role", "ADMIN"));
+
+            // Then
+            result.andExpect(status().isNotFound())
+                    .andExpect(jsonPath("$.code").value("COMMON_NOT_FOUND"));
+            verifyNoInteractions(dropService);
+        }
+
+        @Test
+        @DisplayName("[T2-25] 제목 100자(상한 경계)는 검증을 통과해 서비스로 전달된다")
+        void titleAtMaxLength() throws Exception {
+            // Given
+            given(dropService.register(any())).willReturn(dropResult(11L, "SCHEDULED"));
+            String body = """
+                    {"title":"%s","entryCapacity":1,"winnerCount":1,"openAt":"2026-12-01T10:00:00+09:00","closeAt":"2026-12-01T12:00:00+09:00"}"""
+                    .formatted("가".repeat(100));
+
+            // When / Then
+            register("3", "7", "ADMIN", body).andExpect(status().isCreated());
+            verify(dropService).register(any());
+        }
+
+        @Test
+        @DisplayName("[T2-25] 본문이 없으면 400 COMMON_INVALID_INPUT, 서비스는 호출되지 않는다")
+        void emptyBody() throws Exception {
+            // When / Then
+            register("3", "7", "ADMIN", "").andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value("COMMON_INVALID_INPUT"));
+            verifyNoInteractions(dropService);
+        }
+
+        @Test
+        @DisplayName("[T2-25] 수량이 문자열이면 400 COMMON_INVALID_INPUT")
+        void nonNumericCapacity() throws Exception {
+            // When / Then
+            register("3", "7", "ADMIN", """
+                    {"title":"t","entryCapacity":"many","winnerCount":1,"openAt":"2026-12-01T10:00:00+09:00","closeAt":"2026-12-01T12:00:00+09:00"}""")
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value("COMMON_INVALID_INPUT"));
+            verifyNoInteractions(dropService);
+        }
+
+        @Test
+        @DisplayName("[T2-26] page=10000(상한 경계)은 허용되어 서비스로 그대로 전달된다")
+        void pageAtMax() throws Exception {
+            // Given
+            given(dropQueryService.search(any())).willReturn(new DropPageResult(List.of(), 0L, 10000, 100));
+
+            // When
+            ResultActions result = mockMvc.perform(get("/api/products/drops").param("page", "10000").param("size", "100"));
+
+            // Then
+            result.andExpect(status().isOk());
+            ArgumentCaptor<DropSearchQuery> captor = ArgumentCaptor.forClass(DropSearchQuery.class);
+            verify(dropQueryService).search(captor.capture());
+            assertThat(captor.getValue()).isEqualTo(new DropSearchQuery(null, 10000, 100));
+        }
+
+        @ParameterizedTest(name = "[T2-26] page={0}")
+        @ValueSource(strings = {"10001", "2147483647"})
+        @DisplayName("[T2-26] page 가 10000 을 넘으면 400 COMMON_INVALID_INPUT, 서비스는 호출되지 않는다 (큰 offset 500 방지)")
+        void pageOverMaxRejected(String page) throws Exception {
+            // When
+            ResultActions result = mockMvc.perform(get("/api/products/drops").param("page", page).param("size", "100"));
+
+            // Then
+            result.andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value("COMMON_INVALID_INPUT"));
+            verifyNoInteractions(dropQueryService);
+        }
+    }
 }

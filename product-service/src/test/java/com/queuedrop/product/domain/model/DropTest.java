@@ -313,4 +313,128 @@ class DropTest {
         assertThat(drop.isDrawn()).isTrue();
         assertThat(drop.getCreatedAt()).isEqualTo(CREATED_AT);
     }
+
+    @Nested
+    @DisplayName("create — 정밀도·기간·길이 규칙 (수정 커밋 #6)")
+    class CreateLimits {
+
+        @Test
+        @DisplayName("[T2-08] openAt/closeAt 의 나노초는 마이크로초로 내림되어 저장된다 (DB timestamptz 정밀도와 일치)")
+        void truncatesToMicros() {
+            // Given
+            Instant openAt = Instant.parse("2026-11-16T10:00:00.123456789Z");
+            Instant closeAt = Instant.parse("2026-11-16T12:00:00.000000999Z");
+
+            // When
+            Drop drop = Drop.create(PRODUCT_ID, TITLE, 100, 10, openAt, closeAt, NOW);
+
+            // Then
+            assertThat(drop.getOpenAt()).isEqualTo(Instant.parse("2026-11-16T10:00:00.123456Z"));
+            assertThat(drop.getCloseAt()).isEqualTo(Instant.parse("2026-11-16T12:00:00Z"));
+        }
+
+        @Test
+        @DisplayName("[T2-08] 내림 후 openAt == closeAt 이 되면 DomainException (X.0000006 / X.0000009 → 둘 다 X.000000)")
+        void equalAfterTruncationRejected() {
+            // Given
+            Instant openAt = Instant.parse("2026-11-16T10:00:00.000000600Z");
+            Instant closeAt = Instant.parse("2026-11-16T10:00:00.000000900Z");
+
+            // When / Then
+            assertThatThrownBy(() -> Drop.create(PRODUCT_ID, TITLE, 100, 10, openAt, closeAt, NOW))
+                    .isInstanceOf(DomainException.class);
+        }
+
+        @Test
+        @DisplayName("[T2-09] 최대 오픈 선행 기간은 365일, 최대 응모 기간은 30일이다")
+        void limitConstants() {
+            // Then
+            assertThat(Drop.MAX_OPEN_LEAD_TIME).isEqualTo(Duration.ofDays(365));
+            assertThat(Drop.MAX_ENTRY_PERIOD).isEqualTo(Duration.ofDays(30));
+        }
+
+        @Test
+        @DisplayName("[T2-09] openAt 이 정확히 now+365일이면 생성된다 (경계)")
+        void openAtMaxLeadAccepted() {
+            // Given
+            Instant openAt = NOW.plus(Duration.ofDays(365));
+
+            // When
+            Drop drop = Drop.create(PRODUCT_ID, TITLE, 100, 10, openAt, openAt.plusSeconds(3600), NOW);
+
+            // Then
+            assertThat(drop.getOpenAt()).isEqualTo(openAt);
+        }
+
+        @Test
+        @DisplayName("[T2-09] openAt 이 now+365일을 1µs 라도 넘으면 DomainException")
+        void openAtBeyondMaxLeadRejected() {
+            // Given
+            Instant openAt = NOW.plus(Duration.ofDays(365)).plusNanos(1_000);
+
+            // When / Then
+            assertThatThrownBy(() -> Drop.create(PRODUCT_ID, TITLE, 100, 10, openAt, openAt.plusSeconds(3600), NOW))
+                    .isInstanceOf(DomainException.class);
+        }
+
+        @Test
+        @DisplayName("[T2-09] 극단적인 미래 시각(+300000-01-01)은 DomainException")
+        void extremeFutureRejected() {
+            // Given
+            Instant openAt = Instant.parse("+300000-01-01T00:00:00Z");
+            Instant closeAt = Instant.parse("+300000-01-01T01:00:00Z");
+
+            // When / Then
+            assertThatThrownBy(() -> Drop.create(PRODUCT_ID, TITLE, 100, 10, openAt, closeAt, NOW))
+                    .isInstanceOf(DomainException.class);
+        }
+
+        @Test
+        @DisplayName("[T2-08] 응모 기간(closeAt-openAt)이 정확히 30일이면 생성된다 (경계)")
+        void entryPeriodAtMaxAccepted() {
+            // Given
+            Instant closeAt = OPEN_AT.plus(Duration.ofDays(30));
+
+            // When
+            Drop drop = Drop.create(PRODUCT_ID, TITLE, 100, 10, OPEN_AT, closeAt, NOW);
+
+            // Then
+            assertThat(drop.getCloseAt()).isEqualTo(closeAt);
+        }
+
+        @Test
+        @DisplayName("[T2-08] 응모 기간이 30일을 1µs 라도 넘으면 DomainException")
+        void entryPeriodBeyondMaxRejected() {
+            // Given
+            Instant closeAt = OPEN_AT.plus(Duration.ofDays(30)).plusNanos(1_000);
+
+            // When / Then
+            assertThatThrownBy(() -> Drop.create(PRODUCT_ID, TITLE, 100, 10, OPEN_AT, closeAt, NOW))
+                    .isInstanceOf(DomainException.class);
+        }
+
+        @Test
+        @DisplayName("[T2-06~09] 제목 100자(String.length 기준)는 생성된다 (경계)")
+        void titleAtMaxLengthAccepted() {
+            // Given
+            String title = "가".repeat(100);
+
+            // When
+            Drop drop = Drop.create(PRODUCT_ID, title, 100, 10, OPEN_AT, CLOSE_AT, NOW);
+
+            // Then
+            assertThat(drop.getTitle()).isEqualTo(title);
+        }
+
+        @Test
+        @DisplayName("[T2-06~09] 제목이 101자면 DomainException")
+        void titleOverMaxLengthRejected() {
+            // Given
+            String title = "가".repeat(101);
+
+            // When / Then
+            assertThatThrownBy(() -> Drop.create(PRODUCT_ID, title, 100, 10, OPEN_AT, CLOSE_AT, NOW))
+                    .isInstanceOf(DomainException.class);
+        }
+    }
 }

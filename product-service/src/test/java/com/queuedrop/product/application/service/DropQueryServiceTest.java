@@ -192,4 +192,15 @@ class DropQueryServiceTest {
         assertThat(result.content()).extracting(DropResult::id)
                 .containsExactly(openEarly.getId(), openLate.getId(), sameOpenAt.getId());
     }
+
+    @Test
+    @DisplayName("[T2-16] page*size 가 int 범위를 넘어도 예외 없이 빈 content 와 전체 건수를 돌려준다")
+    void searchHugePage() {
+        // When
+        DropPageResult result = queryService.search(new DropSearchQuery(null, Integer.MAX_VALUE, 100));
+
+        // Then
+        assertThat(result.content()).isEmpty();
+        assertThat(result.totalElements()).isEqualTo(5);
+    }
 }
