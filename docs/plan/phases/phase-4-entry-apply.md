@@ -5,6 +5,7 @@
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 발행 정책·DLT·저장 전 Redis 확인 확정 반영 (0단계 토픽 초기화에 DLT 추가됨), JSON 직렬화 클래스명을 0단계 공통 설정과 통일, 설계 반영 완료 표시 |
+| v1.2 | 2026-11-16 | 0~3단계 실제 코드에 정렬. 에러 계약: `EntryErrorCode implements ErrorCode`(코드 `ENTRY_*`, 상태는 enum 이 보유), `ApplicationException` 으로 던지고 0단계 `GlobalExceptionHandler` 가 매핑 — `BusinessException`·`EntryApplyException`·`EntryExceptionHandler`·`UserIdHeader` 제거, 헤더 누락은 `COMMON_MISSING_USER_HEADER`(400). `DomainException` 은 entry `domain/exception` 에 서비스별로 둔다(queue 와 같은 형태). 잘못된 `drop.created` 는 queue 처럼 application 이 `DomainException` 을 잡아 로그·스킵(재시도·DLT 없음) — `InvalidDropSnapshotException` 제거, 설계 문서 반영. `DropSnapshotRegisterCommand` 를 `Long`/null 검증으로. Kafka 설정은 0단계 `application.yml` 공통 블록(이미 있음) 기준으로 추가분만 표기, `DefaultErrorHandler` 빈 자동 적용(3단계 확인), `@KafkaListener(idIsGroup = false)`. `entry:{dropId}:remaining` 정수 문자열 계약·queue 의존 명시. 스크립트 빈 `EntryScripts` → `infrastructure/config/RedisScriptConfig`, 테스트 지원은 `*ContainerConfig` `@Import`, 테스트 슬라이스 의존성(`data-redis-test`·`data-jpa-test`). 테스트 T4-33~35 추가. 커밋 계획을 테스트 포함 기능 커밋 단위로 재편. 6.1 에 E-34·E-39 사용자 결정 기록 |
 
 > 표기
 > - **(구현 결정)**: 설계 문서에 없던 내용을 이 문서에서 정한 것
@@ -24,14 +25,15 @@
 ### 선행 조건 (0~3단계 산출물, 이 문서에서는 참조만)
 | 산출물 | 단계 | 이 단계에서 쓰는 곳 |
 |--------|------|---------------------|
-| `common` 이벤트 record `DropCreated`, `EntryCreated` / 토픽 상수 `Topics` | 0 | Listener, Publisher |
-| `common` testFixtures: ArchUnit `LayerRules`, Testcontainers 지원 클래스 | 0 | `ArchitectureTest`, 통합 테스트 |
-| Flyway 의존성 및 설정 | 0 | `V1__create_entry_tables.sql` |
-| 서비스별 에러 응답 형식 `ErrorResponse`, `GlobalExceptionHandler` 기본 틀, application 기반 예외 `BusinessException(ErrorCode)` | 0 | 에러 코드 → HTTP 매핑 |
-| 토픽 `drop.created`, `entry.created` 생성 (파티션 수 포함) | 0 | Kafka |
+| `common.event`: `DropCreated(dropId, productId, title, entryCapacity, winnerCount, openAt, closeAt)`, `EntryCreated(eventId, dropId, userId, entrySeq, appliedAt)` (id 는 `Long`), `Topics.DROP_CREATED`·`ENTRY_CREATED`·`DROP_CREATED_DLT`·`ENTRY_CREATED_DLT` | 0 | Listener, Publisher |
+| `common` testFixtures: `com.queuedrop.common.test.archunit.LayerRules`, `com.queuedrop.common.test.container.{Postgres,Redis,Kafka}ContainerConfig` (`@Import` 로 사용, `@ServiceConnection`) | 0 | `ArchitectureTest`(이미 있음), 통합 테스트 |
+| entry-service `application.yml`(datasource·JPA `validate`·Flyway·Redis·Kafka 공통 블록), `build.gradle`(webmvc·jpa·flyway·redis·kafka, `kafka-test`·`webmvc-test`) | 0 | 3.0, 3.5 |
+| `common.error`: `ErrorCode`(code·status·message), `ApplicationException`, `CommonErrorCode`(`MISSING_USER_HEADER` 등), `ErrorResponse` / entry `presentation/api/GlobalExceptionHandler`(+`GlobalExceptionHandlerTest`) | 0 | 에러 코드 → HTTP 매핑 (수정 없음) |
+| 토픽 `drop.created`(1), `entry.created`(6), `drop.created.DLT`(1), `entry.created.DLT`(6) — `infra/kafka/create-topics.sh` | 0 | Kafka |
 | Gateway 의 `X-User-Id` 헤더 주입 | 1 | Controller |
 | `drop.created` 발행 | 2 | 드로우 정보 수신 |
-| queue 의 입장 토큰 키 `queue:{dropId}:token:{userId}` | 3 | 응모 Lua 의 토큰 검사 |
+| queue 의 입장 토큰 키 `queue:{dropId}:token:{userId}` (`QueueKeys.token`, 값 = 발급 시각 ms, TTL 300초) | 3 | 응모 Lua 의 토큰 검사 (`EXISTS` 만) |
+| queue 가 읽는 entry 키 `entry:{dropId}:remaining` (`QueueKeys.entryRemaining`, `admit.lua`·`RedisRemainingCapacityReader`) | 3 | 이 단계가 **쓰는** 키. 형식 계약은 3.0 |
 
 ### 참고 설계 문서
 - [entry-apply.md](../../design/05-features/entry-apply.md): Lua 판정 순서, 발행·보상, 저장 컨슈머, API
@@ -48,22 +50,20 @@
 
 ```
 entry-service/
-├── build.gradle                                        # 테스트 의존성 추가
+├── build.gradle                                        # 테스트 슬라이스 의존성 추가 (3.5)
 └── src
     ├── main
     │   ├── java/com/queuedrop/entry
     │   │   ├── presentation
     │   │   │   ├── api
     │   │   │   │   ├── EntryController.java
-    │   │   │   │   ├── UserIdHeader.java               # X-User-Id 상수 (구현 결정)
+    │   │   │   │   ├── GlobalExceptionHandler.java     # 0단계에서 생성됨 (수정 없음)
     │   │   │   │   └── response
     │   │   │   │       ├── EntryApplyResponse.java
     │   │   │   │       └── MyEntryResponse.java
-    │   │   │   ├── listener
-    │   │   │   │   ├── DropCreatedListener.java
-    │   │   │   │   └── EntryCreatedListener.java
-    │   │   │   └── advice
-    │   │   │       └── EntryExceptionHandler.java      # 0단계 GlobalExceptionHandler 확장
+    │   │   │   └── listener
+    │   │   │       ├── DropCreatedListener.java
+    │   │   │       └── EntryCreatedListener.java
     │   │   ├── application
     │   │   │   ├── service
     │   │   │   │   ├── DropSnapshotRegisterService.java
@@ -83,8 +83,7 @@ entry-service/
     │   │   │   │   ├── EntryCreatedPayload.java
     │   │   │   │   └── EventPublishException.java
     │   │   │   └── exception
-    │   │   │       ├── EntryErrorCode.java
-    │   │   │       └── EntryApplyException.java
+    │   │   │       └── EntryErrorCode.java             # common.error.ErrorCode 구현 (v1.2)
     │   │   ├── domain
     │   │   │   ├── model
     │   │   │   │   ├── Entry.java
@@ -96,7 +95,7 @@ entry-service/
     │   │   │   │   ├── EntryRepository.java
     │   │   │   │   └── DropSnapshotRepository.java
     │   │   │   └── exception
-    │   │   │       └── DomainException.java            # 0단계에 없으면 여기서 생성
+    │   │   │       └── DomainException.java            # 서비스별로 둔다 (queue 와 같은 형태, v1.2)
     │   │   └── infrastructure
     │   │       ├── persistence
     │   │       │   ├── EntryJpaEntity.java
@@ -109,27 +108,28 @@ entry-service/
     │   │       │   └── DropSnapshotRepositoryImpl.java
     │   │       ├── redis
     │   │       │   ├── EntryRedisKeys.java
-    │   │       │   ├── EntryScripts.java               # Lua 스크립트 빈 등록
     │   │       │   └── RedisEntryGate.java
     │   │       ├── messaging
     │   │       │   └── KafkaEntryEventPublisher.java
     │   │       └── config
     │   │           ├── ClockConfig.java
+    │   │           ├── RedisScriptConfig.java          # Lua 스크립트 빈 (queue 와 같은 위치·이름, v1.2)
     │   │           └── KafkaConsumerConfig.java        # 에러 핸들러, DLT
     │   └── resources
-    │       ├── application.yml
+    │       ├── application.yml                         # 0단계에서 생성됨. 3.0 의 추가분만 반영
     │       ├── scripts
     │       │   ├── entry-initialize.lua
     │       │   ├── entry-apply.lua
     │       │   └── entry-compensate.lua
     │       └── db/migration
-    │           └── V1__create_entry_tables.sql
+    │           └── V1__create_entry_tables.sql         # .gitkeep 대체
     └── test/java/com/queuedrop/entry
-        ├── ArchitectureTest.java
+        ├── ArchitectureTest.java                       # 0단계에서 생성됨 (수정 없음)
+        ├── ApplicationContextTest.java                 # 0단계에서 생성됨 (V1 적용 후에도 통과해야 함)
         ├── domain/model
         │   ├── EntryTest.java
         │   └── DropSnapshotTest.java
-        ├── application
+        ├── application/service
         │   ├── fake
         │   │   ├── FakeEntryGate.java
         │   │   ├── FakeEntryEventPublisher.java
@@ -139,12 +139,15 @@ entry-service/
         │   ├── EntrySaveServiceTest.java
         │   ├── DropSnapshotRegisterServiceTest.java
         │   └── EntryQueryServiceTest.java
+        ├── application/exception/EntryErrorCodeTest.java
         ├── infrastructure
         │   ├── redis/RedisEntryGateTest.java
         │   ├── persistence/EntryRepositoryImplTest.java
+        │   ├── persistence/DropSnapshotRepositoryImplTest.java
         │   └── messaging/KafkaEntryEventPublisherTest.java
         ├── presentation
         │   ├── api/EntryControllerTest.java
+        │   ├── api/GlobalExceptionHandlerTest.java     # 0단계에서 생성됨 (수정 없음)
         │   └── listener/EntryCreatedListenerTest.java
         └── scenario
             ├── EntryConcurrencyTest.java
@@ -182,28 +185,37 @@ entry-service/
 ```java
 package com.queuedrop.entry.infrastructure.redis;
 
-final class EntryRedisKeys {
+/** entry-service Redis 키 이름의 단일 출처 (architecture.md 5장). queue-service 의 QueueKeys 와 같은 형태 */
+public final class EntryRedisKeys {
 
     private EntryRedisKeys() {}
 
-    static String meta(long dropId)       { return "entry:" + dropId + ":meta"; }
-    static String remaining(long dropId)  { return "entry:" + dropId + ":remaining"; }
-    static String applicants(long dropId) { return "entry:" + dropId + ":applicants"; }
-    static String seq(long dropId)        { return "entry:" + dropId + ":seq"; }
+    public static String meta(Long dropId)       { return "entry:" + dropId + ":meta"; }
+    /** queue-service 가 읽는다 (QueueKeys.entryRemaining). 값은 항상 10진 정수 문자열 */
+    public static String remaining(Long dropId)  { return "entry:" + dropId + ":remaining"; }
+    public static String applicants(Long dropId) { return "entry:" + dropId + ":applicants"; }
+    public static String seq(Long dropId)        { return "entry:" + dropId + ":seq"; }
 
-    /** queue-service 소유 키. 읽기만 한다. 형식 변경 시 queue-service 와 함께 수정 (architecture.md 5장). */
-    static String queueToken(long dropId, long userId) {
+    /** queue-service 소유 키 — 읽기 전용. QueueKeys.token(dropId, userId) 과 같은 문자열이어야 한다 */
+    public static String queueToken(Long dropId, Long userId) {
         return "queue:" + dropId + ":token:" + userId;
     }
 }
 ```
-- 키 문자열의 `{dropId}` 는 설계 문서의 자리표시자다. 실제 키에는 중괄호 없이 `entry:42:meta` 처럼 들어간다.
-- queue 토큰 키 형식은 이 클래스에 중복으로 정의한다 **(구현 결정)**. `common` 으로 옮기면 서비스 간 결합이 코드로 드러나는 장점이 있지만, 키 하나 때문에 common 에 Redis 개념이 들어가는 게 더 크다고 판단했다.
+- 키 문자열의 `{dropId}` 는 설계 문서의 자리표시자다. 실제 키에는 중괄호 없이 `entry:42:meta` 처럼 들어간다. 해시 태그는 쓰지 않는다 (6.1 ⑤, E-39).
+- queue 토큰 키 형식은 이 클래스에 중복으로 정의한다 **(구현 결정)**. `common` 으로 옮기면 서비스 간 결합이 코드로 드러나는 장점이 있지만, 키 하나 때문에 common 에 Redis 개념이 들어가는 게 더 크다고 판단했다. queue 쪽도 같은 이유로 `QueueKeys.entryRemaining` 을 중복 정의했다 (3단계).
+
+**서비스 간 키 계약** (v1.2, 3단계 코드 기준)
+| 키 | 쓰는 쪽 | 읽는 쪽 | 계약 |
+|----|---------|---------|------|
+| `queue:{dropId}:token:{userId}` | queue `admit.lua` (`SET ... EX 300`, 값 = 발급 시각 ms) | entry `entry-apply.lua` (`EXISTS`) | 키 이름만 의존. 값은 읽지 않는다 |
+| `entry:{dropId}:remaining` | entry `entry-initialize.lua`(`SET capacity`)·`entry-apply.lua`(`DECR`)·`entry-compensate.lua`(`INCR`) | queue `admit.lua`(`tonumber`)·`RedisRemainingCapacityReader`(`Long.parseLong`) | **10진 정수 문자열**. `SET`/`DECR`/`INCR` 만 쓰므로 항상 만족. 키가 없으면 queue 는 진입 허용·입장 보류 (3단계 결정) → `drop.created` 처리 전에는 아무도 입장하지 않는다 |
+- 3단계 테스트는 이 키를 `EntryRemainingFixture` 로 직접 세팅했다. 이 단계에서 실제 쓰기 경로가 생기므로, 형식이 바뀌면 queue 의 `admit.lua`·`RedisRemainingCapacityReader` 가 깨진다. T4-11·18 에서 `GET remaining` 이 정수 문자열인지 함께 확인한다.
 
 #### 시각 주입 (`infrastructure/config/ClockConfig`)
 ```java
 @Configuration
-class ClockConfig {
+public class ClockConfig {          // queue·product 와 같은 형태
     @Bean
     Clock clock() {
         return Clock.systemUTC();
@@ -213,7 +225,8 @@ class ClockConfig {
 - application 서비스는 `Clock` 을 주입받아 `now` 를 만든다. 테스트에서는 `Clock.fixed(...)` 로 바꾼다.
 - domain 은 `Clock` 도 모른다. 시각은 항상 인자로 받는다.
 
-#### application.yml (전문)
+#### application.yml (0단계 공통 블록 + 이 단계 추가분)
+0단계에서 만든 `application.yml` 에 datasource·JPA(`validate`)·Flyway·Redis·Kafka(producer 동기 발행 정책, consumer `ErrorHandlingDeserializer`) 가 이미 있다 (queue-service 와 같은 Kafka 블록). 이 단계는 아래 `# v1.2 추가` 표시 줄만 넣는다.
 ```yaml
 server:
   port: 8085
@@ -227,46 +240,48 @@ spring:
     password: ${DB_PASSWORD:queuedrop}
   jpa:
     hibernate:
-      ddl-auto: validate          # 스키마는 Flyway 가 관리 (0단계 결정)
+      ddl-auto: validate        # 스키마는 Flyway 가 만든다. 엔티티와 불일치 시 기동 실패
     open-in-view: false
   flyway:
     enabled: true
     locations: classpath:db/migration
+    baseline-on-migrate: false
   data:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
-      timeout: 1s
+      timeout: 1s                # v1.2 추가: 명령 타임아웃 (Lettuce 기본 60초). 응모 응답 경로가 Redis 장애에 오래 묶이지 않게
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
-      acks: all
-      retries: 2147483647
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # 0단계 공통 설정과 동일, 구현 시 확인 (아래 참고)
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3)
+      acks: all
+      retries: 2147483647          # 횟수가 아니라 delivery.timeout.ms 로 전체 시간을 제한
       properties:
         enable.idempotence: true
-        max.in.flight.requests.per.connection: 5
-        linger.ms: 0
         request.timeout.ms: 1000
         delivery.timeout.ms: 3000
+        max.block.ms: 1000         # send() 호출 자체의 블로킹 상한 (기본 60초)
+        linger.ms: 0               # v1.2 추가: Kafka 4.0 클라이언트 기본값이 5ms 로 바뀌었다. 응답 경로에 배치 대기를 넣지 않는다
     consumer:
-      group-id: entry-service
+      group-id: ${spring.application.name}
       auto-offset-reset: earliest
-      enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       properties:
-        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer  # 0단계 공통 설정과 동일, 구현 시 확인
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
         spring.json.trusted.packages: com.queuedrop.common.event
-    listener:
-      ack-mode: record
-      concurrency: 3              # 0단계 토픽 파티션 수와 맞춘다
+    listener:                      # v1.2 추가
+      ack-mode: record             # 레코드 단위로 처리 성공 후 커밋
+      concurrency: 3               # entry.created 파티션 6 → 인스턴스 2개 기준 3씩. drop.created(파티션 1)는 1개만 일함
 
-entry:
+entry:                             # v1.2 추가
   publish:
-    await-timeout: 3500ms         # delivery.timeout.ms(3000) + 여유
+    await-timeout: 3500ms          # delivery.timeout.ms(3000) + 여유
 ```
+- `enable-auto-commit` 은 적지 않는다. Spring Kafka 가 명시하지 않으면 `false` 로 두고 컨테이너가 커밋한다 (queue 와 같음).
+- JSON 직렬화 클래스는 0단계에서 Spring Kafka 4 의 `JacksonJsonSerializer` / `JacksonJsonDeserializer` 로 확정됐다 (v1.1 의 "구현 시 확인" 해소).
 
 **Producer 설정 근거**
 | 설정 | 값 | 이유 |
@@ -275,38 +290,47 @@ entry:
 | `enable.idempotence` | `true` | producer 내부 재시도로 생기는 중복 기록을 브로커가 제거 |
 | `retries` | `MAX_INT` | 재시도 횟수가 아니라 `delivery.timeout.ms` 로 전체 시간을 제한 |
 | `request.timeout.ms` / `delivery.timeout.ms` | 1000 / 3000 | send 결과가 **3초 안에 반드시 확정**되게 한다. `get(timeout)` 만 걸면 future 는 타임아웃돼도 producer 는 최대 120초(기본값) 동안 계속 재시도해서, 보상 후에 뒤늦게 기록되는 유령 이벤트가 생기기 쉽다 |
+| `max.block.ms` | 1000 | 메타데이터 조회 등으로 `send()` 호출 자체가 막히는 시간 상한. 최악 응답 시간 = 1초 + `get` 3.5초 |
 | `linger.ms` | 0 | 응답 지연에 배치 대기 시간을 넣지 않는다. 8단계 부하 테스트에서 재조정 |
 
-> **설계와 다른 점 (설계 수정 필요 ①)**: 설계는 "`get(3s)` + 애플리케이션 재시도 2회" 다. 이 문서는 **애플리케이션 재시도를 없애고 producer 내부 재시도(멱등) + `delivery.timeout.ms=3000`** 으로 바꾼다. 애플리케이션이 같은 레코드를 다시 send 하면 멱등 producer 도 중복을 막지 못하고(별개 레코드로 취급), 3초 × 3회면 응답이 최대 9초까지 늘어난다.
+> **설계와 다른 점 (설계 수정 필요 ①, 반영 완료)**: 설계는 "`get(3s)` + 애플리케이션 재시도 2회" 였다. **애플리케이션 재시도를 없애고 producer 내부 재시도(멱등) + `delivery.timeout.ms=3000`** 으로 바꿨다. 애플리케이션이 같은 레코드를 다시 send 하면 멱등 producer 도 중복을 막지 못하고(별개 레코드로 취급), 3초 × 3회면 응답이 최대 9초까지 늘어난다.
 
 **Consumer 설정 근거**
 | 설정 | 값 | 이유 |
 |------|----|------|
-| `enable-auto-commit` | `false` | 자동 커밋은 처리 전에 오프셋이 커밋될 수 있다 → 저장 전 장애 시 유실 |
+| `enable-auto-commit` | `false` (Spring Kafka 기본) | 자동 커밋은 처리 전에 오프셋이 커밋될 수 있다 → 저장 전 장애 시 유실 |
 | `ack-mode` | `record` | 레코드 하나를 **DB 저장 성공 후** 커밋. at-least-once + 컨슈머 멱등으로 정확히 한 번처럼 동작 |
-| `ErrorHandlingDeserializer` | - | 역직렬화 실패 레코드 하나가 파티션 전체를 막지 않게 한다 |
+| `ErrorHandlingDeserializer` | - | 역직렬화 실패 레코드 하나가 파티션 전체를 막지 않게 한다 (0단계 공통) |
 | 타입 정보 | `__TypeId__` 헤더 (JSON serializer 기본) | 모든 서비스가 같은 `common` 클래스를 쓰므로 헤더의 FQCN 이 그대로 맞는다. `trusted.packages` 로 범위를 제한 |
-
-> Spring Kafka 4.x(Boot 4.1.2 관리 버전)는 Jackson 3 기반 `JacksonJsonSerializer` / `JacksonJsonDeserializer` 를 새로 두고 기존 `JsonSerializer` 계열을 deprecated 했을 가능성이 있다. **구현 시 확인**: deprecated 면 새 클래스로 바꾸고 프로퍼티 키도 함께 확인한다.
+| group-id | `${spring.application.name}` = `entry-service` | 두 리스너가 같은 그룹을 쓴다. `@KafkaListener(id = ...)` 를 주면 기본(`idIsGroup = true`)으로 id 가 group-id 를 덮어쓰므로 **`idIsGroup = false`** 를 함께 준다 (v1.2) |
 
 #### Kafka 에러 핸들러 (`infrastructure/config/KafkaConsumerConfig`) (구현 결정)
 ```java
+package com.queuedrop.entry.infrastructure.config;
+
+/**
+ * DB 에 저장하는 컨슈머 실패 정책 (architecture.md 4장, 6.1 ③): 1초 간격 3회 재시도 후 {topic}.DLT.
+ * Spring Boot 가 이 CommonErrorHandler 빈을 기본 리스너 컨테이너 팩토리에 적용한다 (3단계 queue 에서 확인).
+ * 역직렬화 실패(DeserializationException)는 기본으로 재시도하지 않는 예외라 바로 DLT 로 간다.
+ */
 @Configuration
-class KafkaConsumerConfig {
+public class KafkaConsumerConfig {
+
+    static final long RETRY_INTERVAL_MS = 1_000L;
+    static final long MAX_RETRIES = 3L;
 
     @Bean
-    DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, Object> template) {
-        var recoverer = new DeadLetterPublishingRecoverer(template);   // {topic}.DLT 로 보냄
-        var handler = new DefaultErrorHandler(recoverer, new FixedBackOff(1_000L, 3L));
-        handler.addNotRetryableExceptions(DeserializationException.class);
-        return handler;
+    DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, Object> kafkaTemplate) {
+        var recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate);   // 기본: {topic}.DLT, 같은 파티션 번호
+        return new DefaultErrorHandler(recoverer, new FixedBackOff(RETRY_INTERVAL_MS, MAX_RETRIES));
     }
 }
 ```
-- 저장 실패(DB 장애 등)는 1초 간격 3번 재시도 후 `entry.created.DLT` 로 보낸다.
-- DLT 토픽 `drop.created.DLT`, `entry.created.DLT` 는 0단계 토픽 초기화(`create-topics.sh`)에서 만든다 (확정, 설계 수정 ② 반영). 토픽 이름은 `Topics.*_DLT` 상수를 쓴다.
+- queue 의 `KafkaConsumerConfig` 와 같은 형태에 recoverer 만 더한다. 저장 실패(DB 장애 등)는 1초 간격 3번 재시도 후 `entry.created.DLT` / `drop.created.DLT` 로 보낸다.
+- DLT 토픽은 0단계 `create-topics.sh` 가 원본과 같은 파티션 수로 만든다 (기본 recoverer 가 원본 파티션 번호로 보내므로). 토픽 이름은 `Topics.*_DLT` 상수.
+- 잘못된 `drop.created`(도메인 불변식 위반)는 application 이 로그·스킵하므로 이 핸들러까지 오지 않는다 (3.1, v1.2). DLT 로 가는 건 인프라 장애와 역직렬화 실패뿐이다.
+- 역직렬화 실패 레코드는 값이 원본 `byte[]` 로 복원돼 recoverer 에 전달된다. JSON serializer 템플릿이 이를 원본 그대로 보내는지 **구현 시 확인** (T4-34 와 별개로 수동 확인). 아니면 `byte[]` 용 템플릿을 따로 두는 `DeadLetterPublishingRecoverer(Map<Class<?>, KafkaOperations<?, ?>>)` 생성자를 쓴다.
 - DLT 로 간 응모는 Redis 에는 있고 DB 에는 없는 상태라, 5단계 추첨의 건수 비교에서 불일치로 드러난다. 그때 DLT 를 다시 처리하면 된다.
-- Boot 4 에서 `DefaultErrorHandler` 빈 하나만 두면 기본 컨테이너 팩토리에 자동 적용되는지 **구현 시 확인**. 안 되면 `ConcurrentKafkaListenerContainerFactory` 에 직접 설정한다.
 
 #### Flyway 마이그레이션 (`db/migration/V1__create_entry_tables.sql`, 전문)
 ```sql
@@ -362,27 +386,42 @@ package com.queuedrop.entry.domain.model;
 public enum SnapshotStatus { OPEN, CLOSING, DRAWN }
 ```
 
+**`DomainException`** (`domain/exception`): 도메인 불변식 위반. 0단계 `common` 에는 없고 서비스별로 둔다 (queue-service `domain/exception/DomainException` 과 같은 형태, v1.2).
+```java
+package com.queuedrop.entry.domain.exception;
+
+/** 도메인 불변식 위반. application 이 받아 처리한다 (메시지는 로그에만 남는다). */
+public class DomainException extends RuntimeException {
+    public DomainException(String message) {
+        super(message);
+    }
+}
+```
+
 **`DropSnapshot`**: product 드로우의 사본. 생성 시 불변식을 검증한다.
 ```java
 package com.queuedrop.entry.domain.model;
 
 public final class DropSnapshot {
 
-    private final long dropId;
+    private final Long dropId;
     private final int entryCapacity;
     private final int winnerCount;
     private final Instant openAt;
     private final Instant closeAt;
     private final SnapshotStatus status;
 
-    private DropSnapshot(long dropId, int entryCapacity, int winnerCount,
+    private DropSnapshot(Long dropId, int entryCapacity, int winnerCount,
                          Instant openAt, Instant closeAt, SnapshotStatus status) {
         // 필드 대입
     }
 
     /** drop.created 수신 시 생성. 항상 OPEN 으로 시작한다. */
-    public static DropSnapshot register(long dropId, int entryCapacity, int winnerCount,
+    public static DropSnapshot register(Long dropId, int entryCapacity, int winnerCount,
                                         Instant openAt, Instant closeAt) {
+        if (dropId == null || openAt == null || closeAt == null) {
+            throw new DomainException("필수 값 누락");          // 메시지 필드 누락도 스킵 대상 (v1.2)
+        }
         if (winnerCount < 1 || entryCapacity < winnerCount) {
             throw new DomainException("entryCapacity >= winnerCount >= 1 이어야 합니다");
         }
@@ -393,7 +432,7 @@ public final class DropSnapshot {
     }
 
     /** 저장소에서 복원할 때만 사용 (Mapper 전용). 검증하지 않는다. */
-    public static DropSnapshot restore(long dropId, int entryCapacity, int winnerCount,
+    public static DropSnapshot restore(Long dropId, int entryCapacity, int winnerCount,
                                        Instant openAt, Instant closeAt, SnapshotStatus status) {
         return new DropSnapshot(dropId, entryCapacity, winnerCount, openAt, closeAt, status);
     }
@@ -422,14 +461,17 @@ public interface DropSnapshotRepository {
 ```java
 package com.queuedrop.entry.application.dto;
 
+/** dropId 는 Long: 메시지의 null 을 리스너에서 언박싱하다 NPE(→ 재시도·DLT)가 나지 않고 도메인 검증까지 오게 한다 (v1.2) */
 public record DropSnapshotRegisterCommand(
-        long dropId, int entryCapacity, int winnerCount, Instant openAt, Instant closeAt) {}
+        Long dropId, int entryCapacity, int winnerCount, Instant openAt, Instant closeAt) {}
 ```
 
 **`DropSnapshotRegisterService`**: DB 저장 후 Redis 초기화. 둘 다 멱등이라 어느 단계에서 실패해도 재전달로 복구된다.
 ```java
 package com.queuedrop.entry.application.service;
 
+/** drop.created 처리. 잘못된 메시지는 로그 후 스킵한다 (queue 의 QueueMetaRegisterService 와 같은 방식, v1.2) */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class DropSnapshotRegisterService {
@@ -438,9 +480,15 @@ public class DropSnapshotRegisterService {
     private final EntryGate entryGate;
 
     public void register(DropSnapshotRegisterCommand command) {
-        DropSnapshot snapshot = DropSnapshot.register(
-                command.dropId(), command.entryCapacity(), command.winnerCount(),
-                command.openAt(), command.closeAt());
+        DropSnapshot snapshot;
+        try {
+            snapshot = DropSnapshot.register(
+                    command.dropId(), command.entryCapacity(), command.winnerCount(),
+                    command.openAt(), command.closeAt());
+        } catch (DomainException e) {
+            log.warn("invalid drop.created skipped: dropId={} - {}", command.dropId(), e.getMessage());
+            return;
+        }
 
         dropSnapshotRepository.saveIfAbsent(snapshot);       // ① DB (자체 트랜잭션)
 
@@ -455,7 +503,8 @@ public class DropSnapshotRegisterService {
   | ① DB 저장 | 아무것도 없음 | ①부터 다시 |
   | ② Redis 초기화 | DB 만 있음 | ① 은 이미 있어서 건너뜀, ② 실행 |
 - 메서드에 `@Transactional` 을 걸지 않는다. Redis 호출을 DB 트랜잭션 안에 두면, 커밋 실패 시 Redis 만 초기화된 상태가 남는다.
-- 도메인 검증 실패(`DomainException`)는 재시도해도 같은 결과라서 Listener 가 잡아 로그만 남긴다 (3.1 presentation 참고).
+- 도메인 검증 실패(`DomainException`)는 재시도해도 같은 결과라서 **application 이 잡아 warn 로그 후 스킵**한다 (v1.2). 재시도·DLT 로 보내지 않는다. 잘못된 드로우는 Redis 에 초기화되지 않으므로 응모는 `CLOSED` 로 막히고, product 쪽 데이터를 고쳐 다시 발행하면 된다.
+- `try` 는 도메인 생성만 감싼다. DB·Redis 장애 예외는 그대로 올려 `DefaultErrorHandler` 가 재시도 → `drop.created.DLT` 로 보내게 한다.
 
 **`EntryGate.initialize`**: 포트 정의는 3.2 에 전체를 적는다.
 
@@ -555,27 +604,22 @@ class DropSnapshotRepositoryImpl implements DropSnapshotRepository {
 ```java
 package com.queuedrop.entry.presentation.listener;
 
-@Slf4j
 @Component
 @RequiredArgsConstructor
 public class DropCreatedListener {
 
     private final DropSnapshotRegisterService registerService;
 
-    @KafkaListener(id = "entry-drop-created", topics = Topics.DROP_CREATED)
+    @KafkaListener(id = "entry-drop-created", idIsGroup = false, topics = Topics.DROP_CREATED)
     public void on(DropCreated message) {
-        try {
-            registerService.register(new DropSnapshotRegisterCommand(
-                    message.dropId(), message.entryCapacity(), message.winnerCount(),
-                    message.openAt(), message.closeAt()));
-        } catch (InvalidDropSnapshotException e) {
-            log.error("잘못된 드로우 정보, 재시도하지 않음: dropId={}", message.dropId(), e);
-        }
+        registerService.register(new DropSnapshotRegisterCommand(
+                message.dropId(), message.entryCapacity(), message.winnerCount(),
+                message.openAt(), message.closeAt()));
     }
 }
 ```
-- presentation 은 `DomainException` 을 직접 잡을 수 없다(R4). 그래서 `DropSnapshotRegisterService` 가 `DomainException` 을 잡아 application 예외 **`InvalidDropSnapshotException`**(`application/exception`)으로 바꿔 던진다 **(구현 결정)**.
-- DB·Redis 장애 같은 나머지 예외는 그대로 던져서 `DefaultErrorHandler` 가 재시도하게 둔다.
+- 리스너는 예외를 잡지 않는다 (v1.2). 잘못된 값은 application 이 스킵하고, DB·Redis 장애 예외만 올라와 `DefaultErrorHandler` 가 재시도 → DLT 로 보낸다.
+- v1.1 의 `InvalidDropSnapshotException`(application 예외로 바꿔 던지고 리스너가 잡음)은 제거했다. queue 와 같은 방식으로 맞추고, presentation 이 domain 예외를 볼 필요(R4)도 원래 없게 된다.
 
 ---
 
@@ -717,21 +761,34 @@ public class EventPublishException extends RuntimeException {
 }
 ```
 
-**에러 코드·예외** (`application/exception`)
+**에러 코드** (`application/exception`) — 0단계 에러 계약에 정렬 (v1.2)
 ```java
 package com.queuedrop.entry.application.exception;
 
-public enum EntryErrorCode implements ErrorCode {        // ErrorCode: 0단계 공통 인터페이스 (가정)
-    CLOSED("응모 기간이 아닙니다"),
-    NO_TOKEN("입장 토큰이 없거나 만료되었습니다"),
-    DUPLICATE("이미 응모한 드로우입니다"),
-    SOLD_OUT("응모 정원이 마감되었습니다"),
-    TEMPORARILY_FAILED("일시적인 오류입니다. 다시 시도해 주세요"),
-    ENTRY_NOT_FOUND("응모 내역이 없습니다");              // (구현 결정) 단건 조회용
+import com.queuedrop.common.error.ErrorCode;
 
+/** 응답 code 는 {SERVICE}_{REASON}, 상수명은 사유만 (layered-architecture.md 4.5). 상태 코드는 enum 이 갖는다 */
+public enum EntryErrorCode implements ErrorCode {
+    CLOSED("ENTRY_CLOSED", 409, "응모 기간이 아닙니다."),
+    NO_TOKEN("ENTRY_NO_TOKEN", 409, "입장 토큰이 없거나 만료되었습니다."),
+    DUPLICATE("ENTRY_DUPLICATE", 409, "이미 응모한 드로우입니다."),
+    SOLD_OUT("ENTRY_SOLD_OUT", 409, "응모 정원이 마감되었습니다."),
+    TEMPORARILY_FAILED("ENTRY_TEMPORARILY_FAILED", 503, "일시적인 오류입니다. 다시 시도해 주세요."),
+    NOT_FOUND("ENTRY_NOT_FOUND", 404, "응모 내역이 없습니다.");      // (구현 결정) 단건 조회용
+
+    private final String code;
+    private final int status;
     private final String message;
 
-    EntryErrorCode(String message) { this.message = message; }
+    EntryErrorCode(String code, int status, String message) {
+        this.code = code;
+        this.status = status;
+        this.message = message;
+    }
+
+    @Override public String code() { return code; }
+    @Override public int status() { return status; }
+    @Override public String message() { return message; }
 
     /** domain 판정 결과 → application 에러 코드. 변환은 여기 한 곳에서만 한다. */
     public static EntryErrorCode from(ApplyOutcome outcome) {
@@ -744,14 +801,11 @@ public enum EntryErrorCode implements ErrorCode {        // ErrorCode: 0단계 �
         };
     }
 }
-
-public class EntryApplyException extends BusinessException {   // BusinessException: 0단계 (가정)
-    public EntryApplyException(EntryErrorCode code)                  { super(code); }
-    public EntryApplyException(EntryErrorCode code, Throwable cause) { super(code, cause); }
-}
 ```
+- 예외는 `throw new ApplicationException(EntryErrorCode.X)`. 별도 `EntryApplyException`·`EntryExceptionHandler` 는 두지 않는다 — 0단계 `presentation/api/GlobalExceptionHandler` 가 `ErrorCode.status()`·`code()` 로 매핑한다 (queue 3단계 v1.2 와 같음).
+- `from(ApplyOutcome)` 은 public static 이지만 application.service 의 메서드가 아니라 R6 대상이 아니다. presentation 은 `EntryErrorCode` 를 쓰지 않는다.
 
-> **ApplyOutcome → 예외 변환 위치**: `EntryApplyService` 가 `EntryErrorCode.from(outcome)` 으로 변환해 `EntryApplyException` 을 던진다. presentation 은 `EntryErrorCode` 만 보고 HTTP 상태를 정한다. `ApplyOutcome` 은 application 밖으로 나가지 않는다.
+> **ApplyOutcome → 예외 변환 위치**: `EntryApplyService` 가 `EntryErrorCode.from(outcome)` 으로 변환해 `ApplicationException` 을 던진다. `ApplyOutcome` 은 application 밖으로 나가지 않는다.
 
 **`EntryApplyService`**: 판정 → 발행 → (실패 시) 보상.
 ```java
@@ -771,7 +825,7 @@ public class EntryApplyService {
 
         GateResult gate = entryGate.tryApply(command.dropId(), command.userId(), now);
         if (!gate.isOk()) {
-            throw new EntryApplyException(EntryErrorCode.from(gate.outcome()));
+            throw new ApplicationException(EntryErrorCode.from(gate.outcome()));
         }
 
         EntryCreatedPayload payload = new EntryCreatedPayload(
@@ -782,7 +836,7 @@ public class EntryApplyService {
             eventPublisher.publishCreated(payload);
         } catch (EventPublishException e) {
             compensateQuietly(command);
-            throw new EntryApplyException(EntryErrorCode.TEMPORARILY_FAILED, e);
+            throw new ApplicationException(EntryErrorCode.TEMPORARILY_FAILED, e);   // 503 → GlobalExceptionHandler 가 error 로그 + 스택
         }
 
         return new EntryApplyResult(gate.entrySeq());
@@ -882,12 +936,13 @@ return 0
 - `SREM` 결과로 `INCR` 여부를 정하므로 **두 번 호출해도 정원이 두 번 늘지 않는다.**
 - `seq` 는 건드리지 않는다 (번호 재사용 방지, [sequence-diagram.md](../../design/08-sequence-diagram/sequence-diagram.md) 5.2).
 
-**`EntryScripts`**: 스크립트를 빈으로 한 번만 로드한다. `RedisTemplate.execute(script, ...)` 는 EVALSHA 를 먼저 시도하고, 스크립트 캐시가 없으면 EVAL 로 다시 보낸다.
+**`RedisScriptConfig`** (`infrastructure/config`, v1.2: queue 와 같은 위치·이름): 스크립트를 빈으로 한 번만 로드한다. `RedisTemplate.execute(script, ...)` 는 EVALSHA 를 먼저 시도하고, 스크립트 캐시가 없으면 EVAL 로 다시 보낸다.
 ```java
-package com.queuedrop.entry.infrastructure.redis;
+package com.queuedrop.entry.infrastructure.config;
 
+/** Spring Data Redis 는 EVALSHA 를 먼저 시도하고 NOSCRIPT 면 EVAL 로 재시도한다 */
 @Configuration
-class EntryScripts {
+public class RedisScriptConfig {
 
     @Bean
     RedisScript<Long> entryInitializeScript() {
@@ -913,7 +968,7 @@ package com.queuedrop.entry.infrastructure.redis;
 
 @Component
 @RequiredArgsConstructor
-class RedisEntryGate implements EntryGate {
+public class RedisEntryGate implements EntryGate {
 
     private final StringRedisTemplate redis;
     private final RedisScript<Long> entryInitializeScript;
@@ -958,14 +1013,15 @@ class RedisEntryGate implements EntryGate {
     }
 }
 ```
-- Lua 가 반환한 배열에서 문자열은 Java `String`(StringRedisTemplate 직렬화), 정수는 `Long` 으로 들어온다. 실제 타입이 `byte[]` 로 오는지 **구현 시 확인**. 그렇다면 `RedisScript` 의 결과 직렬화기를 지정하는 `execute(script, argsSerializer, resultSerializer, keys, args)` 오버로드를 쓴다.
+- Lua 가 반환한 배열에서 문자열은 Java `String`(StringRedisTemplate 직렬화), 정수는 `Long` 으로 들어온다. queue `admit.lua`(`RedisScript<List>`, userId 문자열 배열)가 같은 방식으로 동작한다 (3단계 확인). 문자열·정수 혼합 배열은 이 단계가 처음이라 T4-11 에서 타입을 확인한다.
+- 빈 이름 주입: 같은 타입(`RedisScript<Long>`) 빈이 둘이라 필드 이름(`entryInitializeScript`, `entryCompensateScript`)으로 구분된다. queue 의 `RedisWaitingQueueRepository` 와 같은 방식.
 
 **`KafkaEntryEventPublisher`**: `EntryEventPublisher` 구현. application DTO 를 `common` 메시지로 바꿔 보낸다.
 ```java
 package com.queuedrop.entry.infrastructure.messaging;
 
 @Component
-class KafkaEntryEventPublisher implements EntryEventPublisher {
+public class KafkaEntryEventPublisher implements EntryEventPublisher {
 
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final Duration awaitTimeout;
@@ -990,10 +1046,13 @@ class KafkaEntryEventPublisher implements EntryEventPublisher {
             throw new EventPublishException("발행 대기 중 인터럽트", e);
         } catch (ExecutionException | TimeoutException e) {
             throw new EventPublishException("entry.created 발행 실패", e);
+        } catch (RuntimeException e) {          // send() 가 동기로 던지는 경우 (max.block.ms 초과 등)
+            throw new EventPublishException("entry.created 발행 실패", e);
         }
     }
 }
 ```
+- `send()` 가 동기로 던지는 예외는 Apache `KafkaException` 계열인지 Spring `KafkaException` 으로 감싸지는지 버전에 따라 다르다. 그래서 `RuntimeException` 으로 넓게 잡는다 (v1.2). 포트 밖으로 Kafka 예외가 새면 `EntryApplyService` 의 보상이 실행되지 않는다.
 - `get()` 의 대기 시간(3.5초)은 producer 의 `delivery.timeout.ms`(3초)보다 조금 길다. 그래서 대부분 producer 가 먼저 성공/실패를 확정하고, `TimeoutException` 은 producer 가 응답하지 않는 예외 상황에서만 난다.
 - `TimeoutException` 이어도 레코드가 나중에 기록될 수 있다. 그 경우가 5.2 의 유령 이벤트고, 저장 컨슈머의 `isApplicant` 확인과 `seq` 카운터가 처리한다.
 
@@ -1011,12 +1070,10 @@ public class EntryController {
     private final EntryApplyService entryApplyService;
     private final EntryQueryService entryQueryService;
 
-    @PostMapping("/drops/{dropId}")
+    @PostMapping("/drops/{dropId:\\d+}")
     @ResponseStatus(HttpStatus.ACCEPTED)
-    public EntryApplyResponse apply(@PathVariable long dropId,
-                                    @RequestHeader(UserIdHeader.NAME) long userId) {
-        EntryApplyResult result = entryApplyService.apply(new EntryApplyCommand(dropId, userId));
-        return EntryApplyResponse.from(result);
+    public EntryApplyResponse apply(@RequestHeader("X-User-Id") Long userId, @PathVariable Long dropId) {
+        return EntryApplyResponse.from(entryApplyService.apply(new EntryApplyCommand(dropId, userId)));
     }
 
     // 조회 API 는 3.4
@@ -1027,47 +1084,24 @@ public record EntryApplyResponse(int entrySeq) {
         return new EntryApplyResponse(result.entrySeq());
     }
 }
-
-public final class UserIdHeader {
-    public static final String NAME = "X-User-Id";
-    private UserIdHeader() {}
-}
 ```
+- 헤더 이름은 queue·product 컨트롤러처럼 리터럴 `"X-User-Id"` 로 쓴다. v1.1 의 `UserIdHeader` 상수 클래스는 제거 (v1.2).
+- 경로 변수는 `{dropId:\d+}` 정규식으로 받는다 (queue 와 같음). 숫자가 아니면 404 `COMMON_NOT_FOUND`.
 
-**`EntryExceptionHandler`**: application 에러 코드 → HTTP. 0단계의 `GlobalExceptionHandler` 형식을 따른다.
-```java
-package com.queuedrop.entry.presentation.advice;
-
-@RestControllerAdvice
-class EntryExceptionHandler {
-
-    @ExceptionHandler(EntryApplyException.class)
-    ResponseEntity<ErrorResponse> handle(EntryApplyException e) {
-        EntryErrorCode code = (EntryErrorCode) e.getErrorCode();
-        HttpStatus status = switch (code) {
-            case CLOSED, NO_TOKEN, DUPLICATE, SOLD_OUT -> HttpStatus.CONFLICT;      // 409
-            case TEMPORARILY_FAILED -> HttpStatus.SERVICE_UNAVAILABLE;               // 503
-            case ENTRY_NOT_FOUND -> HttpStatus.NOT_FOUND;                            // 404
-        };
-        return ResponseEntity.status(status).body(ErrorResponse.of(code));
-    }
-
-    @ExceptionHandler(MissingRequestHeaderException.class)
-    ResponseEntity<ErrorResponse> handleMissingUser(MissingRequestHeaderException e) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ErrorResponse.of("MISSING_USER_HEADER"));
-    }
-}
-```
-| 에러 코드 | HTTP | 응답 `code` |
-|-----------|------|-------------|
-| `CLOSED` | 409 | `CLOSED` |
-| `NO_TOKEN` | 409 | `NO_TOKEN` |
-| `DUPLICATE` | 409 | `DUPLICATE` |
-| `SOLD_OUT` | 409 | `SOLD_OUT` |
-| `TEMPORARILY_FAILED` | 503 | `ENTRY_TEMPORARILY_FAILED` (entry-apply.md 3장 표기와 맞춤) |
-| `ENTRY_NOT_FOUND` | 404 | `ENTRY_NOT_FOUND` **(구현 결정)** |
-| `X-User-Id` 누락 | 400 | `MISSING_USER_HEADER` **(구현 결정)**. Gateway 를 거치면 생길 수 없지만, 내부 직접 호출 대비 |
+**에러 응답**: 0단계 `GlobalExceptionHandler` 를 그대로 쓴다 (수정 없음, v1.2). 별도 `@RestControllerAdvice` 를 두지 않는다.
+| 원인 | HTTP | 응답 `code` |
+|------|------|-------------|
+| `ApplicationException(EntryErrorCode.CLOSED)` | 409 | `ENTRY_CLOSED` |
+| `ApplicationException(EntryErrorCode.NO_TOKEN)` | 409 | `ENTRY_NO_TOKEN` |
+| `ApplicationException(EntryErrorCode.DUPLICATE)` | 409 | `ENTRY_DUPLICATE` |
+| `ApplicationException(EntryErrorCode.SOLD_OUT)` | 409 | `ENTRY_SOLD_OUT` |
+| `ApplicationException(EntryErrorCode.TEMPORARILY_FAILED)` | 503 | `ENTRY_TEMPORARILY_FAILED` |
+| `ApplicationException(EntryErrorCode.NOT_FOUND)` | 404 | `ENTRY_NOT_FOUND` **(구현 결정)** |
+| `X-User-Id` 누락 | 400 | `COMMON_MISSING_USER_HEADER` (0단계 공통) |
+| 숫자가 아닌 `X-User-Id` | 400 | `COMMON_INVALID_INPUT` |
+- 응답 `message` 는 `ErrorCode.message()` 고정 문구다. 상태 코드는 `EntryErrorCode` 가 갖고, 핸들러는 `ErrorCode.status()` 만 본다.
 - `NO_TOKEN` 은 403 으로 볼 수도 있지만, 클라이언트 처리가 "대기열로 돌아가기" 라서 다른 409 사유와 함께 묶었다 **(구현 결정)**.
+- 표는 [entry-apply.md](../../design/05-features/entry-apply.md) 3장 에러 코드 표(v1.4)와 같다.
 
 ---
 
@@ -1244,7 +1278,7 @@ public class EntryCreatedListener {
 
     private final EntrySaveService entrySaveService;
 
-    @KafkaListener(id = "entry-saver", topics = Topics.ENTRY_CREATED)
+    @KafkaListener(id = "entry-saver", idIsGroup = false, topics = Topics.ENTRY_CREATED)
     public void on(EntryCreated message) {
         entrySaveService.save(new EntrySaveCommand(
                 message.dropId(), message.userId(), message.entrySeq(), message.appliedAt()));
@@ -1252,7 +1286,7 @@ public class EntryCreatedListener {
 }
 ```
 - 예외를 잡지 않는다. DB 장애 등은 `DefaultErrorHandler` 가 재시도 → DLT 로 보낸다.
-- 리스너 `id` 는 6장 유령 이벤트 테스트에서 컨테이너를 일시 정지(pause)하는 데 쓴다.
+- 리스너 `id` 는 4.4 유령 이벤트 테스트에서 컨테이너를 일시 정지(pause)하는 데 쓴다. `idIsGroup = false` 로 group-id 는 `entry-service` 그대로 둔다.
 - 배치 리스너 + bulk insert 는 이 단계에서 하지 않는다. 8단계 부하 테스트에서 DB 쓰기가 병목으로 확인되면 적용한다.
 
 ---
@@ -1304,7 +1338,7 @@ public class EntryQueryService {
                     if (entryGate.isApplicant(dropId, userId)) {
                         return MyEntryResult.pendingSave(dropId);     // 판정은 됐고 DB 저장 대기 중
                     }
-                    throw new EntryApplyException(EntryErrorCode.ENTRY_NOT_FOUND);
+                    throw new ApplicationException(EntryErrorCode.NOT_FOUND);
                 });
     }
 }
@@ -1318,13 +1352,12 @@ public class EntryQueryService {
 // EntryController 이어서
 
 @GetMapping("/me")
-public List<MyEntryResponse> myEntries(@RequestHeader(UserIdHeader.NAME) long userId) {
+public List<MyEntryResponse> myEntries(@RequestHeader("X-User-Id") Long userId) {
     return entryQueryService.myEntries(userId).stream().map(MyEntryResponse::from).toList();
 }
 
-@GetMapping("/drops/{dropId}/me")
-public MyEntryResponse myEntry(@PathVariable long dropId,
-                               @RequestHeader(UserIdHeader.NAME) long userId) {
+@GetMapping("/drops/{dropId:\\d+}/me")
+public MyEntryResponse myEntry(@RequestHeader("X-User-Id") Long userId, @PathVariable Long dropId) {
     return MyEntryResponse.from(entryQueryService.myEntry(dropId, userId));
 }
 
@@ -1338,6 +1371,7 @@ public record MyEntryResponse(long dropId, Integer entrySeq, String status, Inst
 ---
 
 ### 3.5 build.gradle (entry-service)
+0단계에서 만든 파일에 테스트 슬라이스 두 줄만 추가한다 (v1.2). Boot 4 는 슬라이스 어노테이션이 기술별 테스트 모듈로 나뉘어 있다 (queue·product 와 같음).
 ```groovy
 dependencies {
     implementation project(':common')
@@ -1345,16 +1379,19 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     runtimeOnly 'org.postgresql:postgresql'
+    implementation 'org.springframework.boot:spring-boot-starter-flyway'
+    implementation 'org.flywaydb:flyway-database-postgresql'
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
     implementation 'org.springframework.boot:spring-boot-starter-kafka'
-    // Flyway: 0단계에서 추가 (starter 이름은 Boot 4 기준 spring-boot-starter-flyway + flyway-database-postgresql, 구현 시 확인)
-
     testImplementation 'org.springframework.boot:spring-boot-starter-kafka-test'
-    testImplementation testFixtures(project(':common'))      // ArchUnit 규칙, Testcontainers 지원
-    testImplementation 'org.awaitility:awaitility'            // Boot BOM 관리 버전 (구현 시 확인)
-    // Testcontainers(postgresql, kafka, redis): 0단계에서 루트에 추가
+    testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'      // @WebMvcTest (0단계)
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis-test'  // @DataRedisTest (v1.2 추가)
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa-test'    // @DataJpaTest (v1.2 추가)
 }
 ```
+- `testFixtures(project(':common'))`(ArchUnit `LayerRules`, `*ContainerConfig`)와 `spring-boot-starter-test` 는 루트 `build.gradle` 이 4계층 서비스에 일괄 추가한다 (0단계).
+- Awaitility 는 따로 추가하지 않는다. queue-service 가 같은 의존성 구성에서 `org.awaitility.Awaitility` 를 쓰고 있다.
+- 슬라이스 패키지: `org.springframework.boot.data.redis.test.autoconfigure.DataRedisTest`, `org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest`(+ `org.springframework.boot.jdbc.test.autoconfigure.AutoConfigureTestDatabase(replace = NONE)`), `org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest`.
 
 ---
 
@@ -1370,19 +1407,25 @@ dependencies {
 | `Clock.fixed(...)` | `Clock` | 고정 시각 |
 
 ### 4.2 테스트 목록
+> 통합 테스트 설정 (v1.2, 0~3단계 방식): 컨테이너는 `common` testFixtures 의 `PostgresContainerConfig`·`RedisContainerConfig`·`KafkaContainerConfig` 를 `@Import` 한다 (공통 상위 클래스 없음).
+> - Redis: `@DataRedisTest` + `@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisEntryGate.class})` (queue `RedisWaitingQueueRepositoryTest` 와 같음). `@BeforeEach` 에서 `FLUSHALL`.
+> - PostgreSQL: `@DataJpaTest` + `@AutoConfigureTestDatabase(replace = NONE)` + `@Import({PostgresContainerConfig.class, EntryRepositoryImpl.class, ...})` (product `DropRepositoryImplTest` 와 같음).
+> - Kafka·시나리오: `@SpringBootTest` + 필요한 `*ContainerConfig` `@Import`. 토픽은 테스트 `@TestConfiguration` 의 `NewTopic` 빈으로 리스너 기동 전에 만든다 (queue `DropCreatedListenerIntegrationTest` 와 같음, DLT 토픽 포함).
+> - 컨트롤러: `@WebMvcTest(EntryController.class)` + `@Import(GlobalExceptionHandler.class)` + `@MockitoBean` 서비스 (queue `QueueControllerTest` 와 같음).
+
 | ID | 계층/종류 | 테스트 클래스 | 시나리오 (Given / When / Then) | 관련 |
 |----|-----------|---------------|-------------------------------|------|
 | T4-01 | domain 단위 | `EntryTest` | G: 정상 값 / W: `Entry.apply` / T: status=APPLIED, id=null. G: entrySeq=0 / T: `DomainException` | REQ-ENTRY-01 |
-| T4-02 | domain 단위 | `DropSnapshotTest` | G: capacity < winner, winner=0, openAt ≥ closeAt / W: `register` / T: 각각 `DomainException`. 정상 값 → status=OPEN | REQ-DROP-02 |
+| T4-02 | domain 단위 | `DropSnapshotTest` | G: capacity < winner, winner=0, openAt ≥ closeAt, dropId·openAt·closeAt null(v1.2) / W: `register` / T: 각각 `DomainException`. 정상 값 → status=OPEN | REQ-DROP-02 |
 | T4-03 | application 단위 | `EntryApplyServiceTest` | G: Gate 가 OK(seq=7) / W: apply / T: 결과 seq=7, 발행 payload 1건(dropId, userId, seq=7, appliedAt=고정 시각), 보상 호출 0 | REQ-ENTRY-01 |
-| T4-04 | application 단위 | `EntryApplyServiceTest` (`@ParameterizedTest`) | G: Gate 가 CLOSED / NO_TOKEN / DUPLICATE / SOLD_OUT / W: apply / T: 같은 이름의 `EntryErrorCode` 예외, 발행 0, 보상 0 | REQ-ENTRY-02, 03 |
+| T4-04 | application 단위 | `EntryApplyServiceTest` (`@ParameterizedTest`) | G: Gate 가 CLOSED / NO_TOKEN / DUPLICATE / SOLD_OUT / W: apply / T: `ApplicationException` 의 `errorCode()` 가 같은 이름의 `EntryErrorCode`, 발행 0, 보상 0 | REQ-ENTRY-02, 03 |
 | T4-05 | application 단위 | `EntryApplyServiceTest` | G: Gate OK, Publisher `failNext()` / W: apply / T: `TEMPORARILY_FAILED`, 보상 호출 1 (같은 dropId, userId) | NFR-03 |
 | T4-06 | application 단위 | `EntryApplyServiceTest` | G: 발행 실패 + 보상도 예외 / W: apply / T: 여전히 `TEMPORARILY_FAILED` (보상 예외가 원래 예외를 가리지 않음) | NFR-03 |
 | T4-07 | application 단위 | `EntrySaveServiceTest` | G: Gate 응모자에 없음 / W: save / T: 저장소 0건 (유령 이벤트 무시) | NFR-03 |
 | T4-08 | application 단위 | `EntrySaveServiceTest` | G: 응모자에 있음 / W: save 2번 / T: 저장소 1건, 예외 없음 | NFR-02 |
-| T4-09 | application 단위 | `DropSnapshotRegisterServiceTest` | G: 이미 저장된 스냅샷 / W: register / T: 저장소 그대로, Gate.initialize 는 호출됨 (Redis 쪽 복구 기회). G: 잘못된 값 / T: `InvalidDropSnapshotException` | REQ-DROP-02 |
-| T4-10 | application 단위 | `EntryQueryServiceTest` | G: DB 없음 + Gate 응모자 / T: status=APPLIED, entrySeq=null. G: 둘 다 없음 / T: `ENTRY_NOT_FOUND`. G: DB 있음 / T: DB 값 | REQ-ENTRY-06 |
-| T4-11 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 초기화(정원 3), 토큰 있음 / W: tryApply / T: OK(seq=1), remaining=2, applicants 에 userId | REQ-ENTRY-01, 02 |
+| T4-09 | application 단위 | `DropSnapshotRegisterServiceTest` | G: 이미 저장된 스냅샷 / W: register / T: 저장소 그대로, Gate.initialize 는 호출됨 (Redis 쪽 복구 기회). G: 잘못된 값(capacity < winner, null 필드) / W: register / T: **예외 없이 스킵** — 저장소 0건, Gate.initialize 호출 0 (v1.2, queue `QueueMetaRegisterServiceTest` 와 같은 방식) | REQ-DROP-02 |
+| T4-10 | application 단위 | `EntryQueryServiceTest` | G: DB 없음 + Gate 응모자 / T: status=APPLIED, entrySeq=null. G: 둘 다 없음 / T: `ApplicationException(EntryErrorCode.NOT_FOUND)`. G: DB 있음 / T: DB 값 | REQ-ENTRY-06 |
+| T4-11 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 초기화(정원 3), 토큰 있음 / W: tryApply / T: OK(seq=1, Java 타입 `Long` → int), `GET remaining` = `"2"`(10진 정수 문자열, queue 계약), applicants 에 userId | REQ-ENTRY-01, 02 |
 | T4-12 | infra 통합 (Redis) | `RedisEntryGateTest` | CLOSED 4가지: meta 없음 / state=CLOSED / now = openAt-1ms / now = closeAt (정각). 반대로 now = openAt (정각) → OK | REQ-ENTRY-02 |
 | T4-13 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 토큰 키 없음 / T: NO_TOKEN, remaining 변화 없음 | REQ-QUEUE-06 |
 | T4-14 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 이미 응모 / T: DUPLICATE, remaining·seq 변화 없음 | REQ-ENTRY-03 |
@@ -1395,8 +1438,8 @@ dependencies {
 | T4-21 | infra 통합 (PostgreSQL) | `EntryRepositoryImplTest` | 조회 매핑: 저장 → `findByDropIdAndUserId` 필드 일치, `findAllByUserId` 최신순 | REQ-ENTRY-06 |
 | T4-22 | infra 통합 (PostgreSQL) | `DropSnapshotRepositoryImplTest` | 같은 dropId 2번 저장 → 두 번째 false, 첫 값 유지 | REQ-DROP-02 |
 | T4-23 | infra 통합 (Kafka) | `KafkaEntryEventPublisherTest` | W: publishCreated / T: `entry.created` 에 key=`{dropId}:{userId}`, 메시지 필드 일치 (테스트 컨슈머로 수신) | NFR-01 |
-| T4-24 | infra 통합 (Kafka) | `KafkaEntryEventPublisherTest` | G: Kafka 컨테이너 정지 / W: publishCreated / T: 4초 안에 `EventPublishException` | NFR-03 |
-| T4-25 | presentation 슬라이스 | `EntryControllerTest` (`@WebMvcTest`) | 202 + `{"entrySeq":7}` / 에러 코드별 409·503·404 + code 값 / `X-User-Id` 없음 → 400 | REQ-ENTRY-01, 06 |
+| T4-24 | infra 통합 (Kafka) | `KafkaEntryEventPublisherTest` | G: Kafka 컨테이너 정지 / W: publishCreated / T: 5초 안에 `EventPublishException` (최악 `max.block.ms` 1초 + `get` 3.5초) | NFR-03 |
+| T4-25 | presentation 슬라이스 | `EntryControllerTest` (`@WebMvcTest`) | 202 + `{"entrySeq":7}` / `ApplicationException(EntryErrorCode.*)` 각 코드 → 409·503·404 + `code`(`ENTRY_*`)·고정 `message` / `X-User-Id` 없음 → 400 `COMMON_MISSING_USER_HEADER` / 숫자 아닌 dropId → 404 | REQ-ENTRY-01, 06 |
 | T4-26 | presentation 통합 | `EntryCreatedListenerTest` | G: 응모자 등록 / W: 같은 `EntryCreated` 2번 발행 / T: Awaitility 로 DB 1건 유지 확인 | NFR-02 |
 | T4-27 | 구조 | `ArchitectureTest` | R1~R7 통과. 특히 `presentation` 이 `domain` 을 import 하지 않음, `EntryApplyService` 시그니처에 domain 타입 없음 | 설계 |
 | T4-28 | **시나리오 (동시성)** | `EntryConcurrencyTest` | G: 정원 100, 사용자 1,000명 모두 토큰 보유 / W: 동시 응모 / T: 성공 정확히 100, SOLD_OUT 900, Redis remaining=0, SCARD=100, **seq 100개 모두 다름**, 최종 DB 100건 | NFR-01 |
@@ -1404,13 +1447,18 @@ dependencies {
 | T4-30 | 시나리오 (보상) | `EntryCompensationScenarioTest` | G: 발행 실패 Publisher 로 교체 / W: HTTP 응모 / T: 503 `ENTRY_TEMPORARILY_FAILED`, remaining·applicants 원상복구, 같은 사용자 재응모(정상 Publisher) → 202 | NFR-03 |
 | T4-31 | **시나리오 (유령 이벤트)** | `GhostEventScenarioTest` | 4.4 참고. T: DB 에 A 1건(seq=1), B 1건(seq=2), Redis SCARD=2 == DB 2 | NFR-03 |
 | T4-32 | 시나리오 (재수신) | `DropCreatedRedeliveryTest` | G: `drop.created` 처리 후 응모 30건 / W: 같은 `drop.created` 재발행 / T: remaining=70, drop_snapshots 1행 | REQ-DROP-02 |
+| T4-33 | 시나리오 (잘못된 메시지, v1.2) | `DropCreatedRedeliveryTest` | G: capacity < winner 인 `drop.created` / W: 발행 후 정상 `drop.created`(다른 dropId) 발행 / T: 정상 건은 처리됨(drop_snapshots·meta 생성), 잘못된 건은 drop_snapshots·Redis meta 없음, `drop.created.DLT` 수신 0 (재시도·DLT 없이 스킵) | REQ-DROP-02 |
+| T4-34 | presentation 통합 (DLT, v1.2) | `EntryCreatedListenerTest` | G: (drop 1, user 1, seq 1) DB 저장, user 2 를 Redis 응모자로 등록 / W: `EntryCreated(drop 1, user 2, seq 1)` 발행 (seq 충돌 → `DataIntegrityViolationException`) / T: 재시도 후 `entry.created.DLT` 에서 같은 key 의 레코드 수신, DB 는 1건 그대로 | 6.1 ③ |
+| T4-35 | application 단위 (v1.2) | `EntryErrorCodeTest` | `from(ApplyOutcome)` 4가지 매핑, `from(OK)` → `IllegalArgumentException`, 각 코드의 `code()`=`ENTRY_*`·`status()` 가 entry-apply.md 3장 표와 일치 | 설계 |
 
 ### 4.3 동시성 테스트 스케치 (T4-28, T4-29)
 application 서비스를 직접 호출한다. HTTP 를 거치면 톰캣 스레드 풀이 동시성을 제한해서 "동시" 요청이 줄어든다. HTTP 경로는 8단계 부하 테스트에서 본다.
 
 ```java
 @SpringBootTest
-class EntryConcurrencyTest extends IntegrationTestSupport {      // 0단계: Testcontainers 지원 클래스
+@Import({PostgresContainerConfig.class, RedisContainerConfig.class, KafkaContainerConfig.class,
+         EntryConcurrencyTest.TopicConfig.class})                // 0단계 testFixtures. TopicConfig: entry.created 등 NewTopic
+class EntryConcurrencyTest {
 
     @Autowired EntryApplyService entryApplyService;
     @Autowired StringRedisTemplate redis;
@@ -1440,8 +1488,8 @@ class EntryConcurrencyTest extends IntegrationTestSupport {      // 0단계: Tes
                         EntryApplyResult r = entryApplyService.apply(new EntryApplyCommand(dropId, userId));
                         success.incrementAndGet();
                         seqs.add(r.entrySeq());
-                    } catch (EntryApplyException e) {
-                        failures.computeIfAbsent((EntryErrorCode) e.getErrorCode(), k -> new AtomicInteger())
+                    } catch (ApplicationException e) {
+                        failures.computeIfAbsent((EntryErrorCode) e.errorCode(), k -> new AtomicInteger())
                                 .incrementAndGet();
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
@@ -1516,31 +1564,33 @@ class AckLostEntryEventPublisher implements EntryEventPublisher {
 
 ## 5. 커밋 계획
 
-| # | 커밋 메시지 | 포함 내용 |
-|---|-------------|-----------|
-| 1 | `feat(entry): 응모·드로우 스냅샷 테이블 마이그레이션 추가` | `V1__create_entry_tables.sql`, `ddl-auto: validate` |
-| 2 | `feat(entry): 응모·드로우 스냅샷 도메인 모델 추가` | `Entry`, `EntryStatus`, `ApplyOutcome`, `DropSnapshot`, `SnapshotStatus`, Repository 인터페이스, T4-01·02 |
-| 3 | `feat(entry): 응모 유스케이스와 포트 정의` | Command/Result, `EntryGate`, `EntryEventPublisher`, 에러 코드, `EntryApplyService`, Fake 포트, T4-03~06 |
-| 4 | `feat(entry): Redis Lua 기반 응모 게이트 구현` | Lua 3종, `EntryScripts`, `RedisEntryGate`, `EntryRedisKeys`, T4-11~18 |
-| 5 | `feat(entry): Kafka 응모 이벤트 발행 구현` | `KafkaEntryEventPublisher`, producer 설정, T4-23·24 |
-| 6 | `feat(entry): 응모 API 추가` | `EntryController`(apply), Response, `EntryExceptionHandler`, T4-25(apply 부분) |
-| 7 | `feat(entry): 드로우 생성 이벤트 수신 및 응모 초기화` | `DropSnapshotRegisterService`, JPA(스냅샷), `DropCreatedListener`, T4-09·22·32 |
-| 8 | `feat(entry): 응모 이벤트 저장 컨슈머 구현` | `EntrySaveService`, JPA(응모), `EntryCreatedListener`, consumer 설정·에러 핸들러, T4-07·08·19~21·26 |
-| 9 | `feat(entry): 내 응모 조회 API 추가` | `EntryQueryService`, 조회 API, T4-10·25(조회 부분) |
-| 10 | `test(entry): 응모 동시성·보상·유령 이벤트 시나리오 테스트` | T4-28~31, `ArchitectureTest`(T4-27) 확인 |
-| 11 | `docs: 4단계 구현 결과 반영` | 6장 "설계 수정 필요" 항목을 설계 문서에 반영, 플랜 진행 현황 갱신 |
+> v1.2: 3단계와 같이 TDD 사이클(장원영 Red → 고윤정 Green) 단위로, 테스트와 구현을 한 커밋에 넣는다. 4단계부터는 **사이클마다 신민아 검증** (CLAUDE.md). 6.2 설계 수정은 모두 반영 완료 상태라 설계 문서 선행 커밋은 없다.
 
-커밋 본문 예시 (#4)
+| # | 커밋 단위 | 커밋 메시지 | 테스트 ID |
+|---|-----------|-------------|-----------|
+| 1 | domain | `feat(entry): 응모·드로우 스냅샷 도메인 모델과 저장소 포트 추가`<br>- Entry, EntryStatus, ApplyOutcome, DropSnapshot(null·불변식 검증), SnapshotStatus, DomainException<br>- EntryRepository, DropSnapshotRepository | T4-01, 02 |
+| 2 | application 응모 | `feat(entry): 응모 유스케이스와 Redis·Kafka 포트 추가`<br>- EntryApplyCommand/Result, EntryGate·GateResult, EntryEventPublisher·EntryCreatedPayload·EventPublishException<br>- EntryErrorCode(ErrorCode 구현, from(ApplyOutcome)), EntryApplyService(판정 → 발행 → 실패 시 보상), ClockConfig | T4-03~06, 35 |
+| 3 | application 저장·수신·조회 | `feat(entry): 응모 저장·드로우 스냅샷 등록·내 응모 조회 유스케이스 추가`<br>- EntrySaveService(저장 전 isApplicant 확인), DropSnapshotRegisterService(잘못된 메시지 스킵), EntryQueryService(단건만 Redis 보완) | T4-07~10 |
+| 4 | infrastructure DB | `feat(entry): 응모·드로우 스냅샷 테이블과 JPA 저장소 추가`<br>- V1__create_entry_tables.sql<br>- JPA 엔티티·Mapper·RepositoryImpl (INSERT ... ON CONFLICT DO NOTHING)<br>- build.gradle: data-jpa-test | T4-19~22 (+ T0-03 `ApplicationContextTest` 통과 유지) |
+| 5 | infrastructure Redis | `feat(entry): Redis Lua 기반 응모 게이트 추가`<br>- entry-initialize/apply/compensate.lua, RedisScriptConfig, EntryRedisKeys, RedisEntryGate<br>- build.gradle: data-redis-test, application.yml: redis timeout | T4-11~18 |
+| 6 | infrastructure Kafka | `feat(entry): entry.created 동기 발행 어댑터 추가`<br>- KafkaEntryEventPublisher (get 3.5초, 실패 → EventPublishException), application.yml: linger.ms·await-timeout | T4-23, 24 |
+| 7 | presentation API | `feat(entry): 응모·내 응모 조회 API 추가`<br>- EntryController(POST 202, GET 2종), Response | T4-25 |
+| 8 | presentation 리스너 | `feat(entry): drop.created·entry.created 리스너와 DLT 에러 핸들러 추가`<br>- DropCreatedListener, EntryCreatedListener (idIsGroup=false), KafkaConsumerConfig(3회 재시도 → DLT), application.yml: listener | T4-26, 32, 33, 34 |
+| 9 | 시나리오 | `test(entry): 응모 동시성·보상·유령 이벤트 시나리오 테스트 추가` | T4-27~31 |
+| 10 | 검증 반영 | `fix(entry): ...` (신민아·한지민 지적 중 명백한 버그가 있을 때만) | — |
+| 11 | 문서 | `docs: 4단계 완료 표시` (플랜 진행 현황, 체크리스트, 백로그 처리 결과) | — |
+
+커밋 본문 예시 (#5)
 ```
-feat(entry): Redis Lua 기반 응모 게이트 구현
+feat(entry): Redis Lua 기반 응모 게이트 추가
 
 - entry-apply.lua: 마감·토큰·중복·잔여 검사 후 DECR + SADD + INCR seq 원자 실행
 - entry-compensate.lua: SREM 성공 시에만 INCR remaining (중복 보상 안전, seq 유지)
 - entry-initialize.lua: meta 가 없을 때만 초기화 (drop.created 재수신 대비)
-- RedisEntryGate: EntryGate 포트 구현
-```
+- RedisEntryGate: EntryGate 포트 구현. remaining 은 정수 문자열 (queue admit.lua 가 읽음)
 
-> 11번은 순서상 마지막이지만, 6장의 설계 수정은 **해당 코드를 커밋하기 전에** 설계 문서부터 고치는 게 원칙이다 (플랜 1.1). 실제로는 #3 전에 설계 문서 수정 커밋을 먼저 넣는 걸 권장한다.
+Co-Authored-By: ...
+```
 
 ---
 
@@ -1551,7 +1601,9 @@ feat(entry): Redis Lua 기반 응모 게이트 구현
 |---|------|------|
 | ① | 컨슈머 저장 전 Redis 응모자 확인 | **확정 (2026-11-16 사용자 승인)**. `EntrySaveService` 에서 `isApplicant` 확인 후 없으면 저장하지 않음 |
 | ② | Kafka 동기 발행 정책 | **확정 (2026-11-16)**. 애플리케이션 재시도 없음, producer 내부 재시도 + `request.timeout.ms=1000`, `delivery.timeout.ms=3000`, `get` 대기 3.5초. 쿠폰(6단계)도 같은 정책 |
-| ③ | 저장 컨슈머 실패 처리 | **확정 (2026-11-16)**. 3회 재시도 후 `{topic}.DLT` |
+| ③ | 저장 컨슈머 실패 처리 | **확정 (2026-11-16)**. 3회 재시도 후 `{topic}.DLT`. 단, 도메인 불변식을 어긴 `drop.created` 는 재시도해도 결과가 같으므로 application 이 로그 후 스킵한다 (v1.2, queue 와 같은 방식) |
+| ④ | E-34 입장 인원과 잔여 정원 | **확정 (사용자 결정 2026-11-16)**. queue 입장은 잔여 정원과 무관하게 **주기당 N명 유지** (`admit.lua` 변경 없음). 소진 직전 초과 입장자는 이 단계 Lua 가 `SOLD_OUT` 으로 거절한다(정합성 영향 없음). 8단계 부하 테스트에서 소진 직전 `SOLD_OUT` 응답 수를 관찰한다 |
+| ⑤ | E-39 Redis Cluster 대비 키 설계 | **확정 (사용자 결정 2026-11-16)**. **단일 Redis 유지, 해시 태그 미적용**. 응모 Lua 가 queue 토큰 키를 KEYS 로 선언해 읽는 현재 형태를 유지한다. Cluster 전환 시 재설계 범위는 백로그 E-39 (해시 태그 또는 토큰 Hash + `HEXPIRE`) |
 
 ### 6.2 설계 수정 필요 (구현 전에 설계 문서부터 고침)
 | # | 대상 문서 | 현재 | 변경 |
@@ -1561,7 +1613,8 @@ feat(entry): Redis Lua 기반 응모 게이트 구현
 | ③ | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.1 | `EntryRepository.save(Entry) Entry`, `existsByDropIdAndUserId` | `saveIfAbsent(Entry) boolean`, `findByDropIdAndUserId`, `findAllByUserId` → 설계 반영 완료 (2026-11-16) |
 | ④ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장 API 설명 | "조회 API 는 DB 에 없으면 Redis 로 보완" | **단건 조회(`/drops/{dropId}/me`)만** 보완. 목록(`/me`)은 DB 만 → 설계 반영 완료 (2026-11-16) |
 | ⑤ | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 3장 | `DropCreated` 에 `productId` 없음 | [architecture.md](../../design/02-architecture/architecture.md) 4장 페이로드에는 있음 → 둘 중 하나로 통일 (entry 는 쓰지 않으므로 어느 쪽이든 무방, ranking·queue 확인 필요) → 설계 반영 완료 (2026-11-16) |
-| ⑥ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 4.5 | 에러 코드 5개 | `ENTRY_NOT_FOUND`(404), `MISSING_USER_HEADER`(400), `InvalidDropSnapshotException` 추가 → 설계 반영 완료 (2026-11-16) |
+| ⑥ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 4.5 | 에러 코드 5개 | `ENTRY_NOT_FOUND`(404), `COMMON_MISSING_USER_HEADER`(400) 추가 → 설계 반영 완료 (2026-11-16, 코드 명명은 0단계 entry-apply v1.4). `InvalidDropSnapshotException` 은 ⑦ 로 대체 |
+| ⑦ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 4.5, [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.1·1.3 | 잘못된 `drop.created` → `InvalidDropSnapshotException` → 리스너 재시도 후 `drop.created.DLT`. 실패 응답은 `EntryApplyException` + 별도 `@RestControllerAdvice` | 잘못된 `drop.created` 는 application 이 `DomainException` 을 잡아 로그·스킵 (queue 와 같음). 실패 응답은 `ApplicationException(EntryErrorCode)` + `GlobalExceptionHandler` → 설계 반영 완료 (2026-11-16, v1.2) |
 
 ### 6.3 리스크
 | 리스크 | 영향 | 대응 |
@@ -1570,11 +1623,12 @@ feat(entry): Redis Lua 기반 응모 게이트 구현
 | `TimeoutException` 후 뒤늦은 기록 (유령 이벤트) | 보상된 응모가 Kafka 에 남음 | 저장 전 `isApplicant` 확인 + seq 카운터 (T4-31 로 검증) |
 | 보상 Lua 실패 | 정원 한 자리가 영구히 비어 있음 (언더 응모) | 로그 알림. 정합성 위반은 아님 (D2) |
 | Redis 재시작 시 데이터 유실 | 오버 응모 가능 | 0단계의 AOF everysec. 최대 1초 유실 가능성은 남음 |
-| Redis Cluster 미지원 | 키가 `{}` 해시태그 없이 여러 슬롯에 흩어져 Lua 다중 키 실행 불가 | 현재 단일 인스턴스 전제. 클러스터 전환 시 키를 `entry:{42}:meta` 형태의 해시태그로 바꾸고 queue 토큰 키도 같은 태그를 쓰게 해야 함 |
+| Redis Cluster 미지원 | 키가 해시태그 없이 여러 슬롯에 흩어져 Lua 다중 키 실행 불가 | 단일 Redis 전제 유지 (6.1 ⑤ 사용자 결정). Cluster 전환 시 백로그 E-39 대로 queue·entry 키를 함께 재설계 |
+| 소진 직전 초과 입장 (E-34) | 잔여 정원보다 많은 토큰 보유자가 응모해 `SOLD_OUT` 응답이 몰림 | 정합성은 응모 Lua 가 지킴. 8단계에서 `SOLD_OUT` 응답 수 관찰 (6.1 ④) |
 | 서버 시계 차이 | 인스턴스마다 `now` 가 달라 마감 경계에서 판정이 조금씩 다를 수 있음 | 판정은 Redis 한 곳에서 하므로 결과가 갈리진 않음. 서버 NTP 동기화 전제 |
 | `drop.created` 전파 지연 | 오픈 직후 `CLOSED` 응답 | 드로우 등록 시 `openAt` 최소 1분 이후 검증 (2단계 확정 규칙) |
-| queue 토큰 키 형식 의존 | queue 가 키 형식을 바꾸면 응모가 전부 `NO_TOKEN` | `EntryRedisKeys.queueToken` 주석 + 4단계 E2E(5단계)에서 실제 queue 와 함께 검증 |
-| Spring Kafka 4 JSON 직렬화 클래스 변경 | 설정 오류로 기동 실패 | 구현 시 확인 (3.0 참고) |
+| queue 토큰 키 형식 의존 | queue 가 키 형식을 바꾸면 응모가 전부 `NO_TOKEN` | `EntryRedisKeys.queueToken` 주석(= `QueueKeys.token`) + 단계 종료 시 로컬 compose 에서 실제 queue 와 함께 진입 → 입장 → 응모 확인 |
+| `entry:{dropId}:remaining` 형식 의존 (역방향) | entry 가 정수가 아닌 값을 쓰면 queue `admit.lua`·`RedisRemainingCapacityReader` 가 깨짐 | `SET`/`DECR`/`INCR` 만 사용, T4-11 에서 정수 문자열 확인 (3.0 키 계약 표) |
 
 ---
 
@@ -1590,10 +1644,12 @@ feat(entry): Redis Lua 기반 응모 게이트 구현
 | 유령 이벤트 시나리오 → DB 에 A, B 모두 1건씩 | T4-17, T4-31 |
 | 같은 이벤트 재전달 → DB 1건 유지 | T4-08, T4-19, T4-26 |
 | `drop.created` 재수신 → 잔여 정원 덮어쓰기 없음 | T4-18, T4-22, T4-32 |
+| (v1.2) 잘못된 `drop.created` → 스킵, 저장 실패 → `entry.created.DLT` | T4-09, T4-33, T4-34 |
 
 ### 공통 완료 조건
 - [ ] `./gradlew :entry-service:build` 통과 (T4-27 ArchUnit 포함)
 - [ ] API 3개가 [entry-apply.md](../../design/05-features/entry-apply.md) API 표와 일치 (경로, 202, 에러 코드)
-- [ ] 6.2 "설계 수정 필요" ①~⑥ 설계 문서 반영 + 변경 이력 추가
+- [x] 6.2 "설계 수정 필요" ①~⑦ 설계 문서 반영 + 변경 이력 추가 (2026-11-16)
+- [ ] 단계 종료 시 로컬 compose 에서 드로우 등록 → 대기열 진입 → 입장 → 응모 202 → 내 응모 조회 확인 (queue 키 계약 실검증)
 - [x] 6.1 결정 ① 을 플랜 4장 "미결정 사항" 표와 설계 README "확인 필요" 에서 확정으로 갱신 (2026-11-16)
 - [ ] 플랜 진행 현황에서 4단계 ✅

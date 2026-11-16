@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-16 | entrySeq 발급을 잔여 정원 계산에서 별도 INCR 카운터로 변경 (보상 후 번호 재사용으로 인한 응모 누락 방지) | NFR-03 |
 | v1.3 | 2026-11-16 | 발행 재시도를 producer 내부 멱등 재시도로 변경, 저장 전 Redis 확인 확정, 저장 방식(ON CONFLICT)·DLT, 조회 보완 범위(단건만), 에러 코드 추가, meta 없음 → CLOSED | phase-4 구현 상세 6장 |
 | v1.4 | 2026-11-16 | 에러 코드 표를 명명 규칙 `{SERVICE}_{REASON}` 에 맞춤 (`ENTRY_*`, `COMMON_MISSING_USER_HEADER`). 판정 결과 `ApplyOutcome` 값 이름은 그대로 | layered-architecture.md 4.5 v1.3 |
+| v1.5 | 2026-11-16 | 도메인 불변식을 어긴 `drop.created` 는 재시도·DLT 없이 application 이 로그 후 스킵 (`InvalidDropSnapshotException` 제거, queue 와 같은 방식). 실패 응답은 `ApplicationException(EntryErrorCode)` + `GlobalExceptionHandler` | phase-4 구현 상세 v1.2 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-ENTRY-01: 입장 토큰으로 응모
@@ -77,7 +78,8 @@
 | `ENTRY_NOT_FOUND` | 404 | 단건 조회 시 DB·Redis 모두 없음 |
 | `COMMON_MISSING_USER_HEADER` | 400 | `X-User-Id` 누락 (Gateway 우회 등) |
 
-- `drop.created` 의 데이터가 도메인 불변식을 어기면(예: M < K) application 이 `InvalidDropSnapshotException` 으로 바꿔 던지고, 리스너 재시도 후 `drop.created.DLT` 로 간다.
+- 실패는 `ApplicationException(EntryErrorCode.*)` 로 던지고 서비스 공통 `GlobalExceptionHandler` 가 위 표대로 매핑한다 (상태 코드는 `EntryErrorCode` 가 보유).
+- `drop.created` 의 데이터가 도메인 불변식을 어기면(예: M < K, 필수 값 누락) application 이 `DomainException` 을 잡아 warn 로그를 남기고 **스킵**한다. 재시도해도 결과가 같으므로 재시도·DLT 로 보내지 않는다 (queue 와 같은 방식). DB·Redis 장애는 3회 재시도 후 `drop.created.DLT`.
 
 ## 4. 설계 결정
 | 결정점 | 선택 | 이유 / 포기한 것 |

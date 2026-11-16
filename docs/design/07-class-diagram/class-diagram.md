@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 | 전체 |
 | v2.0 | 2026-11-16 | 4계층 + 엄격한 DIP + 모델 비노출 원칙으로 전면 재작성 (도메인/JPA 엔티티 분리, 포트 위치 확정) | [layered-architecture.md](../02-architecture/layered-architecture.md) |
 | v2.1 | 2026-11-16 | 단계별 구현 상세에서 구체화된 클래스·포트·메서드 반영 (EntryRepository.saveIfAbsent, DrawTransaction·SeedGenerator·DrawOutcome, DropPage·Requester, queue 포트, CouponGate, DropWindow, user·gateway 클래스), DropCreated.productId 추가, 발행 어댑터 afterCommit 구조 | phase-0~7 구현 상세 6장 |
+| v2.2 | 2026-11-16 | 1.1 실패 응답을 `ApplicationException(EntryErrorCode)` + `GlobalExceptionHandler` 로, 1.3 잘못된 `drop.created` 는 application 이 로그 후 스킵(`InvalidDropSnapshotException` 제거) | phase-4 구현 상세 v1.2 |
 
 ## 쉬운 설명
 > 각 서비스는 창구(presentation) → 매니저(application) → 장인(domain) 순서로 일을 넘기고,
@@ -149,7 +150,7 @@ classDiagram
 - `EntryController` 는 `EntryApplyService` 와 Command/Result 만 안다. **domain 네임스페이스로 가는 화살표가 presentation 에 하나도 없다** (모델 비노출, ArchUnit R4).
 - `EntryApplyService`(응답 경로)는 domain 의 `EntryRepository` 를 쓰지 않는다 — 응답 경로에서 DB 를 뺀 설계([D1](../04-non-functional/concurrency-consistency.md))가 의존 그래프에 그대로 드러난다.
 - `EntrySaveService` 는 저장 전에 `EntryGate.isApplicant()` 로 보상된 응모를 걸러내고(확정), `saveIfAbsent()` 로 멱등 저장한다 ([sequence-diagram.md](../08-sequence-diagram/sequence-diagram.md) 5.2). `EntrySaveService` 에는 `@Transactional` 을 두지 않는다 — 단일 `INSERT ... ON CONFLICT DO NOTHING` 이라 필요 없고, 예외 기반 중복 처리를 피한다.
-- 실패 응답은 application 예외(`EntryApplyException` + `EntryErrorCode`)로 나가고, presentation 의 `@RestControllerAdvice` 가 409/503 으로 매핑한다. `KafkaEntryEventPublisher` 는 `send().get(3.5s)` 실패를 포트 예외로 바꿔 던진다 (재시도는 producer 내부만).
+- 실패 응답은 `ApplicationException(EntryErrorCode.*)` 로 나가고, presentation 의 공통 `GlobalExceptionHandler` 가 `ErrorCode.status()`(409/503/404)로 매핑한다. `KafkaEntryEventPublisher` 는 `send().get(3.5s)` 실패를 포트 예외로 바꿔 던진다 (재시도는 producer 내부만).
 - infrastructure 의 네 클래스는 모두 **위쪽 인터페이스를 구현**하는 방향으로만 연결된다.
 
 ### 1.2 추첨 (Draw)
@@ -277,7 +278,7 @@ classDiagram
 | domain | `DropSnapshot`, `DropSnapshotRepository` (`saveIfAbsent`, `findById`) |
 | infrastructure | `DropSnapshotJpaEntity`, `DropSnapshotRepositoryImpl` (`ON CONFLICT DO NOTHING`), `RedisEntryGate.initialize()` (`entry-initialize.lua`: meta 가 없을 때만 초기화) |
 
-- 수신 데이터가 도메인 불변식을 어기면 application 이 `DomainException` 을 `InvalidDropSnapshotException` 으로 바꿔 던지고, 리스너 재시도 후 `drop.created.DLT` 로 간다.
+- 수신 데이터가 도메인 불변식을 어기면 application 이 `DomainException` 을 잡아 로그 후 스킵한다 (재시도·DLT 없음, queue 와 같음). DB·Redis 장애만 3회 재시도 후 `drop.created.DLT` 로 간다.
 
 ---
 

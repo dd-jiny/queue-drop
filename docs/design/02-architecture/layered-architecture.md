@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | application 의 `common.error` 의존 허용, 커밋 후 발행 규칙(발행 어댑터 내 afterCommit), 에러 계약 위치·추가 에러 코드, domain `exception` 패키지, R3 금지 목록 확장 | phase-0·2·4 구현 상세 6장 |
 | v1.2 | 2026-11-16 | R1 허용 목록에 `lombok..` 추가 (Lombok 생성 코드의 `@lombok.Generated` 가 바이트코드에 남는 것을 확인), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가 | phase-0 커밋 #4 |
 | v1.3 | 2026-11-16 | 4.5: `X-User-Id` 누락 코드 `COMMON_MISSING_USER_HEADER`(400) 로 공통화, 에러 코드 명명 규칙 `{SERVICE}_{REASON}`, 응답 메시지는 코드별 고정(도메인 상세 메시지는 로그만), 서비스 예외는 `ApplicationException` 상속·`GlobalExceptionHandler` 단일화 | phase-0 커밋 #7 |
+| v1.4 | 2026-11-16 | 4.5: 예시를 `ApplicationException(EntryErrorCode.SOLD_OUT)` 로 정정, 리스너 경로의 불변식 위반 메시지는 application 이 로그 후 스킵(재시도·DLT 없음)으로 변경 (`InvalidDropSnapshotException` 제거) | phase-4 구현 상세 v1.2 |
 
 ## 1. 쉬운 설명 (한눈에)
 > 가게로 비유하면 **창구(presentation)** 는 손님 말을 주문서로 옮겨 적고, **매니저(application)** 는 주문서를 보고 일을 지시하고,
@@ -96,10 +97,10 @@ flowchart LR
 - presentation 은 domain 을 볼 수 없으므로, domain 의 판정 결과(`ApplyOutcome.SOLD_OUT` 등)를 그대로 HTTP 로 매핑할 수 없다.
 - **에러 계약은 `common.error`** 에 순수 Java 로 둔다: `ErrorCode`(interface: code, HTTP 상태), `ApplicationException`, `ErrorResponse`(응답 바디 형식). 서비스별 에러 코드 enum 은 **application** 의 `application/exception` 에 두고 `ErrorCode` 를 구현한다.
 - **application 이 에러 코드를 정의**하고, 도메인 결과를 application 예외로 변환해 던진다.
-  - 예: `ApplyOutcome.SOLD_OUT` → `throw new EntryApplyException(EntryErrorCode.SOLD_OUT)`
+  - 예: `ApplyOutcome.SOLD_OUT` → `throw new ApplicationException(EntryErrorCode.SOLD_OUT)`
 - presentation 의 `@RestControllerAdvice` 가 application 예외 → HTTP 상태·응답 바디로 매핑한다.
 - domain 의 불변식 위반(예: `Drop` 생성 시 M < K)은 domain 예외(`DomainException`, 순수 Java, `domain/exception`)로 던지고, application 이 받아 에러 코드로 변환한다.
-  - 리스너 경로도 같다: 수신 메시지가 불변식을 어기면 application 이 예외를 변환해 던지고(예: `InvalidDropSnapshotException`), 리스너 재시도 후 DLT 로 간다.
+  - 리스너 경로는 다르다: 수신 메시지가 불변식을 어기면 재시도해도 결과가 같으므로 application 이 `DomainException` 을 잡아 warn 로그 후 **스킵**한다 (예: queue `QueueMetaRegisterService`, entry `DropSnapshotRegisterService`). 재시도·DLT 는 인프라 장애에만 적용된다.
 - `X-User-*` 헤더 누락(Gateway 우회 등)은 presentation 이 `COMMON_MISSING_USER_HEADER`(400) 로 처리한다 (`CommonErrorCode.MISSING_USER_HEADER`, 전 서비스 공통).
 - **에러 코드 명명 규칙**: 응답의 `code` 값은 `{SERVICE}_{REASON}` 대문자 스네이크 (예: `ENTRY_SOLD_OUT`, `USER_DUPLICATE_EMAIL`, 공통은 `COMMON_*`). enum 상수명은 접두어 없이 사유만 쓴다 (`EntryErrorCode.SOLD_OUT` → code `"ENTRY_SOLD_OUT"`).
 - **응답 메시지와 로그**: 응답 `message` 는 항상 `ErrorCode.message()`(코드별 고정 문구)다. `DomainException` 의 상세 메시지는 응답에 싣지 않고 `GlobalExceptionHandler` 가 로그로만 남긴다 — 5xx 는 error + 스택, 4xx 는 warn + 원인 메시지(스택 없음). 입력 형식 오류의 필드별 사유는 `fieldErrors` 로 전달한다. Spring MVC 표준 예외의 매핑은 phase-0 3.8 표를 따른다.

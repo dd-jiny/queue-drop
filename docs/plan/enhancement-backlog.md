@@ -512,6 +512,7 @@
 - **영향 범위**: (3) `RedisWaitingQueueRepository.saveMeta`·`findActiveDropIds`, `architecture.md` 5장 키 표
 
 ### E-34 잔여 정원과 무관하게 매 주기 N명에게 토큰 발급 — 소진 직전 대량 입장, 응모 완료자 재진입이 입장 슬롯을 씀
+- **처리**: 개선안 1 확정 (2026-11-16 사용자 결정) — 주기당 N명 유지. 8단계 부하 테스트에서 소진 직전 SOLD_OUT 응답 수만 관찰한다.
 - **구분**: 고도화 (설계 결정 사항, 4단계 연동 때 판단)
 - **단계/위치**: phase-3, `admit.lua:10-21` (관련: E-31)
 - **현상**:
@@ -588,6 +589,7 @@
 - **영향 범위**: `RedisSchedulerGate`, `RedisWaitingQueueRepository.admit`, (게이지) `admit.lua` 반환 형식, `phase-8-load-test.md` 3.2 메트릭 표
 
 ### E-39 키 설계·메모리와 Redis Cluster 비호환 — 현재 규모에서는 문제없음, Cluster 전환 시 재설계 범위
+- **처리**: 지금은 하지 않음 확정 (2026-11-16 사용자 결정) — 단일 Redis 전제 유지, 해시 태그 미적용. Cluster 전환 시 아래 개선안으로 재설계.
 - **구분**: 고도화 (현재 규모에서는 불필요, 문서화된 리스크의 구체화)
 - **단계/위치**: phase-3, `QueueKeys.java`, `admit.lua:19`(토큰 키를 스크립트 안에서 조합), `admit.lua:10`(entry 소유 키), 4단계 응모 Lua(`queue:{dropId}:token:{userId}` 를 entry Lua 가 읽음)
 - **현상·메모리**:
