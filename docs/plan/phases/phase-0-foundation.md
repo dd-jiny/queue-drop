@@ -5,6 +5,7 @@
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | Flyway 확정, 공통 producer 설정을 4단계 기준(request 1000 / delivery 3000)으로 통일, DLT 토픽 3종 추가, 설계 반영 완료 표시 |
+| v1.2 | 2026-11-16 | 라이브러리 확인 결과 반영: ArchUnit 1.5.1, Testcontainers 2.0.5 (`testcontainers-{module}` 아티팩트명 확인) |
 
 ---
 
@@ -86,7 +87,7 @@ plugins {
 
 ext {
     set('springCloudVersion', '2025.1.4')
-    set('archunitVersion', '1.3.0')   // 구현 시 최신 버전 확인
+    set('archunitVersion', '1.5.1')
 }
 
 allprojects {
@@ -161,7 +162,7 @@ dependencies {
 
     testFixturesApi 'org.springframework.boot:spring-boot-testcontainers'
     testFixturesApi 'org.springframework.boot:spring-boot-test'
-    testFixturesApi 'org.testcontainers:testcontainers-junit-jupiter'   // Testcontainers 2.x 아티팩트명, 구현 시 확인
+    testFixturesApi 'org.testcontainers:testcontainers-junit-jupiter'
     testFixturesApi 'org.testcontainers:testcontainers-postgresql'
     testFixturesApi 'org.testcontainers:testcontainers-kafka'
 }

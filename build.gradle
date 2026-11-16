@@ -5,6 +5,7 @@ plugins {
 
 ext {
     set('springCloudVersion', '2025.1.4')
+    set('archunitVersion', '1.5.1')
 }
 
 allprojects {
@@ -53,5 +54,15 @@ configure(subprojects.findAll { it.name != 'common' }) {
     dependencies {
         implementation 'org.springframework.boot:spring-boot-starter-actuator'
         testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    }
+}
+
+// 4계층 서비스: 공통 계층 규칙(ArchUnit)과 Testcontainers 지원을 test fixtures 로 공유
+def layeredServices = ['user-service', 'product-service', 'queue-service',
+                       'entry-service', 'coupon-service', 'ranking-service']
+
+configure(subprojects.findAll { it.name in layeredServices }) {
+    dependencies {
+        testImplementation testFixtures(project(':common'))
     }
 }
