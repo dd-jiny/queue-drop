@@ -4,6 +4,7 @@
 | 버전 | 날짜 | 변경 내용 | 관련 요구사항 |
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-ENTRY-01 ~ 04, 06 |
+| v1.1 | 2026-11-16 | 클래스 다이어그램을 4계층 구조로 이관 (class-diagram.md 참고) | layered-architecture.md |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-ENTRY-01: 입장 토큰으로 응모
@@ -125,56 +126,12 @@ sequenceDiagram
 - 저장 컨슈머와 랭킹 컨슈머는 서로 독립이다. 랭킹이 늦어도 응모 저장에는 영향이 없다.
 
 ### 5.3 클래스 다이어그램
-```mermaid
-classDiagram
-    class EntryController {
-        +apply(dropId, userId)
-        +myEntries(userId)
-    }
-    class EntryApplyService {
-        +apply(dropId, userId) EntryResult
-    }
-    class EntryRedisRepository {
-        +tryApply(dropId, userId, now) ApplyResult
-        +compensate(dropId, userId)
-        +isApplicant(dropId, userId) boolean
-    }
-    class EntryEventPublisher {
-        +publishCreated(EntryCreated)
-    }
-    class EntryCreatedConsumer {
-        +consume(EntryCreated)
-    }
-    class EntryRepository {
-        <<JPA>>
-    }
-    class Entry {
-        Long id
-        Long dropId
-        Long userId
-        int entrySeq
-        EntryStatus status
-        Instant appliedAt
-    }
-    class ApplyResult {
-        <<enum>>
-        OK
-        CLOSED
-        NO_TOKEN
-        DUPLICATE
-        SOLD_OUT
-    }
-    EntryController --> EntryApplyService
-    EntryApplyService --> EntryRedisRepository
-    EntryApplyService --> EntryEventPublisher
-    EntryCreatedConsumer --> EntryRepository
-    EntryRepository --> Entry
-    EntryRedisRepository ..> ApplyResult
-```
+4계층 구조의 상세 다이어그램은 [class-diagram.md](../07-class-diagram/class-diagram.md) 1.1 (응모) 참고.
 
-**읽는 법**
-- `EntryApplyService` 는 **DB 에 의존하지 않는다** — 응답 경로에서 DB 를 제거한 설계가 의존 방향에 그대로 드러난다.
-- DB 쓰기는 오직 `EntryCreatedConsumer` 에서만 일어난다 (쓰기 경로 단일화).
+**이 기능에서 봐야 할 포인트**
+- 응답 경로 `EntryController → EntryApplyService → EntryGate(Redis) / EntryEventPublisher(Kafka)` 에 **DB(EntryRepository) 가 없다**.
+- DB 쓰기는 `EntryCreatedListener → EntrySaveService → EntryRepository` 한 경로뿐이다 (쓰기 경로 단일화).
+- 판정 결과 `ApplyOutcome` 은 domain enum 이지만, presentation 은 이를 직접 보지 않고 application 예외의 에러 코드로 409 사유를 받는다.
 
 ### 5.4 ERD
 [erd.md](../06-erd/erd.md) 의 entry_db (`entries`) 참고.

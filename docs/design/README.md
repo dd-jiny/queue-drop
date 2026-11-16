@@ -8,7 +8,8 @@ docs/design/
 ├── 01-requirements/                   # 요구사항
 │   └── requirements.md
 ├── 02-architecture/                   # 아키텍처
-│   └── architecture.md
+│   ├── architecture.md                #   서비스 간 구조
+│   └── layered-architecture.md        #   서비스 내부 4계층 · DIP 규칙
 ├── 03-infrastructure/                 # 인프라
 │   └── infrastructure.md
 ├── 04-non-functional/                 # 비기능 결정 기록
@@ -36,6 +37,7 @@ docs/design/
 |------|------|------|----------------|
 | 요구사항 | [requirements.md](01-requirements/requirements.md) | 요구사항 정의서 (설계의 근거) | 전체 |
 | 아키텍처 | [architecture.md](02-architecture/architecture.md) | 서비스 책임, Kafka 토픽, Redis 키 소유권, 인증 | 전체, REQ-USER-* |
+| 아키텍처 | [layered-architecture.md](02-architecture/layered-architecture.md) | 4계층, 엄격한 DIP, 모델 비노출, 포트 위치, ArchUnit 규칙 | 전체 |
 | 인프라 | [infrastructure.md](03-infrastructure/infrastructure.md) | 기술 스택, docker-compose 구성, 환경변수, 변경 예정 사항 | NFR-01 ~ 03 |
 | 비기능 | [concurrency-consistency.md](04-non-functional/concurrency-consistency.md) | 동시성·정합성 결정 (D1~D7) | NFR-01 ~ 04 |
 | 기능 | [drop-register.md](05-features/drop-register.md) | 상품·드로우 등록, 이벤트 전파 | REQ-DROP-* |
@@ -45,7 +47,7 @@ docs/design/
 | 기능 | [coupon-issue.md](05-features/coupon-issue.md) | 선착순 쿠폰 발급 | REQ-COUPON-* |
 | 기능 | [ranking.md](05-features/ranking.md) | 인기 드로우 / 유저 활동 랭킹 | REQ-RANK-* |
 | ERD | [erd.md](06-erd/erd.md) | 서비스별 ERD | 전체 |
-| 클래스 | [class-diagram.md](07-class-diagram/class-diagram.md) | 서비스별 주요 클래스 | 전체 |
+| 클래스 | [class-diagram.md](07-class-diagram/class-diagram.md) | 서비스별 4계층 클래스 구조 | 전체 |
 | 시퀀스 | [sequence-diagram.md](08-sequence-diagram/sequence-diagram.md) | 인증, 드로우 전체 흐름, 쿠폰, 랭킹, 장애 시나리오 | 전체 |
 
 ## 전체 사용자 흐름
