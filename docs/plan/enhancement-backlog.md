@@ -337,3 +337,123 @@
   3. 관리자 재기동 검증은 두 번째 애플리케이션 대신 `AdminAccountInitializer.run()` 을 같은 컨텍스트에서 한 번 더 호출해 확인한다. 기동 1회가 빠지지만 "실제 재기동" 재현성은 떨어진다. 컨테이너 중복은 E-08 의 싱글턴 컨테이너로 해결한다.
 - **우선순위**: 낮음 — 지금 18초는 수용 가능하다. 4단계 `IntegrationTestSupport` 를 만들 때 1의 패턴을 정해 두면 비용이 가장 적다.
 - **영향 범위**: `SignupIntegrationTest`, `AdminBootstrapIntegrationTest`, phase-4·6 통합 테스트 작성 규칙
+
+---
+
+## phase-2 (드로우: product-service) 분석 — 2026-11-16
+
+분석 범위: `git diff dev...HEAD` (`feat/phase-2-drop`, 커밋 5개), 단계 문서 `phase-2-drop.md` v1.2, 5단계 `markDrawn` 경로(`phase-5-draw.md` 3.5).
+- **측정 환경**: 로컬 Docker `postgres:17` 임시 컨테이너(분석 후 삭제)에 `V1__create_products_and_drops.sql` 을 적용하고, 합성 데이터를 넣어 `EXPLAIN (ANALYZE, BUFFERS)` 를 1회씩 실행했다(워밍 캐시). 데이터: 1시간 간격 오픈·응모 2시간인 드로우 1만 건/10만 건, 기준 시각 기준 SCHEDULED 100, OPEN 2, CLOSED 6, 나머지 DRAWN(99% 이상). 쿼리는 Hibernate 가 만드는 형태(`order by open_at, id offset ? rows fetch first ? rows`, `select count(d.id) ...`)로 직접 썼다.
+- **재현 테스트**: E-25 는 저장소에 추가하지 않고 scratch 디렉터리의 테스트 소스를 Gradle init script 로 붙여 1회 실행했다(`DropRepositoryImpl` + Testcontainers Postgres).
+- 각 항목의 **구분**: "명백한 버그"(이번 단계에서 수정) / "고도화"(나중 단계).
+
+### E-25 큰 `page` 값이면 offset 이 `Integer.MAX_VALUE` 를 넘어 500 과 ERROR 스택 트레이스가 남음
+- **구분**: 명백한 버그 (장애 경로, 공개 API) — 이번 단계에서 수정
+- **처리**: ✅ 2단계에서 반영 (2026-11-16) — 개선안 채택: `page` 에 `@Max(10000)`(400 `COMMON_INVALID_INPUT`) + `DropRepositoryImpl` 에서 `(long) page*size > Integer.MAX_VALUE` 이면 빈 페이지(건수는 실제 값). 회귀 테스트: `DropControllerTest`·`DropRepositoryImplTest`.
+- **단계/위치**: phase-2, `DropController.java:47` (`@Min(0) int page`, 상한 없음), `DropRepositoryImpl.java:39`, `GlobalExceptionHandler.java:95-103` (관련: E-10)
+- **현상**: `page` 는 하한만 검증한다. `PageRequest.of(page, size)` 의 offset 은 `long`(page × size)이지만 Spring Data JPA 가 `Query.setFirstResult(int)` 로 넘기기 전에 `PageableUtils.getOffsetAsInteger` 에서 `InvalidDataAccessApiUsageException("Page offset exceeds Integer.MAX_VALUE")` 를 던진다. 이 예외는 `ErrorResponse` 구현체가 아니라서 catch-all 이 **500 + `log.error("unexpected error", e)`** 로 처리한다.
+- **문제/기회**: 인증 없는 공개 API 에 `?page=21474837&size=100` 같은 요청 하나로 500 을 만들 수 있다. 클라이언트 입력 오류인데 서버 장애로 집계되고, 반복 호출하면 ERROR 로그와 스택 트레이스가 쌓인다(E-10 과 같은 로그 폭증 경로). 데이터 정합성 문제는 없다.
+- **근거**: **측정** — scratch 테스트로 `dropRepository.search(null, now, 21_474_837, 100)` 호출 시 `org.springframework.dao.InvalidDataAccessApiUsageException: Page offset exceeds Integer.MAX_VALUE (2147483647)` 확인. 컨트롤러까지 거친 500 응답은 `GlobalExceptionHandler` 코드로 확인(실행 안 함). 경계: size=100 이면 page ≥ 21,474,837, size=1 이면 page = `Integer.MAX_VALUE` 에서 발생.
+- **개선안**:
+  1. `page` 에 `@Max` 를 둔다(예: `@Max(10_000)` → size 100 이어도 offset 100만). 400 `COMMON_INVALID_INPUT` 으로 떨어지고 기존 `HandlerMethodValidationException` 처리 경로를 그대로 쓴다. 한 줄이고 테스트 추가가 쉽다. 상한 값 자체는 임의라서 단계 문서 API 표에 적어야 한다.
+  2. application(`DropQueryService.search`)에서 `(long) page * size > Integer.MAX_VALUE` 이면 `INVALID_INPUT` 을 던진다. 상한이 정확하지만 영속 기술(JPA int offset)의 제약이 application 에 새어 나온다.
+  3. 범위를 넘으면 빈 페이지를 돌려준다. 사용자에게 오류가 보이지 않지만 의미 없는 요청을 정상으로 처리하게 된다.
+  - 1을 권장한다. 매우 깊은 offset 은 비용 면에서도 의미가 없다(E-27).
+- **우선순위**: 높음 — 공개 API 의 500 경로이고 수정 비용이 한 줄이다.
+- **영향 범위**: `DropController`, `DropControllerTest`(장원영), `phase-2-drop.md` API 표·검증 규칙
+
+### E-26 드로우 목록 쿼리 계획과 인덱스 — CLOSED 조회와 DRAWN count 는 전 테이블을 훑음
+- **구분**: 고도화 (현재 규모에서는 불필요)
+- **단계/위치**: phase-2, `DropJpaRepository.java:17-26`, `V1__create_products_and_drops.sql:25-27`
+- **현상**: 인덱스는 `product_id`, `open_at`, `close_at` 단일 컬럼 3개다. 실제 계획(측정)은 다음과 같다.
+
+  | 쿼리 | 계획 | 1만 건 | 10만 건 |
+  |------|------|--------|---------|
+  | 전체 page 0 | `idx_drops_open_at` Index Scan + Incremental Sort(open_at 선정렬, id 동순위 정렬) | 0.04ms | 0.05ms |
+  | 전체 count | Seq Scan | 0.71ms | 6.7ms |
+  | SCHEDULED (+count) | `idx_drops_open_at` 범위 스캔, `NOT drawn` 필터 | 0.02ms | 0.02ms |
+  | OPEN (+count) | `idx_drops_close_at` 범위 스캔(`close_at > now`), 101건 읽고 99건 필터 | 0.02ms | 0.01ms |
+  | CLOSED | `idx_drops_open_at` **전체** 스캔, 9,994 / 99,994건 필터로 버림 | 0.47ms | 4.8ms |
+  | DRAWN page 0 | `idx_drops_open_at` 앞에서 21건 | 0.01ms | 0.02ms |
+  | DRAWN count | Seq Scan | 0.74ms | 6.8ms |
+  | 상세(id) | PK Index Scan | 0.01ms | 0.01ms |
+
+  - 정렬 `openAt → id` 는 `open_at` 인덱스 순서 + Incremental Sort 로 처리되어 별도 정렬 비용이 거의 없다. `(open_at, id)` 복합 인덱스가 없어도 문제없다.
+  - CLOSED(`drawn = false and close_at <= now`)는 과거 드로우 대부분이 `close_at <= now` 를 만족해서 범위 조건이 걸러 주지 못하고, 선택도가 높은 조건은 `drawn = false` 인데 이를 위한 인덱스가 없다. 시간이 지나 DRAWN 이 쌓일수록 선형으로 느려진다.
+  - `idx_drops_product_id` 를 쓰는 쿼리는 지금 없다(상품별 드로우 조회 API 없음, 상품 삭제 없음).
+- **문제/기회**: 이 서비스의 드로우는 관리자가 등록하므로 수백~수천 건 규모로 본다(추정). 1만 건에서 가장 느린 쿼리가 0.7ms 라서 **현재 규모에서는 인덱스 추가가 불필요하다**. 10만 건이 되어도 7ms 수준이다.
+- **근거**: 측정(위 표). 데이터 분포는 합성이며 실제 분포(CLOSED 체류 시간, drawn 비율)와 다를 수 있다.
+- **개선안**:
+  1. 그대로 둔다(권장). 8단계 부하 테스트 데이터(드로우 수십 건)에서는 차이가 측정되지 않을 것이다(추정).
+  2. 드로우가 10만 건 이상 쌓이면 부분 인덱스 `CREATE INDEX idx_drops_undrawn_open_at_id ON drops (open_at, id) WHERE drawn = false` 를 추가한다. **측정(10만 건)**: CLOSED 4.8ms → 0.009ms, SCHEDULED count 는 Index Only Scan 으로 바뀜. 인덱스 크기 16kB(미추첨 108건만 담음) — 단일 컬럼 인덱스 2.2MB 대비 무시할 수준이고, `markDrawn` UPDATE 때 이 인덱스에서 행이 빠지는 쓰기 비용이 조금 생긴다. 이 인덱스가 생기면 `idx_drops_open_at` 은 전체·DRAWN 목록 정렬용으로만 남는다.
+  3. `idx_drops_product_id` 를 지운다. 쓰기마다 인덱스 1개가 줄지만 드로우 등록은 드물어 효과가 없고, 나중에 상품별 조회가 생기면 다시 필요하다. 권하지 않는다.
+  - DRAWN count 의 Seq Scan 은 E-27 의 count 정책으로 다룬다.
+- **우선순위**: 낮음 — 측정상 현재 규모에서 비용이 없다.
+- **영향 범위**: (2 선택 시) `V2__*.sql`, `erd.md` drops 인덱스 목록
+
+### E-27 offset 페이징과 count 쿼리, 오름차순 정렬로 최신 드로우가 마지막 페이지에 놓임
+- **구분**: 고도화 (정렬 방향은 설계 결정 사항)
+- **단계/위치**: phase-2, `DropRepositoryImpl.java:22, 39-48`, `DropJpaRepository.java` (Spring Data `Page`)
+- **현상**:
+  - 모든 상태 조회가 `Page` 를 반환해 요청당 내용 쿼리 + count 쿼리 2개를 실행한다. 단 Spring Data 는 첫 페이지이고 결과가 size 보다 적으면 count 를 생략한다(OPEN·CLOSED 처럼 결과가 적은 조회는 쿼리 1개).
+  - 정렬은 모든 상태에서 `openAt ASC, id ASC` 다. 전체·DRAWN 목록의 page 0 에는 **가장 오래된** 드로우가 나온다.
+- **문제/기회**:
+  - 비용: offset 99,000 조회가 **측정** 14ms(10만 건), count 6.7ms. 현재 규모(수천 건)에서는 1ms 미만이라 keyset 페이징으로 바꿀 이유가 없다.
+  - 사용성: 드로우가 쌓일수록 전체·DRAWN 목록에서 최근 것을 보려면 마지막 페이지로 가야 한다. 클라이언트가 이를 위해 `totalElements` 로 마지막 페이지를 계산해 깊은 offset 을 요청하게 되면 가장 비싼 경로(깊은 offset + count)가 기본 경로가 된다. SCHEDULED·OPEN 은 "곧 열리는 순/먼저 열린 순"이라 오름차순이 자연스럽다.
+- **근거**: 비용은 측정(E-26 환경). 클라이언트 사용 패턴은 추정.
+- **개선안**:
+  1. 상태별로 정렬 방향을 나눈다: SCHEDULED·OPEN 은 `openAt ASC, id ASC`, CLOSED·DRAWN·전체는 `openAt DESC, id DESC`. B-tree 는 역방향 스캔이 가능해 인덱스 추가가 없다(DESC 계획은 측정 안 함 — 동일 비용 추정). 응답 순서가 바뀌므로 **API 계약 변경**이고 `DropRepositoryImplTest`·`DropControllerTest` 의 정렬 기대값도 바뀐다. 사용자 결정이 필요하다.
+  2. `sort` 파라미터를 받는다. 유연하지만 허용 컬럼 화이트리스트와 검증이 늘어난다.
+  3. 그대로 두고 문서에 "목록은 오픈 시각 오름차순"이라고만 명시한다.
+  - count 는 그대로 둔다. 관리 화면에 총 건수가 필요하고 현재 비용이 작다. 수십만 건 이상에서 문제가 되면 그때 `Slice`(hasNext 만) 또는 keyset(`openAt, id` 커서)으로 바꾼다.
+- **우선순위**: 낮음 — 성능 문제는 아니다. 정렬 방향은 7단계 이후 화면 요구가 생기면 정한다.
+- **영향 범위**: `DropRepositoryImpl.ORDER`, `phase-2-drop.md` 조회 API 설명, `drop-register.md` 조회 절, 관련 테스트
+
+### E-28 공개 목록·상세 조회 캐시 — 현재 규모에서는 불필요, 상태를 캐시하면 경계 시각에 틀린 상태를 보여 줌
+- **구분**: 고도화 (현재 규모에서는 불필요)
+- **단계/위치**: phase-2, `DropQueryService.java:28-41`, `DropResult.of(drop, now)`
+- **현상**: 매 요청 DB 를 조회하고, 응답 `status` 는 요청 시각 `now` 로 계산한다. 캐시는 없다.
+- **문제/기회**:
+  - 부하 추정: 오픈 직전 사용자가 상세를 여러 번 새로 고친다고 해도 피크 트래픽의 대부분은 queue 폴링(S1 3,000 req/s)으로 간다. product 상세 쿼리는 실행 0.01ms(측정) + 왕복을 합쳐도 커넥션 점유가 요청당 1ms 미만(추정)이라 풀 10개로 초당 수천 건 이상을 받는다(추정). 병목은 DB 보다 Tomcat·JSON 직렬화 쪽이 먼저 온다(추정). 8단계 시나리오도 product API 를 피크 경로에 넣지 않는다.
+  - 정합성 위험: 응답 DTO(상태 포함)를 그대로 캐시하면 TTL 동안 `openAt` 이 지나도 SCHEDULED 로 보이고, 목록 캐시는 상태 필터 결과 자체가 시각에 따라 바뀐다. `markDrawn` 이후에도 TTL 만큼 CLOSED 로 보인다.
+- **근거**: 부하 수치는 추정, 쿼리 시간은 측정(E-26).
+- **개선안**:
+  1. 지금은 캐시를 두지 않는다(권장). 8단계에서 product-service 가 상위 병목으로 보일 때만 다시 본다.
+  2. 필요해지면 **상세만** 로컬 캐시(Caffeine)로 `Drop` 원본(상태 없는 값)을 캐시하고 `status(now)` 는 읽을 때 계산한다. 드로우의 시각·정원은 등록 후 불변이고 바뀌는 값은 `drawn` 하나라서, 5단계 `markDrawn` 에서 해당 키를 무효화하면 된다. 인스턴스가 여러 개면 다른 인스턴스는 TTL(예: 5초) 동안 drawn=false 를 보일 수 있다 — 화면 표시용이라 허용 가능한 지연이지만 문서에 적어야 한다.
+  3. 목록은 `Cache-Control: max-age=1~2` 정도의 짧은 HTTP 캐시만 고려한다. 상태 경계에서 최대 2초 늦게 바뀌는 것을 받아들이는 선택이다. 서버 측 목록 캐시는 시각 의존 필터 때문에 무효화가 복잡해 권하지 않는다.
+- **우선순위**: 낮음 — 측정상 필요성이 없고, 잘못 넣으면 상태 표시가 틀린다.
+- **영향 범위**: (2 선택 시) `DropQueryService` 또는 infrastructure 캐시 어댑터, 5단계 `DropService.markDrawn`
+
+### E-29 `drop.created` 유실을 감지하거나 자동 복구할 수단이 없음 (재발행은 사람이 로그를 보고 해야 함)
+- **구분**: 고도화 (D4 확정안의 남은 위험 — 3·4단계 수신 측이 생긴 뒤 다룸)
+- **단계/위치**: phase-2, `KafkaDropEventPublisher.java:27-49`, `DropService.java:54-59` (관련: E-02, E-12, E-17, E-18, E-23)
+- **현상**:
+  - 발행 비용: 드로우 등록 1건당 메시지 1건, 파티션 1개 토픽. 관리자 등록 경로라 처리량 문제는 없다. afterCommit 안에서 `send()` 가 메타데이터 대기로 최대 `max.block.ms` 1초까지 요청 스레드를 잡는다(E-17 과 같은 구조). 관리자 API 라 영향이 작다.
+  - 유실 경로: (a) 커밋 후 `send()` 전에 프로세스 종료, (b) producer 버퍼에 있는 동안 `kill -9`(정상 종료는 producer close 가 flush 함), (c) `delivery.timeout.ms` 10초 안에 브로커 ack 실패. (c) 만 ERROR 로그가 남고, (a)(b) 는 **로그조차 없다**.
+  - 복구는 관리자 재발행 API 하나다. 관리자는 어느 드로우가 전파되지 않았는지 알 방법이 없다.
+- **문제/기회**: 오픈 최소 여유가 1분이라, 유실을 사람이 알아채기 전에 오픈 시각이 지날 수 있다. 그러면 queue 는 meta 가 없어 진입을 거절하고(DROP_NOT_FOUND), entry 는 스냅샷이 없어 응모가 실패한다 — 사용자 입장에서는 드로우 전체 장애다. 빈도는 낮지만(브로커 장애·배포 중 종료와 등록이 겹칠 때) 영향이 크다.
+  - 부수 관찰: 재발행은 마감·추첨이 끝난 드로우에도 허용된다. 수신 측이 NX/`EXISTS` 로 멱등이라 정상 상태에서는 안전하다. 다만 5단계 이후 Redis 키를 정리(삭제·EXPIRE)한 드로우에 재발행하면 `entry-initialize.lua` 가 `state=OPEN`, `remaining=M` 으로 키를 **다시 만든다**. 응모 Lua 가 시각(`now >= closeAt`)으로 막으므로 오버 응모는 없지만(4단계 문서 기준 추정), TTL 없는 키가 남아 메모리 누수가 된다. 5단계 키 정리 정책을 정할 때 함께 확인해야 한다.
+- **근거**: 유실 경로는 코드·Kafka producer 동작 기반 분석(측정 안 함). 영향은 3·4단계 문서 기준.
+- **개선안**:
+  1. **오픈 전 자동 재발행(권장)**: product-service 스케줄러가 주기적으로(예: 30초) `drawn = false and open_at between now and now + 5분` 인 드로우를 재발행한다. 수신 측이 이미 멱등이라 정합성 위험이 없고, 대상은 몇 건이며 SCHEDULED 쿼리는 인덱스 범위 스캔(측정 0.02ms)이다. 유실이 있어도 오픈 전에 자동으로 메워진다. 대가: 드로우마다 오픈 전 최대 10회 정도 중복 메시지(수신 측 Redis/DB 왕복 몇 번), 다중 인스턴스면 중복이 배가된다(멱등이라 무해). 오픈 여유 1분보다 주기를 짧게 잡아야 한다.
+  2. Transactional Outbox(설계에서 포기한 대안). 유실을 원천 차단하지만 테이블·릴레이·정리 작업이 늘어난다. 과제 범위 대비 과하다.
+  3. 감지만 추가: 발행 실패 카운터(`drop.created.publish{result}`, E-23 과 같은 방식) + 수신 측이 스냅샷이 없는 dropId 로 요청을 받으면 경고 로그. 원인을 빨리 알 수 있지만 복구는 여전히 수동이다. 1과 함께 두면 좋다.
+  - 재발행 범위는 1을 넣을 때 `drawn = false and now < closeAt` 로 제한하는 것을 검토한다(위 부수 관찰). 관리자 API 의 허용 범위를 바꾸는 것이므로 설계 결정이다.
+- **우선순위**: 중간 — 빈도는 낮지만 발생하면 해당 드로우 전체가 실패한다. 개선안 1은 프로덕션 코드 수십 줄이며, 수신 측 멱등성이 검증되는 4단계 이후(또는 8단계 전)에 넣는 것이 자연스럽다.
+- **영향 범위**: (1) product-service presentation 스케줄러·`DropRepository` 조회 메서드, `concurrency-consistency.md` D4, `drop-register.md` 6장. (3) `KafkaDropEventPublisher`, 8단계 관찰 메트릭
+
+### E-30 5단계 `markDrawn` 경로 — 단계 문서 코드가 2단계 구현과 맞지 않고, 갱신은 SELECT + 전체 컬럼 UPDATE 2회
+- **구분**: 고도화 (5단계 문서 수정 필요, 성능은 현재 규모에서 불필요)
+- **단계/위치**: phase-2 `Drop.java:89-91`, `DropMapper.java:14-17`, `DropRepositoryImpl.java:28-30` / 계획 `phase-5-draw.md:601-613`
+- **현상**:
+  - 5단계 문서는 `dropRepository.save(drop.markDrawn())` 와 `DropException(DropErrorCode.DROP_NOT_FOUND)` 를 쓰는데, 2단계 구현은 `markDrawn()` 이 `void` 이고 예외는 `ApplicationException(ProductErrorCode.DROP_NOT_FOUND)` 다(v1.2 에러 계약). 문서대로 쓰면 컴파일되지 않는다.
+  - 문서 흐름대로면 쿼리는 `findById`(SELECT) 1회 + `save` 1회다. `save` 는 id 가 있어 `merge` 가 되는데, 같은 트랜잭션에서 이미 로드된 엔티티가 영속성 컨텍스트에 있으므로 추가 SELECT 없이 상태를 복사하고 flush 시 **전체 컬럼 UPDATE** 1회를 낸다(코드 분석, 측정 안 함).
+  - 동시성: `draw.completed` 는 파티션 1개·컨슈머 1개라 같은 dropId 메시지가 동시에 처리되지 않고, 다른 쓰기 경로(재발행은 읽기만)도 없어 lost update 위험은 없다.
+- **문제/기회**: 추첨 완료는 드로우당 1건이라 쿼리 2회는 비용 문제가 아니다 — **현재 규모에서는 최적화 불필요**. 문서 불일치만 5단계 착수 전에 고치면 된다.
+- **근거**: 코드·문서 대조. 쿼리 수는 Spring Data `save` 의 `isNew` 판정과 JPA merge 동작 기반 추정.
+- **개선안**:
+  1. 5단계 문서를 2단계 구현에 맞춘다(권장): `drop.markDrawn(); dropRepository.save(drop);`, 예외는 `ApplicationException(ProductErrorCode.DROP_NOT_FOUND)`. 리스너의 not-retryable 등록 대상도 이 예외(코드 기준 판별)로 바꿔 적는다 — `ApplicationException` 전체를 not-retryable 로 등록하면 다른 코드까지 재시도 대상에서 빠지므로 주의.
+  2. 조건부 UPDATE 포트(`markDrawnIfNotDrawn(dropId)` → `update drops set drawn = true where id = :id and drawn = false`)로 쿼리 1회로 줄인다. 멱등이 SQL 로 보장되지만 도메인 `markDrawn()` 을 거치지 않아 규칙이 영속 계층으로 새고, 없는 dropId 와 이미 추첨된 dropId 를 구분하려면 추가 조회가 필요하다. 권하지 않는다.
+  - E-28 개선안 2(상세 캐시)를 도입하면 이 메서드에서 무효화해야 한다.
+- **우선순위**: 낮음(성능) / 문서 수정은 5단계 착수 전 필수.
+- **영향 범위**: `phase-5-draw.md` 3.5, (2 선택 시) `DropRepository`, `DropJpaRepository`
