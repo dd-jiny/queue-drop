@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | Flyway 확정, 공통 producer 설정을 4단계 기준(request 1000 / delivery 3000)으로 통일, DLT 토픽 3종 추가, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 라이브러리 확인 결과 반영: ArchUnit 1.5.1, Testcontainers 2.0.5 (`testcontainers-{module}` 아티팩트명 확인) |
+| v1.3 | 2026-11-16 | 3.4 `LayerRules`: R1 에 `lombok..` 허용(설계 v1.2), `isDomainModel` 오탐 방지(`domain.modeling` 제외). 규칙 자체 검증 테스트 `LayerRulesTest` 추가 (T0-02a) |
 
 ---
 
@@ -49,12 +50,15 @@ queue-drop/
 │       │       ├── CommonErrorCode.java
 │       │       ├── ApplicationException.java
 │       │       └── ErrorResponse.java
-│       └── testFixtures/java/com/queuedrop/common/test/
-│           ├── archunit/LayerRules.java
-│           └── container/
-│               ├── PostgresContainerConfig.java
-│               ├── RedisContainerConfig.java
-│               └── KafkaContainerConfig.java
+│       ├── testFixtures/java/com/queuedrop/common/test/
+│       │   ├── archunit/LayerRules.java
+│       │   └── container/
+│       │       ├── PostgresContainerConfig.java
+│       │       ├── RedisContainerConfig.java
+│       │       └── KafkaContainerConfig.java
+│       └── test/java/com/queuedrop/common/test/archunit/
+│           ├── LayerRulesTest.java                # T0-02a: 규칙별 위반/준수 샘플로 R1~R7 자체 검증
+│           └── sample/**                          # 검증용 샘플 클래스
 └── {user,product,queue,entry,coupon,ranking}-service/
     ├── build.gradle                               # 수정: (JPA 서비스) Flyway
     └── src/
@@ -165,6 +169,11 @@ dependencies {
     testFixturesApi 'org.testcontainers:testcontainers-junit-jupiter'
     testFixturesApi 'org.testcontainers:testcontainers-postgresql'
     testFixturesApi 'org.testcontainers:testcontainers-kafka'
+
+    // common 자체 테스트(LayerRulesTest)용. ArchUnit·spring-context 는 testFixturesApi 로 이미 보인다.
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'org.assertj:assertj-core'
+    testImplementation 'jakarta.persistence:jakarta.persistence-api'
 }
 ```
 
@@ -380,6 +389,9 @@ import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
  * 분석 범위는 각 서비스의 @AnalyzeClasses(packages = "com.queuedrop.{svc}") 로 제한된다.
  *
  * allowEmptyShould(true): 0단계처럼 계층 패키지가 비어 있어도 규칙이 실패하지 않게 한다.
+ *
+ * R1 의 "lombok.." 허용: Lombok 이 생성한 메서드에는 CLASS 보존 어노테이션 @lombok.Generated 가 남아
+ * 바이트코드 의존으로 잡힌다. 설계 6장 각주(컴파일 타임 Lombok 허용)에 맞추기 위해 허용한다.
  */
 public final class LayerRules {
 
@@ -396,9 +408,9 @@ public final class LayerRules {
     @ArchTest
     public static final ArchRule R1_domain_depends_only_on_domain_and_java =
             classes().that().resideInAPackage(DOMAIN)
-                    .should().onlyDependOnClassesThat().resideInAnyPackage(DOMAIN, "java..")
+                    .should().onlyDependOnClassesThat().resideInAnyPackage(DOMAIN, "java..", "lombok..")
                     .allowEmptyShould(true)
-                    .as("R1: domain 은 domain 과 java.* 외에 의존하지 않는다 (Spring·JPA 금지)");
+                    .as("R1: domain 은 domain 과 java.* 외에 의존하지 않는다 (Spring·JPA 금지, Lombok 허용)");
 
     @ArchTest
     public static final ArchRule R2_application_does_not_depend_on_outer_layers =
@@ -464,7 +476,8 @@ public final class LayerRules {
     }
 
     private static boolean isDomainModel(JavaClass type) {
-        return type.getPackageName().contains(DOMAIN_MODEL);
+        String pkg = type.getPackageName();
+        return pkg.endsWith(DOMAIN_MODEL) || pkg.contains(DOMAIN_MODEL + ".");
     }
 }
 ```
@@ -842,6 +855,7 @@ create coupon.issued.DLT 1
 | ID | 계층/종류 | 테스트 클래스 | 시나리오 (Given / When / Then) | 관련 REQ |
 |----|-----------|---------------|--------------------------------|----------|
 | T0-01 | 아키텍처 | `{svc}.ArchitectureTest` ×6 | Given 4계층 골격만 있는 서비스 / When ArchUnit 실행 / Then R1~R7 모두 통과 (빈 패키지 허용) | - |
+| T0-02a | 아키텍처 (자동) | common `LayerRulesTest` | Given 규칙별 위반/준수 샘플 클래스 / When R1~R7 check / Then 위반 샘플은 실패, 준수 샘플은 `allowEmptyShould(false)` 로도 통과. R3 위반 샘플은 `jakarta.persistence`·`common.event` 만 (Spring Data·Kafka·Web 은 common 에 의존성이 없어 범위 밖). 서비스 패키지 오타는 잡지 못하므로 T0-02 는 계속 필요 | - |
 | T0-02 | 아키텍처 (수동) | entry-service `ArchitectureTest` | Given presentation 이 domain 모델을 반환하는 임시 클래스 / When 실행 / Then R4 실패. 같은 방식으로 R6, R1 실패 확인 후 임시 클래스 삭제 (3.7) | - |
 | T0-03 | 통합 | `{svc}.ApplicationContextTest` ×4 (user, product, entry, coupon) | Given `PostgresContainerConfig` / When 컨텍스트 기동 / Then Flyway 실행 + `ddl-auto: validate` 통과, 기동 성공 | - |
 | T0-04 | 통합 | `{svc}.ApplicationContextTest` (queue, ranking) | Given `RedisContainerConfig`, `KafkaContainerConfig` / When 기동 / Then 성공 | - |
@@ -860,7 +874,7 @@ create coupon.issued.DLT 1
 | 1 | `chore: 테스트 의존성과 common test fixtures 설정` | 루트 `build.gradle`, `common/build.gradle` |
 | 2 | `feat(common): 서비스 간 이벤트 메시지 스키마와 토픽 상수 추가` | `common/.../event/*` |
 | 3 | `feat(common): 공통 에러 코드와 에러 응답 형식 추가` | `common/.../error/*` |
-| 4 | `test(common): ArchUnit 4계층 의존 규칙 R1~R7 추가` | `LayerRules.java` |
+| 4 | `test(common): ArchUnit 4계층 의존 규칙 R1~R7 추가` | `LayerRules.java`, `LayerRulesTest.java`, `sample/**`, `common/build.gradle`(testImplementation) |
 | 5 | `test(common): Testcontainers 지원 설정 추가` | `container/*Config.java` |
 | 6 | `chore: 서비스별 4계층 패키지 골격과 아키텍처 테스트 추가` | 각 서비스 `package-info.java`, `ArchitectureTest.java` |
 | 7 | `feat: 서비스별 전역 예외 처리기 추가` | 각 서비스 `GlobalExceptionHandler.java`, T0-05 |

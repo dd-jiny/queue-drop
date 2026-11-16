@@ -11,4 +11,9 @@ dependencies {
     testFixturesApi 'org.testcontainers:testcontainers-junit-jupiter'
     testFixturesApi 'org.testcontainers:testcontainers-postgresql'
     testFixturesApi 'org.testcontainers:testcontainers-kafka'
+
+    // common 자체 테스트(LayerRules 규칙 검증용 샘플 포함). 버전은 Boot BOM 관리
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'org.assertj:assertj-core'
+    testImplementation 'jakarta.persistence:jakarta.persistence-api'
 }
