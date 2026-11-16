@@ -5,6 +5,7 @@
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 관리자 계정 생성(ADMIN_EMAIL / ADMIN_PASSWORD 기동 시 생성) 확정 및 구현 상세·테스트·커밋 추가, 설계 반영 완료 표시 |
+| v1.2 | 2026-11-16 | 0단계 결과 반영: 헤더 누락 400 `COMMON_MISSING_USER_HEADER`(3.8), Lombok/R1 설명 정정, user-service Kafka 블록을 0단계 공통 설정으로, jjwt 0.13.0. Access token 만료 1시간 기본안 확정. gateway 에러 코드 접두어 `AUTH_` 는 인증 도메인 이름으로 명명 규칙 예외 |
 
 ---
 
@@ -149,9 +150,9 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-kafka'          // user.registered 발행
     implementation 'org.springframework.security:spring-security-crypto'        // BCrypt 만 사용 (Security 필터 체인 X)
 
-    implementation 'io.jsonwebtoken:jjwt-api:0.12.6'                            // 구현 시 최신 버전 확인
-    runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.6'
-    runtimeOnly 'io.jsonwebtoken:jjwt-gson:0.12.6'
+    implementation 'io.jsonwebtoken:jjwt-api:0.13.0'
+    runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.13.0'
+    runtimeOnly 'io.jsonwebtoken:jjwt-gson:0.13.0'
 
     runtimeOnly 'org.postgresql:postgresql'
 
@@ -166,9 +167,9 @@ dependencies {
     implementation project(':common')                                            // ErrorCode, ErrorResponse
     implementation 'org.springframework.cloud:spring-cloud-starter-gateway-server-webflux'
 
-    implementation 'io.jsonwebtoken:jjwt-api:0.12.6'                            // 구현 시 최신 버전 확인
-    runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.12.6'
-    runtimeOnly 'io.jsonwebtoken:jjwt-gson:0.12.6'
+    implementation 'io.jsonwebtoken:jjwt-api:0.13.0'
+    runtimeOnly 'io.jsonwebtoken:jjwt-impl:0.13.0'
+    runtimeOnly 'io.jsonwebtoken:jjwt-gson:0.13.0'
 
     testImplementation 'io.projectreactor:reactor-test'
 }
@@ -293,7 +294,7 @@ public class User {
     }
 }
 ```
-- `@Getter` 는 Lombok compileOnly(SOURCE 유지) 라 R1 에 걸리지 않는다.
+- `@Getter` 는 Lombok compileOnly 다. 생성 메서드에 `@lombok.Generated` 가 남지만 R1 이 `lombok..` 을 허용한다 (layered-architecture.md v1.2).
 - 닉네임 중복은 허용한다 (요구사항에 없음).
 
 #### 도메인 예외 (패키지 `domain.exception`, 순수 Java)
@@ -727,14 +728,18 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
-  kafka:
+  kafka:                          # 0단계 3.9 공통 producer 블록 (user-service 는 발행만 한다)
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # 구현 시 확인
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
       acks: all
+      retries: 2147483647
       properties:
         enable.idempotence: true
+        request.timeout.ms: 1000
+        delivery.timeout.ms: 3000
+        max.block.ms: 1000
 
 queuedrop:
   jwt:
@@ -1073,7 +1078,7 @@ public class ErrorResponseWriter {
 public ResponseEntity<EntryApplyResponse> apply(@PathVariable Long dropId,
                                                 @RequestHeader("X-User-Id") Long userId) { /* ... */ }
 ```
-- 헤더가 없으면 `MissingRequestHeaderException` → 0단계 `GlobalExceptionHandler` 가 401 응답.
+- 헤더가 없으면 `MissingRequestHeaderException` → 0단계 `GlobalExceptionHandler` 가 400 `COMMON_MISSING_USER_HEADER` 응답 (layered-architecture.md 4.5).
 - 관리자 API 는 `@RequestHeader("X-User-Role") String role` 을 받아 Command 에 담고, **application 이 권한을 검사**한다 (2단계 `DropService`).
 
 ---
@@ -1135,6 +1140,8 @@ public ResponseEntity<EntryApplyResponse> apply(@PathVariable Long dropId,
 | 9 | `feat(gateway): JWT 검증 필터와 인증 제외 경로 추가` | auth/*, filter/JwtAuthenticationFilter, config/*, yml, T1-20~26 |
 | 10 | `chore: JWT_SECRET·ADMIN 계정 환경변수 예시 추가` | `.env.example` (`JWT_SECRET`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`) |
 
+> 커밋 #2~#4 시점에는 포트 구현 빈(영속성·보안·발행 어댑터)이 아직 모두 있지 않아 `ApplicationContextTest`(T0-03)가 실패한다. 단위·슬라이스 테스트는 각 커밋에서 통과하고, #5 부터 전체가 통과한다 (구현 결정 — 커밋을 계층·어댑터 단위로 나누기 위해 감수).
+
 커밋 본문 예시 (#9):
 ```
 feat(gateway): JWT 검증 필터와 인증 제외 경로 추가
@@ -1157,7 +1164,7 @@ feat(gateway): JWT 검증 필터와 인증 제외 경로 추가
 ### 결정 필요
 | 항목 | 기본안 | 대안 |
 |------|--------|------|
-| Access token 만료 | 1시간 | 더 짧게 + Refresh token (범위 증가) |
+| Access token 만료 | **1시간 — 확정(기본안), 2026-11-16** | 더 짧게 + Refresh token (범위 증가) |
 
 ### 설계 수정 필요
 | 문서 | 내용 |
@@ -1171,7 +1178,7 @@ feat(gateway): JWT 검증 필터와 인증 제외 경로 추가
 - **헤더 신뢰 전제**: 내부 서비스 포트(8081~8086)에 직접 요청하면 `X-User-Id` 를 위조할 수 있다. 로컬 개발에서는 감수하고, 8단계 컨테이너화 때 gateway 만 외부 노출한다 ([infrastructure.md](../../design/03-infrastructure/infrastructure.md) 5장).
 - **JWT 비밀키 공유**: 두 서비스 기본값이 다르면 모든 요청이 401. 기본값을 한 곳(`.env.example`)에서 관리하고, 기동 시 키 길이 검증(T1-13)으로 설정 누락을 빨리 드러낸다.
 - **BCrypt 비용**: 로그인·가입마다 약 수십 ms CPU 사용. 부하 테스트 시나리오(8단계)에서는 로그인을 미리 해두고 토큰을 재사용한다.
-- **라이브러리 확인**: jjwt 0.12.x API(`verifyWith`, `parseSignedClaims`), Boot 4 의 `JsonMapper` 자동 구성, `spring-boot-starter-webmvc-test` 스타터 이름은 구현 시 확인.
+- **라이브러리 확인**: jjwt 0.13.x API(`verifyWith`, `parseSignedClaims`), Boot 4 의 `JsonMapper` 자동 구성, `spring-boot-starter-webmvc-test` 스타터 이름은 구현 시 확인.
 
 ---
 
