@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 발행 정책·DLT·저장 전 Redis 확인 확정 반영 (0단계 토픽 초기화에 DLT 추가됨), JSON 직렬화 클래스명을 0단계 공통 설정과 통일, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 0~3단계 실제 코드에 정렬. 에러 계약: `EntryErrorCode implements ErrorCode`(코드 `ENTRY_*`, 상태는 enum 이 보유), `ApplicationException` 으로 던지고 0단계 `GlobalExceptionHandler` 가 매핑 — `BusinessException`·`EntryApplyException`·`EntryExceptionHandler`·`UserIdHeader` 제거, 헤더 누락은 `COMMON_MISSING_USER_HEADER`(400). `DomainException` 은 entry `domain/exception` 에 서비스별로 둔다(queue 와 같은 형태). 잘못된 `drop.created` 는 queue 처럼 application 이 `DomainException` 을 잡아 로그·스킵(재시도·DLT 없음) — `InvalidDropSnapshotException` 제거, 설계 문서 반영. `DropSnapshotRegisterCommand` 를 `Long`/null 검증으로. Kafka 설정은 0단계 `application.yml` 공통 블록(이미 있음) 기준으로 추가분만 표기, `DefaultErrorHandler` 빈 자동 적용(3단계 확인), `@KafkaListener(idIsGroup = false)`. `entry:{dropId}:remaining` 정수 문자열 계약·queue 의존 명시. 스크립트 빈 `EntryScripts` → `infrastructure/config/RedisScriptConfig`, 테스트 지원은 `*ContainerConfig` `@Import`, 테스트 슬라이스 의존성(`data-redis-test`·`data-jpa-test`). 테스트 T4-33~35 추가. 커밋 계획을 테스트 포함 기능 커밋 단위로 재편. 6.1 에 E-34·E-39 사용자 결정 기록 |
+| v1.3 | 2026-11-17 | 커밋 #3 검증 반영: `DropSnapshotRegisterService` 가 Redis 를 재수신 메시지 값이 아니라 DB 에 저장된 스냅샷 값으로 초기화 (DB·Redis 정원 불일치 방지). T4-09 에 인프라 예외 전파 케이스 추가 |
 
 > 표기
 > - **(구현 결정)**: 설계 문서에 없던 내용을 이 문서에서 정한 것
@@ -490,13 +491,16 @@ public class DropSnapshotRegisterService {
             return;
         }
 
-        dropSnapshotRepository.saveIfAbsent(snapshot);       // ① DB (자체 트랜잭션)
+        DropSnapshot stored = dropSnapshotRepository.saveIfAbsent(snapshot)   // ① DB (자체 트랜잭션)
+                ? snapshot
+                : dropSnapshotRepository.findById(snapshot.getDropId()).orElseThrow();
 
-        entryGate.initialize(command.dropId(), command.entryCapacity(),   // ② Redis (NX)
-                command.openAt(), command.closeAt());
+        entryGate.initialize(stored.getDropId(), stored.getEntryCapacity(),   // ② Redis (NX)
+                stored.getOpenAt(), stored.getCloseAt());
     }
 }
 ```
+- **Redis 는 DB 에 저장된 스냅샷 값으로 초기화한다 (v1.3)**. 재수신 메시지의 값이 처음과 다르더라도(DB 저장 후 Redis 초기화가 실패한 뒤 값이 바뀐 메시지가 오는 경우) DB 와 Redis 정원이 갈라지지 않게 DB 를 기준으로 삼는다.
 - **순서와 실패 처리** (구현 결정)
   | 실패 지점 | 상태 | 재전달 시 |
   |-----------|------|-----------|
@@ -1423,7 +1427,7 @@ dependencies {
 | T4-06 | application 단위 | `EntryApplyServiceTest` | G: 발행 실패 + 보상도 예외 / W: apply / T: 여전히 `TEMPORARILY_FAILED` (보상 예외가 원래 예외를 가리지 않음) | NFR-03 |
 | T4-07 | application 단위 | `EntrySaveServiceTest` | G: Gate 응모자에 없음 / W: save / T: 저장소 0건 (유령 이벤트 무시) | NFR-03 |
 | T4-08 | application 단위 | `EntrySaveServiceTest` | G: 응모자에 있음 / W: save 2번 / T: 저장소 1건, 예외 없음 | NFR-02 |
-| T4-09 | application 단위 | `DropSnapshotRegisterServiceTest` | G: 이미 저장된 스냅샷 / W: register / T: 저장소 그대로, Gate.initialize 는 호출됨 (Redis 쪽 복구 기회). G: 잘못된 값(capacity < winner, null 필드) / W: register / T: **예외 없이 스킵** — 저장소 0건, Gate.initialize 호출 0 (v1.2, queue `QueueMetaRegisterServiceTest` 와 같은 방식) | REQ-DROP-02 |
+| T4-09 | application 단위 | `DropSnapshotRegisterServiceTest` | G: 이미 저장된 스냅샷 / W: register / T: 저장소 그대로, Gate.initialize 는 **저장된 스냅샷 값**으로 호출됨 (Redis 쪽 복구 기회, v1.3). G: 저장소·Gate 예외 / T: 예외 전파(스킵하지 않음), 저장 실패 시 initialize 0회. G: 잘못된 값(capacity < winner, null 필드) / W: register / T: **예외 없이 스킵** — 저장소 0건, Gate.initialize 호출 0 (v1.2, queue `QueueMetaRegisterServiceTest` 와 같은 방식) | REQ-DROP-02 |
 | T4-10 | application 단위 | `EntryQueryServiceTest` | G: DB 없음 + Gate 응모자 / T: status=APPLIED, entrySeq=null. G: 둘 다 없음 / T: `ApplicationException(EntryErrorCode.NOT_FOUND)`. G: DB 있음 / T: DB 값 | REQ-ENTRY-06 |
 | T4-11 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 초기화(정원 3), 토큰 있음 / W: tryApply / T: OK(seq=1, Java 타입 `Long` → int), `GET remaining` = `"2"`(10진 정수 문자열, queue 계약), applicants 에 userId | REQ-ENTRY-01, 02 |
 | T4-12 | infra 통합 (Redis) | `RedisEntryGateTest` | CLOSED 4가지: meta 없음 / state=CLOSED / now = openAt-1ms / now = closeAt (정각). 반대로 now = openAt (정각) → OK | REQ-ENTRY-02 |

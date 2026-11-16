@@ -10,9 +10,18 @@ import java.util.Optional;
 public class InMemoryDropSnapshotRepository implements DropSnapshotRepository {
 
     private final Map<Long, DropSnapshot> store = new LinkedHashMap<>();
+    private RuntimeException saveFailure;
+
+    /** 이후 saveIfAbsent 호출이 이 예외를 던진다. */
+    public void failSaveWith(RuntimeException failure) {
+        this.saveFailure = failure;
+    }
 
     @Override
     public boolean saveIfAbsent(DropSnapshot snapshot) {
+        if (saveFailure != null) {
+            throw saveFailure;
+        }
         return store.putIfAbsent(snapshot.getDropId(), snapshot) == null;
     }
 

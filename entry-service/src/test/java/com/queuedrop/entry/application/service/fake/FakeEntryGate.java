@@ -40,6 +40,7 @@ public class FakeEntryGate implements EntryGate {
     private final List<Call> compensateCalls = new ArrayList<>();
     private final List<InitializeCall> initializeCalls = new ArrayList<>();
     private RuntimeException compensateFailure;
+    private RuntimeException initializeFailure;
 
     @Override
     public GateResult tryApply(long dropId, long userId, Instant now) {
@@ -89,6 +90,11 @@ public class FakeEntryGate implements EntryGate {
     @Override
     public void initialize(long dropId, int capacity, Instant openAt, Instant closeAt) {
         initializeCalls.add(new InitializeCall(dropId, capacity, openAt, closeAt));
+        if (initializeFailure != null) {
+            RuntimeException failure = initializeFailure;
+            initializeFailure = null; // 한 번만 실패 (재전달 복구 검증용)
+            throw failure;
+        }
         if (metas.containsKey(dropId)) {
             return;
         }
@@ -116,6 +122,11 @@ public class FakeEntryGate implements EntryGate {
     /** 이후 compensate 호출이 이 예외를 던진다 (호출 기록은 남는다). */
     public void failCompensateWith(RuntimeException failure) {
         this.compensateFailure = failure;
+    }
+
+    /** 다음 initialize 호출 한 번이 이 예외를 던진다 (호출 기록은 남는다). */
+    public void failNextInitializeWith(RuntimeException failure) {
+        this.initializeFailure = failure;
     }
 
     // ---- 상태 조회 ----
