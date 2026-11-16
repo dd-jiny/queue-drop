@@ -128,6 +128,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-kafka'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-kafka-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis-test'   // @DataRedisTest 슬라이스
     testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
     // testFixtures(project(':common')) 은 루트 build.gradle 이 4계층 서비스에 일괄 추가 (0단계)
 }
@@ -406,12 +407,13 @@ public class QueueMetaRegisterService {
 ```java
 public final class QueueKeys {
     public static final String ACTIVE_DROPS = "queue:active-drops";
-    public static final String ADMISSION_GATE_PREFIX = "queue:";   // queue:{name}:gate
     public static String meta(Long dropId)    { return "queue:" + dropId + ":meta"; }
     public static String seq(Long dropId)     { return "queue:" + dropId + ":seq"; }
     public static String waiting(Long dropId) { return "queue:" + dropId + ":waiting"; }
     public static String tokenPrefix(Long dropId) { return "queue:" + dropId + ":token:"; }
     public static String token(Long dropId, Long userId) { return tokenPrefix(dropId) + userId; }
+    /** 스케줄러 게이트 queue:{name}:gate (v1.2) */
+    public static String gate(String name) { return "queue:" + name + ":gate"; }
     /** entry-service 소유 — 읽기 전용 */
     public static String entryRemaining(Long dropId) { return "entry:" + dropId + ":remaining"; }
 }
@@ -595,7 +597,7 @@ public class RedisSchedulerGate implements SchedulerGate {
     @Override
     public boolean tryPass(String name, Duration window) {
         return Boolean.TRUE.equals(redis.opsForValue()
-                .setIfAbsent("queue:" + name + ":gate", instanceId, window));
+                .setIfAbsent(QueueKeys.gate(name), instanceId, window));
     }
 }
 ```

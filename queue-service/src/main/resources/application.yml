@@ -28,3 +28,10 @@ spring:
       properties:
         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
         spring.json.trusted.packages: com.queuedrop.common.event
+
+queue:
+  admission:
+    interval-ms: 1000         # 입장 주기
+    batch-size: 100           # 주기당·드로우당 입장 인원 N (1~1000)
+    token-ttl-seconds: 300    # 입장 토큰 TTL
+    scheduler-enabled: true   # false 면 AdmissionScheduler 빈을 만들지 않는다 (테스트에서 admit() 직접 호출)
