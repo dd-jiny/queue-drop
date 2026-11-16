@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 커밋 후 발행을 1단계와 같은 방식(발행 어댑터 안의 `TransactionSynchronization.afterCommit`)으로 교체 — Spring 이벤트 중계 구조 제거, 재시도는 producer 내부 재시도로 일원화. 이벤트 발행 방식 확정, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 0단계 에러 계약에 정렬: `ProductErrorCode implements ErrorCode`(코드 `PRODUCT_*`), 별도 `ProductException`·`ProductExceptionHandler` 제거(`ApplicationException` + 0단계 `GlobalExceptionHandler`), 권한 없음은 `COMMON_FORBIDDEN`(403), 헤더 누락은 `COMMON_MISSING_USER_HEADER`(400), 응답 메시지는 코드별 고정(도메인 상세는 cause 로 로그에만). Kafka 설정은 0단계 공통 블록 유지 + `delivery.timeout.ms` 만 덮어씀. 커밋 계획을 1단계처럼 테스트 포함 기능 커밋 단위로 재편 |
 | v1.3 | 2026-11-16 | 단계 검증 반영: page 상한 10000(offset int 초과 500 방지) + 저장소 방어, 시각 마이크로초 정규화(Clock tick 1µs, `Drop.create` 내림, 조회 now 내림), 등록 상한(오픈 365일·기간 30일, 기본안), 도메인 길이 검증, API 표 보강(`COMMON_NOT_FOUND`·범위 초과 id), SQL 은 IDENTITY 로 표기 |
+| v1.4 | 2026-11-16 | 2단계 완료: 체크리스트 갱신 (전 테스트 통과, 로컬 compose 에서 등록 → `drop.created` 수신 확인) |
 
 ---
 
@@ -868,6 +869,6 @@ public class DropController {
 | 공통: 설계 수정 필요 항목 설계 문서 반영 | 6장 "설계 수정 필요" |
 | 결정: 드로우 이벤트 발행 방식 확정 | 6장 "결정 필요" |
 
-- [ ] 위 테스트 전부 통과
-- [ ] 로컬 docker compose 환경에서 관리자 등록 → Kafka UI 에서 `drop.created` 메시지 확인
-- [ ] [implementation-plan.md](../implementation-plan.md) 진행 현황 갱신
+- [x] 위 테스트 전부 통과 (product-service 187건)
+- [x] 로컬 docker compose 환경에서 관리자 등록 → `drop.created` 메시지 확인 (key=1, 필드 일치. Kafka UI 대신 console consumer 로 확인)
+- [x] [implementation-plan.md](../implementation-plan.md) 진행 현황 갱신

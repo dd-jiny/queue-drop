@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-16 | 확정 사항 반영: Flyway, 커밋 후 발행 방식(afterCommit), 동기 발행 정책(애플리케이션 재시도 없음), DLT, 관리자 계정 생성, 저장 전 Redis 확인(응모·쿠폰). 미결정 표 갱신 |
 | v1.3 | 2026-11-16 | 0단계 완료: 진행 현황·체크리스트 갱신. 에러 계약 결정(X-User-* 누락 400, `{SERVICE}_{REASON}`, 응답 메시지 고정) 4장 표에 추가 |
 | v1.4 | 2026-11-16 | 1단계 완료: 진행 현황·체크리스트 갱신 |
+| v1.5 | 2026-11-16 | 2단계 완료: 진행 현황·체크리스트 갱신. 드로우 등록 상한(오픈 365일·기간 30일) 기본안 확정 4장 표에 추가 |
 
 ---
 
@@ -81,7 +82,7 @@ flowchart LR
 |------|--------|-----------|------|
 | 0. 공통 기반 | `chore/phase-0-foundation` | [phase-0-foundation.md](phases/phase-0-foundation.md) | ✅ 완료 (2026-11-16) |
 | 1. 인증 | `feat/phase-1-auth` | [phase-1-auth.md](phases/phase-1-auth.md) | ✅ 완료 (2026-11-16) |
-| 2. 드로우 | `feat/phase-2-drop` | [phase-2-drop.md](phases/phase-2-drop.md) | ⬜ 대기 |
+| 2. 드로우 | `feat/phase-2-drop` | [phase-2-drop.md](phases/phase-2-drop.md) | ✅ 완료 (2026-11-16) |
 | 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ⬜ 대기 |
 | 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ⬜ 대기 |
 | 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ⬜ 대기 |
@@ -157,18 +158,18 @@ flowchart LR
 **참고**: [drop-register.md](../design/05-features/drop-register.md), [erd.md](../design/06-erd/erd.md) product_db
 
 **작업**
-- [ ] domain: `Product`, `Drop`(생성 검증 M ≥ K ≥ 1, openAt < closeAt, `status(now)`, `markDrawn()`), `DropStatus`, Repository(I) 2개
-- [ ] application: `ProductService`, `DropService`(register, republish), `DropQueryService`, 포트 `DropEventPublisher`, 관리자 권한 검사
-- [ ] infrastructure: JPA 엔티티·Mapper·Repository 구현, 발행 어댑터 안의 `TransactionSynchronization.afterCommit` 발행 (1단계와 같은 패턴, producer 내부 재시도)
-- [ ] presentation: `ProductController`, `DropController` (API 5개)
+- [x] domain: `Product`, `Drop`(생성 검증 M ≥ K ≥ 1, openAt < closeAt, `status(now)`, `markDrawn()`), `DropStatus`, Repository(I) 2개
+- [x] application: `ProductService`, `DropService`(register, republish), `DropQueryService`, 포트 `DropEventPublisher`, 관리자 권한 검사
+- [x] infrastructure: JPA 엔티티·Mapper·Repository 구현, 발행 어댑터 안의 `TransactionSynchronization.afterCommit` 발행 (1단계와 같은 패턴, producer 내부 재시도)
+- [x] presentation: `ProductController`, `DropController` (API 5개)
 
 **확정 (2026-11-16)**
 - [x] 드로우 이벤트 발행 방식: **afterCommit 발행 + 재발행 API** (Outbox 미사용)
 
 **완료 조건**
-- [ ] 단위: `Drop.status(now)` 경계값 (openAt 직전/정각, closeAt 직전/정각), 생성 검증 실패 케이스
-- [ ] 통합: 드로우 등록 → 커밋 후 `drop.created` 발행, **롤백 시 발행되지 않음**
-- [ ] USER 권한으로 등록 시 403
+- [x] 단위: `Drop.status(now)` 경계값 (openAt 직전/정각, closeAt 직전/정각), 생성 검증 실패 케이스
+- [x] 통합: 드로우 등록 → 커밋 후 `drop.created` 발행, **롤백 시 발행되지 않음**
+- [x] USER 권한으로 등록 시 403
 
 ---
 
@@ -334,6 +335,7 @@ flowchart LR
 | 저장 컨슈머 실패 처리 | 0·4·6단계 | 3회 재시도 후 `{topic}.DLT` (랭킹은 로그·스킵) | ✅ 확정 (2026-11-16) |
 | 관리자 계정 생성 | 1단계 | 기동 시 `ADMIN_EMAIL`/`ADMIN_PASSWORD` 로 없으면 생성 | ✅ 확정 (2026-11-16) |
 | 드로우 이벤트 발행 방식 | 2단계 | 발행 어댑터 안의 afterCommit 발행 + 재발행 API | ✅ 확정 (2026-11-16) |
+| 드로우 등록 상한 | 2단계 | 오픈은 등록 후 365일 이내, 응모 기간 30일 이내 (범위 밖 시각 500 방지) | ✅ 확정(기본안) (2026-11-16) |
 | 컨슈머 저장 전 Redis 응모자 확인 | 4단계 | 확인 후 없으면 저장 스킵 | ✅ 확정 (2026-11-16) |
 | 쿠폰 저장 전 Redis 발급 확인 | 6단계 | 확인 후 없으면 저장 스킵 (초과 발급 방지) | ✅ 확정 (2026-11-16) |
 | 에러 계약 (헤더 누락 상태 코드, 코드 명명, 상세 메시지 노출) | 0단계 | `COMMON_MISSING_USER_HEADER`(400), `{SERVICE}_{REASON}`, 응답 메시지 고정·상세는 로그만 | ✅ 확정 (2026-11-16) |
