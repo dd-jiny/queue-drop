@@ -10,6 +10,8 @@
 | v1.4 | 2026-11-17 | 마이그레이션 번호 V3 → V2 (entry 는 V1 만 있음). T5-34(DrawResult 영속) 추가. 벌크 UPDATE clearAutomatically |
 | v1.5 | 2026-11-17 | Redis·Kafka 포트 id 를 원시 `long` 으로. `RedisEntryGate.close` 도 `call()` 래퍼로 감싸 Redis 장애를 `GateUnavailableException` 으로 (`closeDueDrops` 는 이를 잡아 WARN 만 남기고 재시도하지 않는다 — 이미 CLOSING 이라 다음 주기 대상이 아니고, 응모 차단은 Lua 의 closeAt 검사가 보장) |
 | v1.6 | 2026-11-17 | `KafkaDrawEventPublisher` 대기 시간: 상수 3초 → 4단계와 같은 `entry.publish.await-timeout`(3500ms) 주입 — `delivery.timeout.ms`(3000) 와 같으면 실제 발행 후 타임아웃 판정 → 재발행 중복 (신민아 MINOR). `EntryRedisKeys.all` 추가 |
+| v1.7 | 2026-11-17 | `drawIfReady`: `ApplicantCounter` 장애(`GateUnavailableException`) 시 해당 드로우만 건너뜀 (기존 코드는 루프 중단 → 다른 드로우 추첨 불가, 버그 수정). 응모 0건 드로우도 추첨 (확정(기본안)). `DrawSummaryResult.from`·`DrawOutcome.skipped` public (dto → service 패키지 호출) |
+| v1.8 | 2026-11-17 | 스케줄러 루프 드로우 단위 예외 격리: `closeDueDrops`·`drawReadyDrops` 가 드로우마다 `RuntimeException` 을 잡아 ERROR 로그 후 다음 드로우 진행 (실패가 반복되는 드로우가 다른 드로우·재발행을 막는 버그, 신민아 MAJOR). `publishSafely` 발행 실패/표시 실패 로그 분리. 리스크에 중복 발행 추가. 결과 조회의 없는 dropId 는 409 `NOT_COMPLETED` (확정(기본안)) |
 
 ---
 
@@ -257,7 +259,7 @@ public interface EntryGate {
 public record DrawCompletedPayload(Long dropId, int applicantCount, int winnerCount, Instant drawnAt) {}
 
 public record DrawSummaryResult(Long dropId, int applicantCount, int winnerCount, long seed, Instant drawnAt) {
-    static DrawSummaryResult from(DrawResult r) { /* application 내부에서만 변환 */ }
+    public static DrawSummaryResult from(DrawResult r) { /* service 패키지에서 호출. presentation 은 domain 을 import 하지 않아 쓸 수 없다 */ }
 }
 
 /** DrawTransaction 실행 결과. domain 타입을 밖으로 내보내지 않기 위한 application DTO */
@@ -268,7 +270,7 @@ public record Requester(Long userId, String role) {
 }
 
 public record DrawOutcome(boolean drawn, DrawCompletedPayload payload) {
-    static DrawOutcome skipped() { return new DrawOutcome(false, null); }
+    public static DrawOutcome skipped() { return new DrawOutcome(false, null); }
 }
 ```
 
@@ -305,9 +307,13 @@ public class DrawService {
     /** 1) 마감 잠금: OPEN → CLOSING, Redis state=CLOSED */
     public void closeDueDrops(Instant now) {
         for (Long dropId : snapshots.findDueOpenIds(now)) {
-            if (snapshots.markClosingIfOpen(dropId, now)) {   // 1곳만 true
-                closeGateQuietly(dropId);                     // 실패해도 응모 차단은 Lua 의 closeAt 검사가 보장
-                log.info("drop closed dropId={}", dropId);
+            try {
+                if (snapshots.markClosingIfOpen(dropId, now)) {   // 1곳만 true
+                    closeGateQuietly(dropId);                     // 실패해도 응모 차단은 Lua 의 closeAt 검사가 보장
+                    log.info("drop closed dropId={}", dropId);
+                }
+            } catch (RuntimeException e) {                        // 드로우 단위 격리: 다음 드로우는 계속
+                log.error("drop close failed dropId={}", dropId, e);
             }
         }
     }
@@ -315,13 +321,23 @@ public class DrawService {
     /** 2) CLOSING 드로우마다 건수 비교 후 추첨 */
     public void drawReadyDrops(Instant now) {
         for (DropSnapshot snapshot : snapshots.findClosing()) {
-            drawIfReady(snapshot, now);
+            try {
+                drawIfReady(snapshot, now);
+            } catch (RuntimeException e) {     // DB 예외 등. 롤백되어 CLOSING 유지 → 다음 주기 재시도
+                log.error("draw failed dropId={}", snapshot.getDropId(), e);
+            }
         }
     }
 
     private void drawIfReady(DropSnapshot snapshot, Instant now) {
         Long dropId = snapshot.getDropId();
-        long redisCount = applicantCounter.count(dropId);
+        long redisCount;
+        try {
+            redisCount = applicantCounter.count(dropId);
+        } catch (GateUnavailableException e) {
+            log.warn("applicant count failed dropId={}", dropId, e);   // 이 드로우만 건너뜀. 다음 주기 재시도
+            return;
+        }
         long dbCount = entries.countByDropId(dropId);
 
         if (redisCount != dbCount) {
@@ -377,15 +393,21 @@ public class DrawService {
     private void publishSafely(DrawCompletedPayload payload) {
         try {
             publisher.publishCompleted(payload);
-            results.markPublished(payload.dropId());
         } catch (RuntimeException e) {
             log.warn("draw.completed publish failed dropId={}", payload.dropId(), e);   // 다음 주기 재발행
+            return;
+        }
+        try {
+            results.markPublished(payload.dropId());
+        } catch (RuntimeException e) {
+            log.warn("draw.completed published but mark failed dropId={}", payload.dropId(), e);  // 다음 주기 중복 발행 (소비자 멱등)
         }
     }
 }
 ```
 - `DropSnapshot` 은 `DrawService` 내부(private)에서만 쓰이고 public 시그니처에 노출되지 않는다 (ArchUnit R6).
 - `AdminGuard` 는 entry application 에 product 와 같은 형태로 둔다 (package-private, `Requester.isAdmin()`).
+- 응모 0건(Redis 0 / DB 0)도 건수가 같으므로 추첨한다: DRAWN, 당첨 0명, `draw.completed`(0/0) 발행. CLOSING 에 묶어 두지 않는다 (확정(기본안)).
 - `safeCount` 는 `ApplicantCounter.count` 의 `GateUnavailableException` 을 잡아 -1 을 돌려준다 (로그용).
 - 수동 추첨은 상태를 앞에서 검사하지만, 최종 방어선은 `DrawTransaction` 의 조건부 UPDATE 다 (검사와 실행 사이에 스케줄러가 먼저 추첨하면 `skipped` → 409).
 - 건수 비교를 트랜잭션 밖에서 하는 이유: 불일치 시 아무것도 쓰지 않으므로 트랜잭션이 필요 없고, Redis 호출을 DB 트랜잭션 안에 넣지 않기 위해서다.
@@ -662,7 +684,7 @@ public record DrawSummaryResponse(Long dropId, int applicantCount, int winnerCou
 }
 ```
 - `seed` 를 문자열로 내보낸다 (구현 결정): JavaScript `Number` 는 2^53 을 넘는 long 을 정확히 표현하지 못한다.
-- 추첨 전 조회 → `ENTRY_DRAW_NOT_COMPLETED` (409).
+- 추첨 전 조회 → `ENTRY_DRAW_NOT_COMPLETED` (409) 없는 dropId 도 같은 409 다 (확정(기본안): 결과 조회는 `draw_results` 만 보며, 공개 조회라 드로우 존재 여부를 따로 구분해 알리지 않는다).
 
 #### `AdminDrawController` (D5-1)
 ```java
@@ -837,6 +859,7 @@ public class DrawCompletedListener {
 - **E2E 불안정성**: 시각 기반 시나리오라 CI 환경에서 느리면 실패할 수 있다. Awaitility 타임아웃을 넉넉히(30초) 두고, 기본 빌드에서는 제외한다.
 - **추첨 후 키 만료 실패**: Redis 장애로 `expireAfterDraw` 가 실패하면 그 드로우의 키는 만료 없이 남는다 (WARN 1줄). 재시도하지 않는다 — 정합성 영향이 없고 메모리 문제는 드로우 수백 개 단위에서나 생긴다 (E-42).
 - **수동 추첨으로 빠지는 응모**: 202 를 받았지만 저장이 DLT 에 머문 사용자는 수동 추첨에서 제외된다. 그래서 운영 절차는 DLT 재처리를 먼저 하고 API 를 부르는 순서다 (3.4). 보상까지 실패한 사용자는 503 을 받았으므로 응모가 성립하지 않은 것으로 본다.
+- **`draw.completed` 중복 발행**: 인스턴스 A 가 커밋 후 발행하기 전에 B 의 `republishUnpublished` 가 같은 결과를 읽어 발행할 수 있고, `markPublished` 실패 시에도 다음 주기에 다시 발행된다. product 소비자가 멱등(T5-25)이라 결과 영향 없음 (의도된 동작).
 - **스케줄러 시계**: 추첨 판단은 entry-service 인스턴스의 `Clock` 기준이다. 인스턴스 간 시계 차이가 크면 마감 잠금 시점이 몇 초 달라질 수 있으나, 응모 차단은 Redis Lua 의 시각 검사가 담당하므로 정합성에는 영향 없음.
 
 ---

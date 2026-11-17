@@ -4,6 +4,7 @@ import com.queuedrop.entry.domain.model.DropSnapshot;
 import com.queuedrop.entry.domain.model.SnapshotStatus;
 import com.queuedrop.entry.domain.repository.DropSnapshotRepository;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,6 +18,12 @@ public class InMemoryDropSnapshotRepository implements DropSnapshotRepository {
 
     private final Map<Long, DropSnapshot> store = new LinkedHashMap<>();
     private RuntimeException saveFailure;
+    private final Map<Long, RuntimeException> markClosingFailures = new HashMap<>();
+
+    /** 다음 markClosingIfOpen(dropId) 한 번만 이 예외를 던진다 (상태는 바꾸지 않음). */
+    public synchronized void failMarkClosingOnceFor(long dropId, RuntimeException failure) {
+        markClosingFailures.put(dropId, failure);
+    }
 
     /** 이후 saveIfAbsent 호출이 이 예외를 던진다. */
     public void failSaveWith(RuntimeException failure) {
@@ -46,6 +53,10 @@ public class InMemoryDropSnapshotRepository implements DropSnapshotRepository {
 
     @Override
     public synchronized boolean markClosingIfOpen(long dropId, Instant now) {
+        RuntimeException failure = markClosingFailures.remove(dropId);
+        if (failure != null) {
+            throw failure;
+        }
         DropSnapshot s = store.get(dropId);
         if (s == null || s.getStatus() != SnapshotStatus.OPEN || s.getCloseAt().isAfter(now)) {
             return false;

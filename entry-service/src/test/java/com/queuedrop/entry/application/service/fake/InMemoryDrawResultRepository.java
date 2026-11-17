@@ -6,19 +6,35 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
+import org.springframework.dao.DataIntegrityViolationException;
 
-/** dropId 키 인메모리 저장소. 같은 dropId 재저장은 예외 (DB uk_draw_results_drop_id 와 같은 의미). */
+/**
+ * dropId 키 인메모리 저장소. save 는 AtomicLong 으로 id 를 부여한 인스턴스를 돌려준다 (DB IDENTITY 와 같은 의미).
+ * 같은 dropId 재저장은 DataIntegrityViolationException (DrawResultRepositoryImpl.saveAndFlush 의 uk_draw_results_drop_id 위반과 같은 예외).
+ */
 public class InMemoryDrawResultRepository implements DrawResultRepository {
 
     private final Map<Long, DrawResult> store = new LinkedHashMap<>();
+    private final AtomicLong idSequence = new AtomicLong();
+    private RuntimeException markPublishedFailure;
+
+    /** 다음 markPublished 한 번만 이 예외를 던진다 (published 는 바뀌지 않음). */
+    public synchronized void failMarkPublishedNext(RuntimeException failure) {
+        this.markPublishedFailure = failure;
+    }
 
     @Override
     public synchronized DrawResult save(DrawResult result) {
         if (store.containsKey(result.getDropId())) {
-            throw new IllegalStateException("draw_results drop_id 중복: dropId=" + result.getDropId());
+            throw new DataIntegrityViolationException(
+                    "duplicate key value violates unique constraint \"uk_draw_results_drop_id\": dropId="
+                            + result.getDropId());
         }
-        store.put(result.getDropId(), result);
-        return result;
+        DrawResult saved = DrawResult.restore(idSequence.incrementAndGet(), result.getDropId(), result.getSeed(),
+                result.getApplicantCount(), result.getWinnerCount(), result.getDrawnAt(), result.isPublished());
+        store.put(saved.getDropId(), saved);
+        return saved;
     }
 
     @Override
@@ -33,6 +49,11 @@ public class InMemoryDrawResultRepository implements DrawResultRepository {
 
     @Override
     public synchronized void markPublished(long dropId) {
+        if (markPublishedFailure != null) {
+            RuntimeException failure = markPublishedFailure;
+            markPublishedFailure = null;
+            throw failure;
+        }
         store.computeIfPresent(dropId, (id, r) -> r.markPublished());
     }
 

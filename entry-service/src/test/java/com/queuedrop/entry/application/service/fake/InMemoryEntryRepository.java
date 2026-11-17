@@ -4,6 +4,7 @@ import com.queuedrop.entry.domain.model.Entry;
 import com.queuedrop.entry.domain.model.EntryStatus;
 import com.queuedrop.entry.domain.repository.EntryRepository;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +24,12 @@ public class InMemoryEntryRepository implements EntryRepository {
     private final Map<Key, Entry> store = new LinkedHashMap<>();
     private final AtomicLong idSequence = new AtomicLong();
     private RuntimeException markResultsFailure;
+    private final Map<Long, RuntimeException> countFailures = new HashMap<>();
+
+    /** 다음 countByDropId(dropId) 한 번만 이 예외를 던진다. */
+    public synchronized void failCountOnceFor(long dropId, RuntimeException failure) {
+        countFailures.put(dropId, failure);
+    }
 
     /** 이후 markResults 호출이 이 예외를 던진다 (아무 행도 바꾸지 않음). */
     public void failMarkResultsWith(RuntimeException failure) {
@@ -62,6 +69,10 @@ public class InMemoryEntryRepository implements EntryRepository {
 
     @Override
     public synchronized long countByDropId(long dropId) {
+        RuntimeException failure = countFailures.remove(dropId);
+        if (failure != null) {
+            throw failure;
+        }
         return store.values().stream().filter(e -> e.getDropId() == dropId).count();
     }
 
