@@ -13,6 +13,7 @@ import com.queuedrop.entry.application.service.DropSnapshotRegisterService;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.LongStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -27,8 +28,10 @@ import org.springframework.kafka.core.KafkaTemplate;
 /**
  * 시나리오 테스트 공통 설정. 모든 시나리오 클래스가 이 클래스를 상속해 같은 컨텍스트를 쓴다
  * (@AutoConfigureMockMvc 도 공통으로 둬서 컨텍스트 캐시 키를 맞춘다).
+ * 테스트 기본값(src/test/resources/config/application.yml)은 스케줄러 꺼짐이지만, T5-21 등록 검증을 위해 켠다.
+ * 자동 실행은 NoOpTaskScheduler 가 막는다.
  */
-@SpringBootTest
+@SpringBootTest(properties = "entry.draw.scheduler-enabled=true")
 @AutoConfigureMockMvc
 @Import({PostgresContainerConfig.class, RedisContainerConfig.class, KafkaContainerConfig.class,
         ScenarioTestSupport.Config.class})
@@ -44,15 +47,17 @@ abstract class ScenarioTestBase {
     @Autowired KafkaTemplate<String, Object> kafkaTemplate;
     @Autowired DropSnapshotRegisterService registerService;
     @Autowired ScenarioTestSupport.ControllableEntryEventPublisher publisher;
+    @Autowired ScenarioTestSupport.RecordingDrawEventPublisher drawPublisher;
 
     @BeforeEach
     void resetState() throws Exception {
         publisher.reset();
+        drawPublisher.reset();
         redis.execute((RedisCallback<Object>) connection -> {
             connection.serverCommands().flushAll();
             return null;
         });
-        jdbc.update("TRUNCATE TABLE entries, drop_snapshots");
+        jdbc.update("TRUNCATE TABLE entries, drop_snapshots, draw_results");
         warmUpProducer();
     }
 
@@ -64,7 +69,7 @@ abstract class ScenarioTestBase {
         if (producerWarmedUp) {
             return;
         }
-        awaitTopicMetadata(kafkaTemplate, Topics.ENTRY_CREATED);   // NewTopic 직후 메타데이터 전파 대기
+        awaitTopicMetadata(kafkaTemplate, Topics.ENTRY_CREATED, Topics.DRAW_COMPLETED);   // NewTopic 직후 메타데이터 전파 대기
         kafkaTemplate.send(Topics.ENTRY_CREATED, "0:0",
                         new EntryCreated(UUID.randomUUID().toString(), 0L, 0L, 1, ScenarioTestSupport.NOW))
                 .get(10, TimeUnit.SECONDS);
@@ -101,6 +106,40 @@ abstract class ScenarioTestBase {
     Integer dbSeq(long dropId, long userId) {
         return jdbc.query("SELECT entry_seq FROM entries WHERE drop_id = ? AND user_id = ?",
                 rs -> rs.next() ? rs.getInt(1) : null, dropId, userId);
+    }
+
+    /** 5단계: 마감 시각(PAST_CLOSE_AT)이 NOW 보다 앞선 OPEN 드로우. drop.created 수신과 같은 경로로 DB·Redis 를 만든다 */
+    void givenDueDrop(long dropId, int capacity, int winnerCount) {
+        registerService.register(new DropSnapshotRegisterCommand(
+                dropId, capacity, winnerCount, ScenarioTestSupport.PAST_OPEN_AT, ScenarioTestSupport.PAST_CLOSE_AT));
+    }
+
+    /** 5단계: 판정 성공한 응모자(Redis applicants) userId fromUser ~ toUser */
+    void givenRedisApplicants(long dropId, long fromUser, long toUser) {
+        String[] users = LongStream.rangeClosed(fromUser, toUser).mapToObj(String::valueOf).toArray(String[]::new);
+        redis.opsForSet().add("entry:" + dropId + ":applicants", users);
+    }
+
+    /** 5단계: 저장 컨슈머가 저장을 마친 응모 (APPLIED). entry_seq = userId */
+    void givenSavedEntries(long dropId, long fromUser, long toUser) {
+        jdbc.batchUpdate("INSERT INTO entries (drop_id, user_id, entry_seq, status, applied_at) VALUES (?, ?, ?, 'APPLIED', ?)",
+                LongStream.rangeClosed(fromUser, toUser)
+                        .mapToObj(u -> new Object[]{dropId, u, (int) u,
+                                java.sql.Timestamp.from(ScenarioTestSupport.PAST_OPEN_AT.plusSeconds(u))})
+                        .toList());
+    }
+
+    String snapshotStatus(long dropId) {
+        return jdbc.queryForObject("SELECT status FROM drop_snapshots WHERE drop_id = ?", String.class, dropId);
+    }
+
+    long drawResultCount(long dropId) {
+        return jdbc.queryForObject("SELECT count(*) FROM draw_results WHERE drop_id = ?", Long.class, dropId);
+    }
+
+    long entryCountByStatus(long dropId, String status) {
+        return jdbc.queryForObject("SELECT count(*) FROM entries WHERE drop_id = ? AND status = ?", Long.class,
+                dropId, status);
     }
 
     /** entry.created 를 모두 소비할 때까지 기다린다 (늦게 처리되는 이벤트까지 반영된 뒤 단언하려고) */

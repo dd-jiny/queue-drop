@@ -1,0 +1,7 @@
+# 테스트 클래스패스 전용 덮어쓰기. Spring Boot 는 classpath:/config/application.yml 을
+# classpath:/application.yml(main) 보다 우선 적용하므로 이 모듈의 모든 @SpringBootTest 에 빠짐없이 걸린다.
+# DrawScheduler 가 시스템 Clock 으로 5초마다 돌면, 실제 시각이 테스트 마감 시각을 지난 뒤 테스트 드로우를
+# 마감해 간헐 실패한다 (단계 문서 5단계 v1.11). 스케줄러를 검증하는 시나리오 컨텍스트만 켠다 (ScenarioTestBase).
+entry:
+  draw:
+    scheduler-enabled: false

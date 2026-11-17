@@ -1,9 +1,12 @@
 package com.queuedrop.entry.scenario;
 
 import com.queuedrop.common.event.Topics;
+import com.queuedrop.entry.application.dto.DrawCompletedPayload;
+import com.queuedrop.entry.application.port.DrawEventPublisher;
 import com.queuedrop.entry.application.port.EntryCreatedPayload;
 import com.queuedrop.entry.application.port.EntryEventPublisher;
 import com.queuedrop.entry.application.port.EventPublishException;
+import com.queuedrop.entry.infrastructure.messaging.KafkaDrawEventPublisher;
 import com.queuedrop.entry.infrastructure.messaging.KafkaEntryEventPublisher;
 import static org.awaitility.Awaitility.await;
 
@@ -11,9 +14,12 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledFuture;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.ListOffsetsResult;
@@ -27,6 +33,8 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.config.TopicBuilder;
 import org.springframework.kafka.core.KafkaAdmin;
+import org.springframework.scheduling.TaskScheduler;
+import org.springframework.scheduling.Trigger;
 
 /**
  * 4단계 시나리오 테스트 공통 지원 (단계 문서 4.3, 4.4).
@@ -38,6 +46,9 @@ final class ScenarioTestSupport {
     static final Instant NOW = Instant.parse("2026-11-20T10:30:00Z");
     static final Instant OPEN_AT = Instant.parse("2026-11-20T10:00:00Z");
     static final Instant CLOSE_AT = Instant.parse("2026-11-20T12:00:00Z");
+    /** 5단계: 마감이 지난 드로우 기간 (NOW 기준 30분 전 마감) */
+    static final Instant PAST_OPEN_AT = Instant.parse("2026-11-20T09:00:00Z");
+    static final Instant PAST_CLOSE_AT = Instant.parse("2026-11-20T10:00:00Z");
     static final String CONSUMER_GROUP = "entry-service";
 
     private ScenarioTestSupport() {}
@@ -49,6 +60,17 @@ final class ScenarioTestSupport {
         @Bean NewTopic entryCreatedTopic()    { return TopicBuilder.name(Topics.ENTRY_CREATED).partitions(6).replicas(1).build(); }
         @Bean NewTopic dropCreatedDltTopic()  { return TopicBuilder.name(Topics.DROP_CREATED_DLT).partitions(1).replicas(1).build(); }
         @Bean NewTopic entryCreatedDltTopic() { return TopicBuilder.name(Topics.ENTRY_CREATED_DLT).partitions(6).replicas(1).build(); }
+        @Bean NewTopic drawCompletedTopic()   { return TopicBuilder.name(Topics.DRAW_COMPLETED).partitions(1).replicas(1).build(); }
+
+        /**
+         * 스케줄 자동 실행 차단 (5단계). @Scheduled 등록은 그대로 되지만 실행하지 않는다 — fixedDelay 는 기동 직후 1회
+         * 실행되므로 interval 만 키우면 첫 실행이 테스트 준비와 겹칠 수 있다. 테스트는 DrawScheduler.run() 을 직접 호출한다.
+         * 이름이 taskScheduler 라 Boot 자동 설정 스케줄러는 만들어지지 않는다.
+         */
+        @Bean
+        TaskScheduler taskScheduler() {
+            return new NoOpTaskScheduler();
+        }
 
         @Bean @Primary
         Clock fixedClock() {
@@ -60,6 +82,41 @@ final class ScenarioTestSupport {
                                                                         JdbcTemplate jdbc) {
             return new ControllableEntryEventPublisher(delegate, jdbc);
         }
+
+        @Bean @Primary
+        RecordingDrawEventPublisher recordingDrawEventPublisher(KafkaDrawEventPublisher delegate) {
+            return new RecordingDrawEventPublisher(delegate);
+        }
+    }
+
+    /** 실제 KafkaDrawEventPublisher 로 보내고, 브로커 기록에 성공한 발행만 기록한다 (5단계 T5-21·T5-22) */
+    static final class RecordingDrawEventPublisher implements DrawEventPublisher {
+
+        private final DrawEventPublisher delegate;
+        private final List<DrawCompletedPayload> published = new CopyOnWriteArrayList<>();
+
+        RecordingDrawEventPublisher(DrawEventPublisher delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void publishCompleted(DrawCompletedPayload payload) {
+            delegate.publishCompleted(payload);
+            published.add(payload);
+        }
+
+        List<DrawCompletedPayload> published() { return List.copyOf(published); }
+        void reset() { published.clear(); }
+    }
+
+    /** 어떤 작업도 실행하지 않는 TaskScheduler. 반환 future 는 null (ScheduledTaskRegistrar 가 null 을 허용) */
+    static final class NoOpTaskScheduler implements TaskScheduler {
+        @Override public ScheduledFuture<?> schedule(Runnable task, Trigger trigger) { return null; }
+        @Override public ScheduledFuture<?> schedule(Runnable task, Instant startTime) { return null; }
+        @Override public ScheduledFuture<?> scheduleAtFixedRate(Runnable task, Instant startTime, Duration period) { return null; }
+        @Override public ScheduledFuture<?> scheduleAtFixedRate(Runnable task, Duration period) { return null; }
+        @Override public ScheduledFuture<?> scheduleWithFixedDelay(Runnable task, Instant startTime, Duration delay) { return null; }
+        @Override public ScheduledFuture<?> scheduleWithFixedDelay(Runnable task, Duration delay) { return null; }
     }
 
     /**

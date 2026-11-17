@@ -12,6 +12,9 @@
 | v1.6 | 2026-11-17 | `KafkaDrawEventPublisher` 대기 시간: 상수 3초 → 4단계와 같은 `entry.publish.await-timeout`(3500ms) 주입 — `delivery.timeout.ms`(3000) 와 같으면 실제 발행 후 타임아웃 판정 → 재발행 중복 (신민아 MINOR). `EntryRedisKeys.all` 추가 |
 | v1.7 | 2026-11-17 | `drawIfReady`: `ApplicantCounter` 장애(`GateUnavailableException`) 시 해당 드로우만 건너뜀 (기존 코드는 루프 중단 → 다른 드로우 추첨 불가, 버그 수정). 응모 0건 드로우도 추첨 (확정(기본안)). `DrawSummaryResult.from`·`DrawOutcome.skipped` public (dto → service 패키지 호출) |
 | v1.8 | 2026-11-17 | 스케줄러 루프 드로우 단위 예외 격리: `closeDueDrops`·`drawReadyDrops` 가 드로우마다 `RuntimeException` 을 잡아 ERROR 로그 후 다음 드로우 진행 (실패가 반복되는 드로우가 다른 드로우·재발행을 막는 버그, 신민아 MAJOR). `publishSafely` 발행 실패/표시 실패 로그 분리. 리스크에 중복 발행 추가. 결과 조회의 없는 dropId 는 409 `NOT_COMPLETED` (확정(기본안)) |
+| v1.9 | 2026-11-17 | `SchedulingConfig` 는 `@EnableScheduling` 만 (Clock 빈은 기존 `ClockConfig`). `DrawProperties` 바인딩은 `infrastructure/config/DrawPropertiesConfig` (`@Value` + 0 초과 검증, queue `AdmissionProperties` 방식) |
+| v1.10 | 2026-11-17 | 컨트롤러 경로 `{dropId:\d+}` (4단계 EntryController 와 통일). T5-21 발행 단언: 발행 payload 1종 (재발행 중복 허용) |
+| v1.11 | 2026-11-17 | `DrawScheduler` 에 `entry.draw.scheduler-enabled` 조건 추가. 스케줄러를 검증하지 않는 `@SpringBootTest` 는 끔 — 시스템 Clock 실행이 실제 시각 경과 후 4단계 테스트 드로우를 마감해 간헐 실패 (신민아 MAJOR) |
 
 ---
 
@@ -89,7 +92,7 @@ entry-service/src/main/java/com/queuedrop/entry/
 │   ├── random
 │   │   └── SecureRandomSeedGenerator.java           [신규]
 │   └── config
-│       └── SchedulingConfig.java                    [신규] @EnableScheduling, Clock 빈
+│       └── SchedulingConfig.java                    [신규] @EnableScheduling (Clock 빈은 기존 ClockConfig)
 └── presentation
     ├── scheduler
     │   └── DrawScheduler.java                       [신규]
@@ -626,9 +629,7 @@ public class SecureRandomSeedGenerator implements SeedGenerator {
 
 @Configuration
 @EnableScheduling
-public class SchedulingConfig {
-    @Bean Clock clock() { return Clock.system(ZoneId.of("Asia/Seoul")); }
-}
+public class SchedulingConfig {}   // Clock 빈은 4단계 ClockConfig 를 그대로 쓴다 (중복 빈 금지)
 ```
 
 #### 설정 (`application.yml` 추가)
@@ -636,6 +637,7 @@ public class SchedulingConfig {
 entry:
   draw:
     interval-ms: 5000          # 추첨 스케줄러 주기
+    scheduler-enabled: true    # false 면 DrawScheduler 빈을 만들지 않는다 (테스트용)
     closing-warn-threshold: 5m # CLOSING 장기화 경고 기준 (경고 후 관리자 수동 추첨, D5-1)
     key-ttl-after-draw: 1d     # 추첨 커밋 후 응모 Redis 키 만료 (E-42)
 ```
@@ -647,6 +649,7 @@ entry:
 #### `DrawScheduler`
 ```java
 @Component
+@ConditionalOnProperty(name = "entry.draw.scheduler-enabled", havingValue = "true", matchIfMissing = true)
 @RequiredArgsConstructor
 public class DrawScheduler {
     private final DrawService drawService;
@@ -661,12 +664,14 @@ public class DrawScheduler {
     }
 }
 ```
+- `entry.draw.scheduler-enabled: false` 면 빈을 만들지 않는다 (queue `AdmissionScheduler` 와 같은 방식). 스케줄러를 검증하지 않는 `@SpringBootTest` 는 끈다: 시스템 Clock 으로 돌면 실제 시각이 테스트 데이터의 마감 시각을 지난 뒤 드로우를 마감해 다른 테스트를 깨뜨린다.
+- 조회 단계(`findDueOpenIds`·`findClosing`) 예외는 `run()` 밖으로 나가 그 주기의 다음 단계를 건너뛰지만, Spring 이 다음 주기를 계속 실행하므로 한 주기 지연뿐이다 (그대로 둠).
 - `fixedDelay` 를 쓰는 이유: 이전 실행이 끝난 뒤 간격을 두므로 한 인스턴스 안에서 실행이 겹치지 않는다. 인스턴스 간 중복은 조건부 UPDATE 가 막는다 (분산 락 불필요).
 
 #### `DrawResultController`
 ```java
 @RestController
-@RequestMapping("/api/entries/drops/{dropId}")
+@RequestMapping("/api/entries/drops/{dropId:\\d+}")   // 4단계 EntryController 와 같은 패턴 (숫자 아니면 404)
 @RequiredArgsConstructor
 public class DrawResultController {
     private final DrawQueryService queryService;
@@ -689,7 +694,7 @@ public record DrawSummaryResponse(Long dropId, int applicantCount, int winnerCou
 #### `AdminDrawController` (D5-1)
 ```java
 @RestController
-@RequestMapping("/api/entries/admin/drops/{dropId}")
+@RequestMapping("/api/entries/admin/drops/{dropId:\\d+}")
 @RequiredArgsConstructor
 public class AdminDrawController {
     private final DrawService drawService;
@@ -802,7 +807,7 @@ public class DrawCompletedListener {
 | T5-18 | infra 통합 (PostgreSQL) | `DrawTransactionTest` | G: `markResults` 에서 예외 주입 / W: `execute` / T: 롤백 → 상태 CLOSING, entries 모두 APPLIED, draw_results 없음 | NFR-03 |
 | T5-19 | infra 통합 (Redis) | `RedisEntryGateCloseTest` | G: OPEN 드로우, 토큰 보유 / W: `close` 후 `tryApply` / T: `CLOSED` | REQ-ENTRY-05 |
 | T5-20 | infra 통합 (Kafka) | `KafkaDrawEventPublisherTest` | W: `publishCompleted` / T: `draw.completed` 토픽에 키=dropId 메시지 1건 | - |
-| T5-21 | 통합 (전체 entry 컨텍스트) | `DrawSchedulerIntegrationTest` | G: 응모 100건 저장, 마감 지남 / W: `DrawScheduler` 빈 2개(같은 컨텍스트에 두 번째 인스턴스 수동 생성)를 동시 실행 / T: `draw_results` 1건, 발행 1건 | REQ-ENTRY-05 |
+| T5-21 | 통합 (전체 entry 컨텍스트) | `DrawSchedulerIntegrationTest` | G: 응모 100건 저장, 마감 지남 / W: `DrawScheduler` 빈 2개(같은 컨텍스트에 두 번째 인스턴스 수동 생성)를 동시 실행 / T: `draw_results` 1건, 발행 payload 1종 (같은 payload 재발행 중복은 허용 — 6장 리스크) | REQ-ENTRY-05 |
 | T5-22 | 통합 (전체 entry 컨텍스트) | `DrawSchedulerIntegrationTest` | G: Redis 응모자 100, DB 90 / W: 스케줄 1회 → 나머지 10건 저장 → 스케줄 1회 / T: 1회차 추첨 없음, 2회차 추첨 | NFR-03 |
 | T5-23 | presentation 슬라이스 | `DrawResultControllerTest` | G: 추첨 전 / 후 / W: `GET /result` / T: 409 `ENTRY_DRAW_NOT_COMPLETED` / 200 + seed 문자열 | REQ-ENTRY-06 |
 | T5-24 | 통합 (entry 컨텍스트) | `EntryQueryAfterDrawTest` | G: 추첨 완료 / W: `GET /me` / T: 당첨자 WON, 낙첨자 LOST | REQ-ENTRY-06 |
