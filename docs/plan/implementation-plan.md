@@ -14,6 +14,7 @@
 | v1.8 | 2026-11-17 | 4단계 사용자 결정 2건(E-40 요청 ID·저장 확정 기반 유령 이벤트 대응, E-41 Redis 타임아웃 시 보상 후 503) 4장 표에 추가 |
 | v1.9 | 2026-11-17 | 4단계 완료: 진행 현황·체크리스트 갱신 (entry-service 테스트 223건, 전체 빌드, 로컬 compose 에서 등록 → 진입 → 입장 → 응모 202 → 내 응모 조회 확인) |
 | v2.0 | 2026-11-17 | 5단계 착수: 추첨 건수 불일치 정책 확정(사용자 결정, 관리자 수동 추첨) |
+| v2.1 | 2026-11-17 | 5단계 완료: 진행 현황·완료 조건 갱신 |
 
 ---
 
@@ -90,7 +91,7 @@ flowchart LR
 | 2. 드로우 | `feat/phase-2-drop` | [phase-2-drop.md](phases/phase-2-drop.md) | ✅ 완료 (2026-11-16) |
 | 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ✅ 완료 (2026-11-16) |
 | 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ✅ 완료 (2026-11-17) |
-| 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ⬜ 대기 |
+| 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ✅ 완료 (2026-11-17) |
 | 6. 쿠폰 | `feat/phase-6-coupon` | [phase-6-coupon.md](phases/phase-6-coupon.md) | ⬜ 대기 |
 | 7. 랭킹 | `feat/phase-7-ranking` | [phase-7-ranking.md](phases/phase-7-ranking.md) | ⬜ 대기 |
 | 8. 검증 | `test/phase-8-load-test` | [phase-8-load-test.md](phases/phase-8-load-test.md) | ⬜ 대기 |
@@ -254,15 +255,15 @@ flowchart LR
   - [ ] `DrawCompletedListener` → `Drop.markDrawn()`
 
 **결정 필요**
-- [ ] 건수 불일치가 계속될 때: **경고 후 관리자 수동 확정** (기본안) vs 일정 시간 후 강제 추첨
+- [x] 건수 불일치가 계속될 때: **경고 후 관리자 수동 확정** (사용자 결정, 2026-11-17)
 
 **완료 조건**
-- [ ] 단위(`Drawer`): 같은 시드 → 같은 결과, K ≥ 응모자 수 → 전원 당첨, 응모자 0 → 당첨 0
-- [ ] 통합: 스케줄러 2개 동시 실행 → `draw_results` 1건 (중복 추첨 없음)
-- [ ] 통합: DB 응모 수가 부족한 상태 → 추첨 대기, 저장 완료 후 다음 주기에 추첨
-- [ ] 통합: 마감 후 응모 → `CLOSED`
-- [ ] 통합: 추첨 후 product 드로우 상태 `DRAWN`
-- [ ] **E2E: 드로우 등록 → 대기열 → 응모 → 마감 → 추첨 → 결과 조회** 시나리오 1회 통과
+- [x] 단위(`Drawer`): 같은 시드 → 같은 결과, K ≥ 응모자 수 → 전원 당첨, 응모자 0 → 당첨 0
+- [x] 통합: 스케줄러 2개 동시 실행 → `draw_results` 1건 (중복 추첨 없음)
+- [x] 통합: DB 응모 수가 부족한 상태 → 추첨 대기, 저장 완료 후 다음 주기에 추첨
+- [x] 통합: 마감 후 응모 → `CLOSED`
+- [x] 통합: 추첨 후 product 드로우 상태 `DRAWN`
+- [x] **E2E: 드로우 등록 → 대기열 → 응모 → 마감 → 추첨 → 결과 조회** 시나리오 1회 통과
 
 ---
 

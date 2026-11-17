@@ -9,6 +9,7 @@
 | v2.2 | 2026-11-16 | 1.1 실패 응답을 `ApplicationException(EntryErrorCode)` + `GlobalExceptionHandler` 로, 1.3 잘못된 `drop.created` 는 application 이 로그 후 스킵(`InvalidDropSnapshotException` 제거) | phase-4 구현 상세 v1.2 |
 | v2.3 | 2026-11-17 | 1.1 `EntryGate` 시그니처 변경 — `tryApply(..., eventId)`, `compensate(dropId, userId, eventId) CompensationResult`, `claimForSave(dropId, userId, eventId) boolean` 추가, `GateUnavailableException`·`CompensationResult` 추가, `EntrySaveCommand.eventId` 추가, `RedisEntryGate` 에 claim.lua (사용자 결정, E-40·E-41) | concurrency-consistency.md D2 v1.3 |
 | v2.4 | 2026-11-17 | 1.2 `AdminDrawController`, `DrawService.drawManually` 추가 (관리자 수동 추첨). `EntryGate.expireAfterDraw` 는 1.1 포트 목록에 추가 | draw.md v1.2, phase-5 D5-1·D5-4 |
+| v2.5 | 2026-11-17 | 1.2 구현 결과 반영: `DrawService` 의존(`DrawResultRepository`, `DrawProperties`), `AdminGuard`, `DropSnapshot.isClosing/isDrawn/isClosingTooLong`, 드로우 단위 격리·스케줄러 토글 설명 | phase-5 구현 상세 v1.7~v1.13 |
 
 ## 쉬운 설명
 > 각 서비스는 창구(presentation) → 매니저(application) → 장인(domain) 순서로 일을 넘기고,
@@ -197,6 +198,8 @@ classDiagram
             -EntryGate gate
             -DrawTransaction drawTransaction
             -DrawEventPublisher publisher
+            -DrawResultRepository results
+            -DrawProperties properties
             +closeDueDrops(now)
             +drawReadyDrops(now)
             +republishUnpublished()
@@ -214,6 +217,14 @@ classDiagram
         }
         class DrawQueryService {
             +summary(dropId) DrawSummaryResult
+        }
+        class AdminGuard {
+            +requireAdmin(Requester)$
+        }
+        class DrawProperties {
+            <<record>>
+            Duration closingWarnThreshold
+            Duration keyTtlAfterDraw
         }
         class SeedGenerator {
             <<interface>>
@@ -235,6 +246,9 @@ classDiagram
             -Instant closeAt
             -SnapshotStatus status
             +isDue(now) boolean
+            +isClosing() boolean
+            +isDrawn() boolean
+            +isClosingTooLong(now, threshold) boolean
         }
         class Drawer {
             +draw(List~Long~ orderedUserIds, int k, long seed) Set~Long~
@@ -276,6 +290,8 @@ classDiagram
     DrawService --> ApplicantCounter
     DrawService --> DrawTransaction
     DrawService --> DrawEventPublisher
+    DrawService --> DrawResultRepository
+    DrawService ..> AdminGuard
     DrawTransaction --> DropSnapshotRepository
     DrawTransaction --> EntryRepository
     DrawTransaction --> DrawResultRepository
@@ -293,7 +309,9 @@ classDiagram
 - 내 결과 조회(`/drops/{dropId}/me`)는 응모 단건 조회와 같은 API 라 `EntryController` 가 맡는다. `DrawResultController` 는 추첨 요약만 담당한다.
 - `DrawService.republishUnpublished()` 가 `published=false` 인 결과의 `draw.completed` 를 다시 발행한다.
 - 당첨/낙첨 반영도 엔티티 루프 대신 `markResults()` 벌크 연산 — JPA 엔티티 분리로 변경 감지를 쓰지 않기 때문 ([layered-architecture.md](../02-architecture/layered-architecture.md) 7장).
-- infrastructure 구현체(`DropSnapshotRepositoryImpl`, `RedisApplicantCounter`, `KafkaDrawEventPublisher` 등)는 1.1 과 같은 패턴이라 생략.
+- `closeDueDrops`·`drawReadyDrops` 는 드로우마다 예외를 잡아 다음 드로우로 넘어간다. `DrawScheduler` 는 `entry.draw.scheduler-enabled` 로 끌 수 있다 (테스트용).
+- `DrawProperties` 는 application 의 순수 record 이고, 값 바인딩·검증은 infrastructure `DrawPropertiesConfig` 가 한다.
+- infrastructure 구현체(`DropSnapshotRepositoryImpl`, `RedisApplicantCounter`, `KafkaDrawEventPublisher`, `SecureRandomSeedGenerator`, `SchedulingConfig` 등)는 1.1 과 같은 패턴이라 생략.
 
 ### 1.3 드로우 정보 수신
 | 계층 | 클래스 |
