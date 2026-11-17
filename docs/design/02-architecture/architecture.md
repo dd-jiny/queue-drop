@@ -10,6 +10,7 @@
 | v1.4 | 2026-11-16 | queue 키(`meta`·`seq`·`waiting`) 만료 시각 `closeAt + 1일` 명시 | phase-3 구현 상세 v1.2 |
 | v1.5 | 2026-11-17 | Redis 키 `entry:{dropId}:requests`(요청 ID), `entry:{dropId}:persisted`(저장 확정) 추가 — 유령 이벤트·Redis 타임아웃 대응 (사용자 결정, E-40·E-41). TTL 은 5단계(E-42) | concurrency-consistency.md D2 v1.3 |
 | v1.6 | 2026-11-17 | 응모 키 6개 TTL: 추첨 커밋 후 EXPIRE 1일 (E-42 기본안) | draw.md v1.2 |
+| v1.7 | 2026-11-17 | product `draw.completed` 컨슈머를 DB 저장 컨슈머로 분류: 3회 재시도 후 `draw.completed.DLT` (드로우 없음은 로그 후 커밋). 추첨 완료 반영 누락을 DLT 재처리로 복구 | phase-5 구현 상세 v1.12 |
 
 ---
 
@@ -81,10 +82,10 @@ flowchart LR
 | `entry.created` | entry | entry(저장), ranking | eventId, dropId, userId, entrySeq, appliedAt | `dropId:userId` |
 | `draw.completed` | entry | product | dropId, applicantCount, winnerCount, drawnAt | dropId |
 | `coupon.issued` | coupon | coupon(저장) | eventId, couponEventId, userId, issuedAt | `couponEventId:userId` |
-| `drop.created.DLT` / `entry.created.DLT` / `coupon.issued.DLT` | (DLT) | 운영자 재처리 | 원본과 동일 | 원본과 동일 |
+| `drop.created.DLT` / `entry.created.DLT` / `draw.completed.DLT` / `coupon.issued.DLT` | (DLT) | 운영자 재처리 | 원본과 동일 | 원본과 동일 |
 
 - 이벤트 스키마는 `common` 모듈에 둔다.
-- **컨슈머 실패 정책**: DB 에 저장하는 컨슈머(entry 의 `drop.created`·`entry.created`, coupon 의 `coupon.issued`)는 1초 간격 3회 재시도 후 `{topic}.DLT` 로 보낸다. Redis 만 쓰는 컨슈머(queue, ranking)와 product 의 `draw.completed` 는 3회 재시도 후 로그를 남기고 건너뛴다. 토픽 자동 생성이 꺼져 있으므로 DLT 도 미리 생성한다 ([infrastructure.md](../03-infrastructure/infrastructure.md) 5장).
+- **컨슈머 실패 정책**: DB 에 저장하는 컨슈머(entry 의 `drop.created`·`entry.created`, product 의 `draw.completed`, coupon 의 `coupon.issued`)는 1초 간격 3회 재시도 후 `{topic}.DLT` 로 보낸다 (product 의 `draw.completed` 중 드로우 없음은 재시도·DLT 없이 로그 후 커밋, E-30). Redis 만 쓰는 컨슈머(queue, ranking)는 3회 재시도 후 로그를 남기고 건너뛴다. 토픽 자동 생성이 꺼져 있으므로 DLT 도 미리 생성한다 ([infrastructure.md](../03-infrastructure/infrastructure.md) 5장).
 - 모든 컨슈머는 **at-least-once 전제로 멱등**하게 처리한다 (DB 유니크 제약 / Redis dedupe Set).
 - `entry.created` 키를 `dropId` 단독으로 두면 인기 드로우 하나가 한 파티션에 몰리므로 `dropId:userId` 로 분산. 드로우 내 순서는 `entrySeq` 가 보장하므로 파티션 순서에 의존하지 않는다.
 

@@ -15,6 +15,7 @@
 | v1.9 | 2026-11-17 | `SchedulingConfig` 는 `@EnableScheduling` 만 (Clock 빈은 기존 `ClockConfig`). `DrawProperties` 바인딩은 `infrastructure/config/DrawPropertiesConfig` (`@Value` + 0 초과 검증, queue `AdmissionProperties` 방식) |
 | v1.10 | 2026-11-17 | 컨트롤러 경로 `{dropId:\d+}` (4단계 EntryController 와 통일). T5-21 발행 단언: 발행 payload 1종 (재발행 중복 허용) |
 | v1.11 | 2026-11-17 | `DrawScheduler` 에 `entry.draw.scheduler-enabled` 조건 추가. 스케줄러를 검증하지 않는 `@SpringBootTest` 는 끔 — 시스템 Clock 실행이 실제 시각 경과 후 4단계 테스트 드로우를 마감해 간헐 실패 (신민아 MAJOR) |
+| v1.12 | 2026-11-17 | product 컨슈머 실패 처리 구체화 (architecture.md v1.7·infrastructure.md v1.3 의 "로그 후 건너뜀"을 DLT 로 정정, 신민아 BLOCKER: DLT 토픽 사전 생성 누락): 재시도 1초×3, DROP_NOT_FOUND 는 재시도·DLT 모두 없이 로그 후 커밋 (recoverer 에서 분기), `Topics.DRAW_COMPLETED_DLT` 추가, product `ack-mode: record`, `draw.completed.DLT` 사전 생성, 리스너 groupId 하드코딩 제거 |
 
 ---
 
@@ -744,13 +745,14 @@ public void markDrawn(MarkDrawnCommand command) {
 public class DrawCompletedListener {
     private final DropService dropService;
 
-    @KafkaListener(topics = Topics.DRAW_COMPLETED, groupId = "product-service")
+    @KafkaListener(topics = Topics.DRAW_COMPLETED)   // groupId 는 spring.kafka.consumer.group-id(${spring.application.name}) 를 따른다
     public void on(DrawCompleted message) {
         dropService.markDrawn(new MarkDrawnCommand(message.dropId()));
     }
 }
 ```
 - 드로우가 없으면(`PRODUCT_DROP_NOT_FOUND`) 재시도해도 해결되지 않으므로 에러 로그 후 커밋한다 (구현 결정). `ApplicationException` 전체를 not-retryable 로 등록하지 않고, `DefaultErrorHandler` 의 분류 함수에서 **에러 코드가 `DROP_NOT_FOUND` 인 경우만** 재시도하지 않는다 (E-30). 그 밖의 예외는 재시도 후 `draw.completed.DLT`.
+- 구현 방식 (v1.12): `FixedBackOff(1000, 3)`(entry 와 같음, 첫 시도 포함 4회). DROP_NOT_FOUND 는 `addNotRetryableExceptions` 가 아니라 분류 함수로 재시도 0회로 만들고, **recoverer 에서도 걸러** ERROR 로그 후 커밋한다 (DLT 로 보내지 않음). 그 밖은 `DeadLetterPublishingRecoverer` 로 `Topics.DRAW_COMPLETED_DLT`. `Topics` 에 `DRAW_COMPLETED_DLT` 상수 추가 (common). product `application.yml` 에 `spring.kafka.listener.ack-mode: record` 추가 (entry 와 동일). `draw.completed.DLT` 는 `infra/kafka/create-topics.sh` 에서 사전 생성 (자동 생성 꺼짐 — 없으면 DLT 발행이 `max.block.ms` 로 매번 실패해 파티션이 막힘). recoverer 가 정상 반환한 레코드는 `ack-mode: record` + `ackAfterHandle`(기본 true) 로 바로 커밋된다 (`commitRecovered` 는 MANUAL_IMMEDIATE 전용이라 설정 불필요).
 
 ---
 

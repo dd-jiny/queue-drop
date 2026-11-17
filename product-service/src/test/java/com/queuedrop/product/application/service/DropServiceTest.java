@@ -7,6 +7,7 @@ import com.queuedrop.common.error.ApplicationException;
 import com.queuedrop.common.error.CommonErrorCode;
 import com.queuedrop.product.application.dto.DropRegisterCommand;
 import com.queuedrop.product.application.dto.DropResult;
+import com.queuedrop.product.application.dto.MarkDrawnCommand;
 import com.queuedrop.product.application.dto.Requester;
 import com.queuedrop.product.application.exception.ProductErrorCode;
 import com.queuedrop.product.application.port.DropCreatedPayload;
@@ -316,5 +317,72 @@ class DropServiceTest {
         assertThat(result.closeAt()).isEqualTo(closeMicros);
         assertThat(eventPublisher.created().getFirst().openAt()).isEqualTo(openMicros);
         assertThat(eventPublisher.created().getFirst().closeAt()).isEqualTo(closeMicros);
+    }
+
+    @Test
+    @DisplayName("[T5-25] drawn=false 드로우에 markDrawn 하면 저장 값이 drawn=true 가 되고 명시 save 1회 (E-30)")
+    void markDrawnSavesDrawnTrue() {
+        // Given
+        Drop saved = givenSavedDrop();
+        int savesBefore = dropRepository.saveCount();
+
+        // When
+        dropService.markDrawn(new MarkDrawnCommand(saved.getId()));
+
+        // Then — findById 는 복사본을 주므로 save 가 없으면 저장 값은 그대로다
+        assertThat(dropRepository.findById(saved.getId()).orElseThrow().isDrawn()).isTrue();
+        assertThat(dropRepository.saveCount() - savesBefore).isEqualTo(1);
+        assertThat(eventPublisher.created()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T5-25] 같은 드로우에 markDrawn 을 2번 호출하면 예외 없이 drawn=true 이고 두 번째는 save 하지 않는다 (멱등)")
+    void markDrawnTwiceIsIdempotent() {
+        // Given
+        Drop saved = givenSavedDrop();
+        MarkDrawnCommand command = new MarkDrawnCommand(saved.getId());
+        dropService.markDrawn(command);
+        int savesAfterFirst = dropRepository.saveCount();
+
+        // When
+        dropService.markDrawn(command);
+
+        // Then
+        assertThat(dropRepository.findById(saved.getId()).orElseThrow().isDrawn()).isTrue();
+        assertThat(dropRepository.saveCount()).isEqualTo(savesAfterFirst);
+    }
+
+    @Test
+    @DisplayName("[T5-25] 이미 drawn=true 로 저장된 드로우에 markDrawn 하면 예외 없이 save 하지 않는다")
+    void markDrawnOnAlreadyDrawnDoesNotSave() {
+        // Given — 저장소에 drawn=true 상태로 직접 둔다
+        Drop drop = Drop.create(productId, TITLE, 100, 10, OPEN_AT, CLOSE_AT, NOW);
+        drop.markDrawn();
+        Drop saved = dropRepository.save(drop);
+        int savesBefore = dropRepository.saveCount();
+
+        // When
+        dropService.markDrawn(new MarkDrawnCommand(saved.getId()));
+
+        // Then
+        assertThat(dropRepository.findById(saved.getId()).orElseThrow().isDrawn()).isTrue();
+        assertThat(dropRepository.saveCount()).isEqualTo(savesBefore);
+    }
+
+    @Test
+    @DisplayName("[T5-25] 없는 dropId 로 markDrawn 하면 PRODUCT_DROP_NOT_FOUND, 저장 없음")
+    void markDrawnUnknownDropIsNotFound() {
+        // Given
+        Long unknownId = 9_999L;
+
+        // When / Then
+        assertThatExceptionOfType(ApplicationException.class)
+                .isThrownBy(() -> dropService.markDrawn(new MarkDrawnCommand(unknownId)))
+                .satisfies(e -> {
+                    assertThat(e.errorCode()).isEqualTo(ProductErrorCode.DROP_NOT_FOUND);
+                    assertThat(e.errorCode().code()).isEqualTo("PRODUCT_DROP_NOT_FOUND");
+                });
+        assertThat(dropRepository.saveCount()).isZero();
+        assertThat(dropRepository.findAll()).isEmpty();
     }
 }
