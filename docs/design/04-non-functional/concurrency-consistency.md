@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 (Phase 1 합의) | NFR-01 ~ NFR-04 |
 | v1.1 | 2026-11-16 | D2 남는 리스크에 '보상 후 응모 번호 재사용' 과 해결 방식(별도 seq 카운터) 추가 | NFR-03 |
 | v1.2 | 2026-11-16 | D2 재시도를 producer 내부 멱등 재시도로 변경(애플리케이션 재시도 제거), 저장 전 Redis 확인 확정, D4 발행 방식 확정(어댑터 내 afterCommit), 저장 컨슈머 DLT 추가 | NFR-03, phase-4·6 구현 상세 6장 |
+| v1.3 | 2026-11-17 | D2 유령 이벤트·Redis 타임아웃 대응 변경 (사용자 결정, 백로그 E-40·E-41): 요청 ID(eventId) 기록(`requests`), 저장 확정 표시(`persisted`, claim Lua)가 `SISMEMBER` 확인을 대체, 보상 Lua 가 3결과(COMPENSATED / ALREADY_PERSISTED / NOT_OURS) 반환 — 이미 저장 확정이면 되돌리지 않고 성공 응답. Redis 예외는 `GateUnavailableException` → 같은 eventId 로 보상 시도 후 503. 정합성 논증·남는 리스크 갱신. D3 에 entry 키 쓰기 소유 추가 | NFR-03, E-40, E-41 |
 
 > 이 문서는 여러 기능에 걸친 **비기능 결정**의 합의 기록이다.
 > 기능 설계 문서(응모, 쿠폰, 추첨, 대기열)는 모두 이 결정을 전제로 한다.
@@ -17,7 +18,7 @@
 | 결정점 | 선택 | 포기한 대안 |
 |--------|------|-------------|
 | D1. 선착순 판정 위치 / 진실의 원천 | **Redis Lua 원자 판정 + Kafka 비동기 DB 저장** | Redis 판정 + DB 동기 저장, DB 락 판정 |
-| D2. Kafka 발행 실패 시 | **동기 발행 확인(producer 내부 멱등 재시도, 3초 제한), 실패 시 Redis 보상(롤백) 후 실패 응답 + 저장 전 Redis 확인** | 보정 배치(Reconciliation), 애플리케이션 재시도 |
+| D2. Kafka 발행 실패 시 | **동기 발행 확인(producer 내부 멱등 재시도, 3초 제한), 실패 시 요청 ID 기준 Redis 보상(롤백) 후 실패 응답 + 저장 전 Redis 저장 확정(claim). 보상과 저장 확정은 Redis 에서 원자적으로 경합** | 보정 배치(Reconciliation), 애플리케이션 재시도, 추첨 전 집합 대조 |
 | D3. 입장 토큰 검증 | **entry-service 가 공유 Redis 를 직접 조회 (응모 Lua 안에서)** | queue REST 호출, 서명 토큰(JWT) |
 | D4. 드로우 정보 전파 | **Kafka `DropCreated` 이벤트로 entry/queue/ranking 에 복제 (커밋 후 발행, 재발행 API)** | 필요 시 REST 조회, Outbox |
 | D5. 추첨 위치 | **entry-service 내부** | 별도 draw-service |
@@ -52,26 +53,50 @@
 > 그래서 "성공"이라고 답한 응모는 반드시 장부에 남아요.
 
 **상세 설명**
-1. Lua 판정 성공
+0. 요청마다 **요청 ID(`eventId`, UUID)** 를 판정 **전에** 만든다. 이 값이 그대로 `EntryCreated.eventId` 가 된다.
+1. Lua 판정 성공 → `applicants` 에 등록하고 `entry:{dropId}:requests` Hash 에 `userId → eventId` 를 기록한다 (어느 요청이 이 자리를 잡았는지)
 2. `kafkaTemplate.send(...).get(3.5s)` 로 **브로커 수신 확인(acks=all)까지 동기 대기**
    - 재시도는 **producer 내부 멱등 재시도**만 사용한다: `enable.idempotence=true`, `retries=MAX`, `request.timeout.ms=1000`, `delivery.timeout.ms=3000`
    - **애플리케이션 재시도는 하지 않는다.** 애플리케이션이 같은 내용을 다시 `send` 하면 Kafka 는 별개 레코드로 받아 멱등 producer 도 중복을 막지 못하고, 앞선 send 가 보상 이후 뒤늦게 기록되는 **유령 이벤트**가 생기기 쉽다
    - `delivery.timeout.ms` 로 전체 시간을 3초로 제한해 send 결과가 반드시 확정되게 한다 (`get` 타임아웃만 걸면 producer 가 기본 120초 동안 계속 재시도한다)
-3. 실패(예외 또는 3.5초 초과) 시 **보상 Lua** 실행: `SREM applicants` 결과가 1이면 `INCR remaining` (응모 번호 `seq` 는 되돌리지 않음)
-4. 클라이언트에 실패 응답 (재시도 가능 에러, 503)
+3. 실패(예외 또는 3.5초 초과) 시 **보상 Lua** 를 같은 `eventId` 로 실행한다. 결과는 셋 중 하나 (응모 번호 `seq` 는 어느 경우에도 되돌리지 않음):
+   | 결과 | 조건 | 동작 | 응답 |
+   |------|------|------|------|
+   | `ALREADY_PERSISTED` | `persisted` 에 userId 있음 (컨슈머가 이미 저장 확정) | 되돌리지 않음 | **202 성공** (판정 때 받은 entrySeq) — 실제로 기록됐으므로 불변식과 맞다 |
+   | `NOT_OURS` | `requests[userId] ≠ eventId` (다른 요청의 응모이거나 판정이 실행되지 않음) | 되돌리지 않음 | 503 |
+   | `COMPENSATED` | 그 외 | `SREM applicants` + `HDEL requests` + `INCR remaining` | 503 |
+4. 클라이언트에 실패 응답 (재시도 가능 에러, 503). 보상 자체가 실패해도 로그를 남기고 503.
+
+**저장 컨슈머의 저장 확정 (claim Lua)** — DB 저장 **전에** 호출한다 (예전 `SISMEMBER` 확인을 대체)
+- `applicants` 에 userId 가 없으면 0 → 저장하지 않음 (보상된 응모의 유령 이벤트)
+- `requests[userId] ≠ 메시지의 eventId` 면 0 → 저장하지 않음 (보상 후 재응모한 사용자의 **이전 시도** 유령 이벤트)
+- 그 외에는 `SADD entry:{dropId}:persisted userId` 후 1 → `ON CONFLICT DO NOTHING` 저장. 재전달에도 1을 반환한다 (멱등)
+
+**Redis 응답 실패 (타임아웃 포함)**
+- 어댑터는 Redis 예외(`DataAccessException` 계열)를 포트 예외 `GateUnavailableException` 으로 감싼다 (application 이 Spring Data 예외에 의존하지 않음).
+- 판정 Lua 에서 이 예외가 나면 "Lua 가 실행됐는지 모름"이다. 같은 `eventId` 로 보상을 한 번 시도한다 — 실행됐다면 `requests` 가 이 eventId 라 되돌려지고(COMPENSATED), 실행되지 않았다면 `NOT_OURS` 로 아무것도 바뀌지 않는다. 결과와 무관하게 503. (Lettuce 는 한 연결의 명령 순서를 보장하므로 늦게 도착한 판정 Lua 가 보상보다 먼저 실행된다)
 
 > 응모(entry)와 선착순 쿠폰(coupon)이 같은 규칙을 쓴다.
 
 **불변식**: "성공 응답을 받은 응모 = Kafka 에 반드시 기록된 응모"
 
+**정합성 논증**: 저장 확정(claim)과 보상은 둘 다 같은 Redis 의 Lua 라 원자적으로 하나가 먼저 실행된다.
+- claim 이 먼저: `persisted` 에 들어가 보상은 `ALREADY_PERSISTED` 로 거절 → DB 저장 + Redis 응모자 유지 + 성공 응답
+- 보상이 먼저: `applicants`·`requests` 에서 빠져 claim 은 0 → DB 미저장 + Redis 응모자 없음 + 실패 응답
+- 어느 순서든 **"DB 저장 ⇔ Redis 응모자 유지"** 가 성립하므로 풀린 자리를 다른 사용자가 가져가도 DB 응모 수가 정원을 넘지 않는다.
+- `persisted` 에 있으면 반드시 `applicants` 에도 있다(보상이 `persisted` 를 되돌리지 않음). 따라서 판정이 OK 였던 요청의 보상이 `ALREADY_PERSISTED` 를 받았다면 그 저장은 이 요청의 것이다.
+
 **남는 리스크**
-- 발행은 실제로 성공했는데 타임아웃으로 실패로 판단 → 보상 실행 → **DB 에는 기록되지만 Redis 에는 없음**.
-  → **확정**: 저장 컨슈머가 저장 전 Redis `SISMEMBER` 로 확인하고, 없으면(보상된 응모·발급) 저장하지 않는다.
-  → 쿠폰은 추첨의 건수 비교(D6) 같은 사후 안전장치가 없어서, 이 확인이 없으면 유령 이벤트가 곧 **초과 발급**이 된다. 응모·쿠폰 모두 필수.
+- 발행은 실제로 성공했는데 타임아웃으로 실패로 판단(**유령 이벤트**) → 컨슈머 소비와 보상의 순서가 정해지지 않는다. ack 유실형에서는 소비(수십 ms)가 보상(최대 3초 뒤)보다 먼저 오는 쪽이 일반적이다.
+  → ~~저장 전 `SISMEMBER` 확인~~ (v1.2): 소비가 먼저 오면 확인을 통과해 DB 에만 응모가 남고 DB 응모 수 = 정원 + 1 이 될 수 있었다 (E-40).
+  → **확정 (v1.3)**: 위의 claim Lua + 3결과 보상으로 두 순서 모두 정합성을 지킨다 (정합성 논증 참고).
+  → 쿠폰은 추첨의 건수 비교(D6) 같은 사후 안전장치가 없어서, 이 처리가 없으면 유령 이벤트가 곧 **초과 발급**이 된다. 응모·쿠폰 모두 필수 (쿠폰 적용 방식은 6단계에서 확정).
+- Redis 응답 타임아웃 (E-41) → 위의 `GateUnavailableException` 처리로 되돌린다. **보상까지 실패하면** 그 사용자는 Redis 에만 응모돼 있고 Kafka 메시지가 없다 → 언더 응모 + D6 건수 불일치(추첨 대기). 로그(알림) 대상이며 운영 대응 또는 5단계 대조로 처리한다.
 - **보상 후 응모 번호 재사용** (해결됨): 번호를 `M - remaining` 으로 계산하면 보상 후 같은 번호가 재발급되어 정상 응모가 DB 유니크 제약에서 누락될 수 있다.
   → `entrySeq` 를 **되돌리지 않는 별도 카운터(`INCR entry:{dropId}:seq`)** 로 발급. 빈 번호는 허용한다 (번호는 정렬 기준일 뿐 당첨은 셔플로 결정).
-- 보상 Lua 자체가 실패하는 극단 케이스 → 정원 한 자리가 "새는" 상태. 오버 응모가 아니라 **언더 응모** 방향이므로 정합성 위반은 아님.
-- 저장 컨슈머 자체 실패(DB 장애 등) → 3회 재시도 후 `{topic}.DLT` 로 보낸다 (`entry.created.DLT`, `coupon.issued.DLT`). 응모는 Redis 에 있고 DB 에 없는 상태라 D6 건수 비교에서 드러나며, DLT 재처리로 복구한다.
+- 보상 Lua 자체가 실패하는 극단 케이스 (발행 실패 경로) → 정원 한 자리가 "새는" 상태. 오버 응모가 아니라 **언더 응모** 방향이므로 정합성 위반은 아님.
+- 저장 컨슈머 자체 실패(DB 장애 등) → 3회 재시도 후 `{topic}.DLT` 로 보낸다 (`entry.created.DLT`, `coupon.issued.DLT`). 응모는 Redis 에 있고 DB 에 없는 상태라 D6 건수 비교에서 드러나며, DLT 재처리로 복구한다. claim 후 DB 저장이 실패한 경우도 같다 — `persisted` 에 있어 보상되지 않으므로, v1.3 이후 남는 Redis·DB 불일치는 **이 경우뿐**이다 (재처리 시 claim 은 멱등하게 1).
+- 새 키 `requests`·`persisted` 의 TTL 은 다른 응모 키와 함께 5단계에서 정한다 (E-42).
 
 ---
 
@@ -84,6 +109,7 @@
 - queue-service 가 `queue:{dropId}:token:{userId}` 를 TTL 과 함께 기록한다 (**쓰기 소유자: queue-service**).
 - entry-service 는 응모 Lua 안에서 `EXISTS` 로만 확인한다 (**읽기 전용**).
 - 토큰은 응모 후 삭제하지 않는다. 같은 드로우 재응모는 중복 방지(applicants Set)가 막고, 토큰은 TTL 로 자연 만료.
+- 반대로 `entry:{dropId}:*` 키(`applicants`, `requests`, `persisted` 등)의 쓰기 소유자는 entry-service 하나다. queue-service 는 `remaining` 만 읽는다.
 
 **트레이드오프**
 - ✅ 피크 순간 서비스 간 동기 호출 없음, 토큰 확인이 판정과 원자적으로 묶임

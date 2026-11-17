@@ -512,6 +512,7 @@
 - **영향 범위**: (3) `RedisWaitingQueueRepository.saveMeta`·`findActiveDropIds`, `architecture.md` 5장 키 표
 
 ### E-34 잔여 정원과 무관하게 매 주기 N명에게 토큰 발급 — 소진 직전 대량 입장, 응모 완료자 재진입이 입장 슬롯을 씀
+- **처리**: 개선안 1 확정 (2026-11-16 사용자 결정) — 주기당 N명 유지. 8단계 부하 테스트에서 소진 직전 SOLD_OUT 응답 수만 관찰한다.
 - **구분**: 고도화 (설계 결정 사항, 4단계 연동 때 판단)
 - **단계/위치**: phase-3, `admit.lua:10-21` (관련: E-31)
 - **현상**:
@@ -588,6 +589,7 @@
 - **영향 범위**: `RedisSchedulerGate`, `RedisWaitingQueueRepository.admit`, (게이지) `admit.lua` 반환 형식, `phase-8-load-test.md` 3.2 메트릭 표
 
 ### E-39 키 설계·메모리와 Redis Cluster 비호환 — 현재 규모에서는 문제없음, Cluster 전환 시 재설계 범위
+- **처리**: 지금은 하지 않음 확정 (2026-11-16 사용자 결정) — 단일 Redis 전제 유지, 해시 태그 미적용. Cluster 전환 시 아래 개선안으로 재설계.
 - **구분**: 고도화 (현재 규모에서는 불필요, 문서화된 리스크의 구체화)
 - **단계/위치**: phase-3, `QueueKeys.java`, `admit.lua:19`(토큰 키를 스크립트 안에서 조합), `admit.lua:10`(entry 소유 키), 4단계 응모 Lua(`queue:{dropId}:token:{userId}` 를 entry Lua 가 읽음)
 - **현상·메모리**:
@@ -603,3 +605,114 @@
   - 지금은 아무것도 하지 않는다(권장). 키 이름을 바꾸는 작업은 4단계가 queue 키를 읽기 시작하기 **전**이 가장 싸므로, Cluster 가능성이 조금이라도 있다면 4단계 착수 전에 1번(해시 태그)만 정하는 것을 검토한다.
 - **우선순위**: 낮음 — 단일 Redis 전제가 유지되는 한 효과가 없다.
 - **영향 범위**: (1) `QueueKeys`, entry 키 상수, `architecture.md` 5장 키 표, 3·4단계 문서 Lua 주석
+
+### E-40 [명백한 버그] 유령 이벤트가 보상보다 먼저 소비되면 `isApplicant` 검사를 통과해 DB 에만 응모가 남음 — 오버 응모, 5단계 건수 비교가 영영 맞지 않음
+- **구분**: 명백한 버그 (정합성, D2 의 남은 리스크 처리가 경쟁 조건을 가짐)
+- **단계/위치**: phase-4, `EntryApplyService.java:41-46`(발행 실패 → 보상), `EntrySaveService.java:25-34`(검사 후 저장), `entry-compensate.lua`, `GhostEventScenarioTest`
+- **현상**: 저장 컨슈머는 "Redis 응모자에 있으면 저장"(check-then-act)이고, 보상은 발행 실패를 확인한 **뒤에** 실행된다. 유령 이벤트(브로커는 기록, producer 는 실패로 판단)가 생기는 실제 순서는 대개 이렇다:
+  1. t=0 판정 OK(SADD) → send
+  2. 브로커가 기록·복제 완료 → 레코드가 컨슈머에 보임(수~수십 ms 안)
+  3. 컨슈머: `SISMEMBER` = true(아직 보상 전) → **DB INSERT**
+  4. t≈3s producer 가 `delivery.timeout.ms` 만료로 실패 판단 → 보상 Lua(`SREM` + `INCR remaining`) → 사용자에게 503
+  - 결과: DB 에는 A 가 있고 Redis 응모자에는 없으며, 풀린 한 자리를 다른 사용자가 가져가 **DB 응모 수 = 정원 + 1** 이 될 수 있다. A 는 실패 응답을 받았는데 추첨 대상이 된다.
+- **문제/기회**: 설계(D2)와 T4-31 은 "보상 → 그 뒤 유령 이벤트 소비" 순서만 가정한다. ack 유실형 유령 이벤트에서는 소비가 보상보다 먼저 오는 쪽이 오히려 일반적이다(보상은 최대 3초 뒤, 소비는 수십 ms). 5단계 D6 는 `SCARD == COUNT` 를 기다리는데 DB 가 더 크면 **영영 일치하지 않아 추첨이 멈춘다**. 쿠폰(6단계)은 같은 패턴을 그대로 쓰므로 사후 안전장치 없이 **초과 발급**이 된다.
+- **근거**: 코드 분석 + Kafka 동작(acks=all 레코드는 HW 전진 즉시 컨슈머에 보이고, producer 응답 유실과 무관). 발생 빈도는 브로커/네트워크 장애 순간에 한정(추정: 정상 운영에서는 0, 장애 주입 시 재현 가능). T4-31 의 `ghostEventWithoutReapply` 도 테스트 publisher 가 보낸 직후 즉시 실패를 던지므로 이 창(수 ms)이 작을 뿐 존재해 드물게 실패할 수 있다(추정).
+- **개선안**:
+  1. **저장 확정 표시 + 보상 거절** (권장): 컨슈머가 DB INSERT 전에 Lua 로 `SISMEMBER applicants` 이면 `SADD entry:{dropId}:persisted userId` 하고 1 반환(아니면 0 → 무시). 보상 Lua 는 `persisted` 에 있으면 되돌리지 않고 "이미 기록됨"을 반환하고, `EntryApplyService` 는 이 경우 503 대신 **202(성공)** 로 응답한다(실제로 기록됐으므로 불변식 "성공 응답 = Kafka 기록"과 오히려 맞음). 대가: 키 1개(정원 크기 Set) 추가, 컨슈머 왕복 수 동일(SISMEMBER → Lua), 보상 Lua·응답 분기 변경. INSERT 가 이후 실패하면 기존 DLT 경로(Redis 에 있고 DB 에 없음)와 같다.
+  2. **5단계에서 집합 대조**: D6 를 "건수 비교"에서 "Redis 응모자 ∖ DB, DB ∖ Redis 대조"로 바꾸고, DB 에만 있는 응모는 추첨 전 제외(삭제 또는 상태 표시)한다. 4단계 코드는 그대로지만 응모자 수만큼 `SMEMBERS`(정원 수만이면 수백 KB) + DB 전체 조회가 필요하고, 쿠폰에는 적용할 수 없다(사후 단계가 없음).
+  3. 보상을 하지 않고 "불확실(타임아웃)"이면 판정을 유지한 채 503 을 주는 방식 — 메시지가 정말 유실됐을 때 Redis 에만 남아 D6 가 멈추므로 권장하지 않음.
+  - 1 을 권장(응모·쿠폰 공통). T4-31 에 "리스너를 멈추지 않고, 소비 완료를 기다린 뒤 실패를 던지는" 변형을 추가해 재현한다.
+- **우선순위**: 높음 — 정합성(오버 응모·초과 발급) 불변식 위반이고, 6단계 쿠폰이 같은 코드를 복제하기 전에 고쳐야 비용이 작다.
+- **영향 범위**: `concurrency-consistency.md` D2(남은 리스크·확정 내용) + 변경 이력, `architecture.md` 5장 키 표(`entry:{dropId}:persisted`), `phase-4-entry-apply.md` 4.4·5.2, `entry-compensate.lua`, `RedisEntryGate`, `EntryGate` 포트(보상 결과 반환), `EntryApplyService`, `EntrySaveService`, `GhostEventScenarioTest`, 6단계 쿠폰 문서
+- **처리**: 4단계에서 반영 (2026-11-17 사용자 결정) — 개선안 1 을 요청 ID 와 함께 채택: 판정 전에 만든 eventId 를 `entry:{dropId}:requests`(Hash) 에 기록, 저장 컨슈머는 `entry-claim.lua`(applicants·requests 확인 후 `SADD persisted`)로 `isApplicant` 확인을 대체, 보상 Lua 는 COMPENSATED / ALREADY_PERSISTED / NOT_OURS 3결과, ALREADY_PERSISTED 면 202. 설계 D2 v1.3, `phase-4-entry-apply.md` v1.5 (T4-36~38·40·42, 커밋 #10a~c). 쿠폰은 6단계에서 같은 방식 적용 여부를 확정한다.
+
+### E-41 [명백한 버그(장애 경로)] Redis 응답 타임아웃 시 판정만 되고 발행·보상이 모두 빠짐 — 응답은 500, 5단계 건수 비교가 영영 맞지 않음
+- **구분**: 명백한 버그 (장애 경로) + 응답 코드 정의 누락 (카리나 후보 4)
+- **단계/위치**: phase-4, `EntryApplyService.java:32`, `RedisEntryGate.tryApply`, `GlobalExceptionHandler.handleUnexpected`, `application.yml`(`spring.data.redis.timeout: 1s`)
+- **현상**: `tryApply` 에서 `RedisConnectionFailureException`/`QueryTimeoutException` 이 나면 그대로 올라가 catch-all 이 **500 `INTERNAL_ERROR` + ERROR 스택**을 남긴다. 명령 타임아웃(1초)은 "Lua 가 실행됐는지 모름"을 뜻한다 — Redis 가 느려서 Lua 는 실행됐고 응답만 늦은 경우, `applicants` 에 들어가고 정원이 차감됐지만 Kafka 발행도 보상도 없다.
+- **문제/기회**: 그 사용자는 Redis 에만 있고 DB 에는 영영 없다 → D6 `SCARD > COUNT` 가 유지돼 **추첨이 멈춘다**(DLT 처럼 재처리할 메시지도 없음). 사용자가 다시 누르면 409 `DUPLICATE`, `GET /drops/{id}/me` 는 계속 "저장 대기"(pendingSave)를 보여 준다. 또 설계 에러 표에 없는 500 이라 클라이언트가 재시도 가능 여부를 알 수 없다. 오픈 순간 Redis 지연(피크 부하)에서 가장 일어나기 쉬운 경로다.
+- **근거**: 코드 분석. Lettuce 는 한 연결에서 명령 순서를 보장하므로, 타임아웃 뒤 같은 연결로 보낸 보상 Lua 는 늦게 도착한 판정 Lua **뒤에** 실행된다(Lettuce 동작 기준, 측정 안 함).
+- **개선안**:
+  1. `EntryApplyService` 가 `tryApply` 의 인프라 예외를 잡아 **보상 Lua 를 한 번 실행**(멱등: 실행 안 됐으면 `SREM` 0 → 아무것도 안 함)하고 503 `ENTRY_TEMPORARILY_FAILED` 를 준다. 포트 계약상 어댑터가 `DataAccessException` 을 포트 예외(예: `GateUnavailableException`)로 바꿔 던지게 한다(application 이 Spring Data 예외에 의존하지 않도록). 보상도 실패하면 기존처럼 log.error — 이때는 E-40/D6 의 운영 대응 대상.
+  2. 1 + D6 에 "Redis 에만 있는 응모" 대조 단계를 둔다(E-40 개선안 2 와 같은 작업) — 보상까지 실패한 극단 경우까지 메운다. 비용이 크므로 5단계에서 판단.
+  - 공통: `GlobalExceptionHandler` 또는 포트 예외로 Redis 장애를 503 에 매핑하고, 설계 에러 표(`entry-apply.md`)에 행 추가. 503 은 스택 없이 warn 1줄(E-47).
+- **우선순위**: 높음 — 피크 시 Redis 지연이라는 현실적인 조건에서 추첨 정지로 이어지고, 수정은 서비스 한 곳 + 예외 매핑이다.
+- **영향 범위**: `EntryApplyService`, `RedisEntryGate`, `EntryGate` 포트(예외 계약), `GlobalExceptionHandler`, `EntryApplyServiceTest`(Gate 예외 케이스), `docs/design/.../entry-apply.md` 에러 표, `concurrency-consistency.md` D2 남은 리스크
+- **처리**: 4단계에서 반영 (2026-11-17 사용자 결정) — 개선안 1 채택: `RedisEntryGate` 가 `DataAccessException` 을 `GateUnavailableException`(application/port)으로 감싸고, `EntryApplyService` 가 같은 eventId 로 보상을 시도한 뒤 503 `ENTRY_TEMPORARILY_FAILED`(E-40 의 `requests` 덕분에 Lua 가 실행되지 않았으면 NOT_OURS 로 무변화). 보상까지 실패한 경우는 리스크로 남기고 개선안 2(대조)는 5단계에서 판단. 503 로그 정책(E-47)은 별도. 설계 D2 v1.3, `phase-4-entry-apply.md` v1.5 (T4-39·41, 커밋 #10a·b).
+
+### E-42 응모 Redis 키(`entry:{dropId}:meta/remaining/applicants/seq`)에 TTL 이 없음
+- **구분**: 고도화 (메모리·운영) (관련: E-39, E-36)
+- **단계/위치**: phase-4, `entry-initialize.lua`, `entry-apply.lua`(seq 는 첫 INCR 시 생성), `EntryRedisKeys`
+- **현상**: 4개 키 모두 만료가 없다. queue 키는 `closeAt + 1일` 로 만료된다(E-39).
+- **문제/기회**: 드로우가 끝나도 키가 영구히 남는다. 메모리: `applicants` 는 512개를 넘으면 intset → hashtable 로 바뀌어 원소당 약 50~70B(추정) — 정원 1만이면 약 0.6MB, 10만이면 약 6MB. 드로우 수백 개가 쌓이면 수백 MB~GB 로 커지고, AOF 재작성 시간도 늘어난다. 단, **5단계 추첨이 `applicants`(SCARD)와 meta(state 변경)를 쓰므로 `closeAt` 직후 만료시키면 안 된다**. 추첨이 지연되면(E-40/E-41 로 D6 대기) TTL 이 먼저 끝나 건수 비교 근거가 사라질 위험이 있다.
+- **근거**: 키 구조는 코드 확인, 메모리는 Redis 인코딩 규칙 기준 계산(추정, `MEMORY USAGE` 측정 안 함).
+- **개선안**:
+  1. `entry-initialize.lua` 에서 4개 키에 `EXPIREAT closeAt + 7일`(seq 는 생성 시점이 apply 라 initialize 에서 `SET seq 0` 으로 미리 만들고 같이 만료). 단순하지만 추첨이 7일 넘게 멈추면 근거가 사라진다(그 전에 알림이 떠야 함).
+  2. 5단계 추첨 완료(`DRAWN`) 시 추첨 서비스가 `EXPIRE` 1일을 건다 — 추첨이 끝난 드로우만 정리돼 안전하지만, 추첨이 실패한 드로우 키는 남는다. 1 을 안전망(예: closeAt + 30일)으로 같이 두면 둘 다 커버.
+  - 2 + 긴 안전망 TTL 을 권장. 현재 규모(드로우 수십 개, 정원 수천~수만)에서는 수십 MB 이하라 급하지 않다.
+- **우선순위**: 낮음 — 지금 규모에서는 메모리 문제가 없다. 5단계에서 추첨 완료 처리와 함께 정하면 된다.
+- **영향 범위**: `entry-initialize.lua`, 5단계 추첨 서비스·문서, `architecture.md` 5장 키 표(TTL 열)
+
+### E-43 응모 응답 경로에 Kafka 동기 대기(최대 3.5초)가 들어가 Kafka 지연 시 Tomcat 스레드가 고갈됨
+- **구분**: 고도화 (응답 경로·피크 병목) (카리나 후보 3)
+- **단계/위치**: phase-4, `KafkaEntryEventPublisher.java`(`get(3500ms)`), `application.yml`(`delivery.timeout.ms 3000`, `linger.ms 0`)
+- **현상**: 정상 시 응답 = Redis Lua 1회 + acks=all 왕복(로컬 단일 브로커 수 ms, 추정). Kafka 가 느리거나 리더 선출 중이면 요청마다 최대 3.5초 플랫폼 스레드를 잡는다.
+- **문제/기회**: Tomcat 기본 200 스레드 / 3.5초 ≈ **초당 57건**으로 처리량이 떨어지고(계산), 같은 인스턴스의 조회 API·헬스체크까지 밀린다. 입장 N=100명/초 기준이면 Kafka 장애 몇 초 동안 응모 요청이 큐에 쌓이고 클라이언트 타임아웃 → 재시도로 부하가 증폭된다. 단, 동기 대기 자체는 D2 불변식("성공 응답 = Kafka 기록")의 대가라 없앨 수 없다.
+- **근거**: 계산(추정), 정상 지연은 측정 안 함(8단계에서 측정).
+- **개선안**:
+  1. **가상 스레드**(`spring.threads.virtual.enabled: true`, Java 21): 블로킹 대기가 플랫폼 스레드를 잡지 않아 동시 대기 수 제한이 사실상 사라진다. 설정 1줄. 대가: Hikari·Lettuce 풀이 실제 상한이 되므로 그쪽 풀 크기 확인 필요, `synchronized` 핀닝(Java 21) 점검.
+  2. `delivery.timeout.ms` 를 줄인다(예: 1500 / await 2000). 실패가 빨라지는 대신 일시 지연에도 503 이 늘어난다.
+  3. 응모 엔드포인트 동시 실행 수 제한(세마포어 bulkhead)으로 다른 API 를 보호. 초과 시 즉시 503.
+  - `linger.ms 0` 은 지금 규모에서 맞다. 초당 수천 건 이상이면 `linger.ms 1~2` 가 배치 효율로 오히려 p99 를 낮출 수 있으나 8단계 측정 후 판단.
+  - 1 을 권장(비용 최소). 8단계 부하 테스트에서 Kafka 지연 주입으로 확인.
+- **우선순위**: 중간 — 정상 시에는 문제없고 장애 시 증폭 위험. 8단계 전에 1 정도면 충분.
+- **영향 범위**: `application.yml`(entry, 6단계 coupon 동일), `phase-8-load-test.md` 시나리오
+
+### E-44 내 응모 목록 — 정렬 동률 순서 미정, 페이지네이션 없음 (현재 규모에서는 불필요)
+- **구분**: 고도화 (조회) (카리나 후보 1)
+- **단계/위치**: phase-4, `EntryJpaRepository.findAllByUserIdOrderByAppliedAtDesc`, `V1__create_entry_tables.sql`(`idx_entries_user_applied (user_id, applied_at DESC)`)
+- **현상**: `user_id` 로 전부 읽고 `applied_at DESC` 정렬. 인덱스가 정렬까지 커버하므로 정렬 비용은 없다(EXPLAIN 측정 안 함, 인덱스 구조상 추정). 엔티티 전체 컬럼 조회, N+1 없음.
+- **문제/기회**: 사용자당 응모는 드로우당 1건이라 수십~수백 건이 상한 — **현재 규모에서는 페이지네이션·커버링 인덱스 불필요**. `applied_at` 은 서버 시각(ms 이하 정밀도)이라 동률은 드물지만, 동률이면 페이지 간 순서가 흔들릴 수 있어 페이지네이션을 넣는 순간 문제가 된다.
+- **근거**: 응모 구조상 계산.
+- **개선안**:
+  1. 지금은 정렬에 `id DESC` 타이브레이커만 추가(인덱스 변경 불필요, 결과 건수가 작아 추가 정렬 비용 무시 가능).
+  2. 목록이 커지면 keyset 페이징 `(applied_at, id) < (?, ?) LIMIT n` + 인덱스 `(user_id, applied_at DESC, id DESC)` 로 교체. offset 페이징은 권장하지 않음(E-27 와 같은 이유).
+- **우선순위**: 낮음 — 현재 규모에서는 불필요. 1 은 비용이 거의 없어 5단계 결과 조회 확장 시 함께 넣으면 된다.
+- **영향 범위**: `EntryJpaRepository`, (2 선택 시) Flyway V2, API 문서
+
+### E-45 `drop.created` 처리 실패 시 1초×3회 후 DLT — Redis 수 초 장애로 드로우 전체가 응모 불가(CLOSED)
+- **구분**: 고도화 (장애 복구) (관련: E-36, E-29)
+- **단계/위치**: phase-4, `KafkaConsumerConfig`(`FixedBackOff(1000, 3)` 를 `drop.created`·`entry.created` 공통 적용), `DropSnapshotRegisterService`
+- **현상**: entry 는 queue(E-36)와 달리 초기화가 Lua 하나로 원자적이라 부분 실패 상태는 없다(좋음). 그러나 Redis 가 3~4초 이상 응답하지 않으면 재시도를 소진하고 `drop.created.DLT` 로 간다. 그 드로우는 meta 가 없어 응모 Lua 가 모든 요청에 `CLOSED` 를 돌려준다. 복구는 사람이 DLT 를 재처리하거나 재발행 API 를 호출해야 한다.
+- **문제/기회**: 등록과 오픈 사이(최소 여유 1분) 에 이 경로가 실패하면 오픈 시각에 응모가 전부 거절된다. 수신 측이 멱등(`ON CONFLICT DO NOTHING`, `EXISTS` NX)이라 길게 재시도해도 안전하다. `entry.created` 는 반대로 lag 을 키우지 않도록 짧은 재시도가 맞으므로 정책을 토픽별로 나눠야 한다.
+- **근거**: 코드 분석(측정 안 함).
+- **개선안**:
+  1. `drop.created` 리스너 전용 컨테이너 팩토리에 `ExponentialBackOff`(예: 0.5초 시작, 최대 10초, 최대 경과 5분) 후 DLT. `entry.created` 는 현행 유지. 대가: 팩토리 빈 1개 추가.
+  2. 현행 유지 + E-29 개선안 1(오픈 전 자동 재발행)로 메운다.
+  - 1 을 권장하고 queue(E-36)와 같은 방식으로 맞춘다.
+- **우선순위**: 중간 — 빈도는 낮지만 드로우 전체 실패, 수정 비용 작음.
+- **영향 범위**: `KafkaConsumerConfig`, `DropCreatedRedeliveryTest`, `architecture.md` 4장 실패 정책 표
+
+### E-46 저장 컨슈머가 레코드마다 Redis 1왕복 + DB 1트랜잭션 — 현재 규모에서는 불필요, 정원 수십만이면 배치 리스너
+- **구분**: 고도화 (Kafka·DB 처리량, 현재 규모에서는 불필요)
+- **단계/위치**: phase-4, `EntryCreatedListener`, `EntrySaveService.save`, `EntryRepositoryImpl.saveIfAbsent`(native INSERT, 건당 커밋)
+- **현상**: 레코드 1건 = `SISMEMBER` 1회 + INSERT 1회 + 커밋 1회. 파티션 6, 인스턴스 2 × concurrency 3.
+- **문제/기회**: 건당 약 2~5ms(추정)면 컨슈머 6개 합계 초당 1,000~3,000건. 정원 수만이 소진되는 수십 초 동안 lag 이 잠시 생겨도 마감 전 따라잡으므로 **현재 규모에서는 문제없다**. lag 은 D6 추첨 대기 시간과 `pendingSave` 노출 시간으로만 나타난다.
+- **근거**: 계산(추정). 8단계에서 consumer lag 측정 필요.
+- **개선안**:
+  1. 배치 리스너(`max.poll.records` 수백) + `SMISMEMBER` 1회 + 다중 행 `INSERT ... ON CONFLICT DO NOTHING` 1회. 왕복이 수백 분의 1로 줄어든다. 대가: 배치 중 한 건 실패 시 재처리 단위가 배치 전체(멱등이라 안전), DLT 로 보낼 레코드 식별이 복잡해짐(`BatchListenerFailedException`), E-40 개선안 1 을 넣으면 Lua 도 배치 형태로 바꿔야 함.
+  2. 파티션·concurrency 증설 — 코드 변경 없음, 파티션 수 변경은 키 순서 보장에 영향(같은 사용자 레코드 순서) 있으나 `ON CONFLICT` 로 무해.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요. 8단계에서 lag 이 마감 시각을 넘길 때만 검토.
+- **영향 범위**: `EntryCreatedListener`, `EntrySaveService`, `EntryRepositoryImpl`, `KafkaConsumerConfig`
+
+### E-47 응모 관측 지표 없음, 발행 실패 503 이 요청마다 ERROR 스택으로 남음
+- **구분**: 고도화 (관측성·로그, 8단계 준비) (관련: E-38, E-10)
+- **단계/위치**: phase-4, `GlobalExceptionHandler.handleApplication`(status ≥ 500 이면 스택 포함 error), `EntryApplyService.compensateQuietly`, `EntrySaveService`(유령 무시 warn)
+- **현상**: 판정 결과별 건수, 발행 지연, 보상 횟수, 유령 이벤트 무시 횟수를 볼 수단이 로그뿐이다. Kafka 장애 시 503 `ENTRY_TEMPORARILY_FAILED` 가 요청마다 원인 예외 스택과 함께 ERROR 로 찍힌다(초당 수백 건이면 로그 폭주, 디스크·수집 비용).
+- **문제/기회**: 8단계 "정원 소진 시간", E-34 결정의 `SOLD_OUT` 응답 수 관찰, E-40/E-41 발생 여부 확인에 지표가 필요하다.
+- **근거**: 코드 확인.
+- **개선안**:
+  1. Micrometer: `entry.apply{outcome=OK|CLOSED|NO_TOKEN|DUPLICATE|SOLD_OUT|FAILED}` 카운터(infrastructure 어댑터 또는 presentation), `entry.publish` Timer, `entry.compensate{result}` 카운터, `entry.save.ghost_skipped` 카운터. 태그에 dropId 는 넣지 않는다(시계열 수).
+  2. 503 은 warn 1줄(코드 + 원인 메시지), 스택은 샘플링하거나 debug 로. 보상 실패(`log.error`)만 스택 유지.
+- **우선순위**: 중간 — 8단계 전에 필요. 로그 정책(2)은 비용이 작아 E-41 과 함께 넣을 만하다.
+- **영향 범위**: `GlobalExceptionHandler`, `EntryApplyService`(또는 어댑터), `phase-8-load-test.md` 3.2 메트릭 표
