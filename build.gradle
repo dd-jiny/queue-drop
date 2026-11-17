@@ -47,8 +47,9 @@ subprojects {
     }
 }
 
-// common 을 제외한 모든 모듈은 실행 가능한 Spring Boot 애플리케이션
-configure(subprojects.findAll { it.name != 'common' }) {
+// common · e2e-test 를 제외한 모든 모듈은 실행 가능한 Spring Boot 애플리케이션
+// (e2e-test 는 HTTP 로만 검증하는 테스트 전용 모듈 — phase-5 3.6)
+configure(subprojects.findAll { !(it.name in ['common', 'e2e-test']) }) {
     apply plugin: 'org.springframework.boot'
 
     dependencies {

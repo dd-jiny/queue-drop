@@ -16,6 +16,7 @@
 | v1.10 | 2026-11-17 | 컨트롤러 경로 `{dropId:\d+}` (4단계 EntryController 와 통일). T5-21 발행 단언: 발행 payload 1종 (재발행 중복 허용) |
 | v1.11 | 2026-11-17 | `DrawScheduler` 에 `entry.draw.scheduler-enabled` 조건 추가. 스케줄러를 검증하지 않는 `@SpringBootTest` 는 끔 — 시스템 Clock 실행이 실제 시각 경과 후 4단계 테스트 드로우를 마감해 간헐 실패 (신민아 MAJOR) |
 | v1.12 | 2026-11-17 | product 컨슈머 실패 처리 구체화 (architecture.md v1.7·infrastructure.md v1.3 의 "로그 후 건너뜀"을 DLT 로 정정, 신민아 BLOCKER: DLT 토픽 사전 생성 누락): 재시도 1초×3, DROP_NOT_FOUND 는 재시도·DLT 모두 없이 로그 후 커밋 (recoverer 에서 분기), `Topics.DRAW_COMPLETED_DLT` 추가, product `ack-mode: record`, `draw.completed.DLT` 사전 생성, 리스너 groupId 하드코딩 제거 |
+| v1.13 | 2026-11-17 | E2E: product 최소 오픈 지연 프로퍼티가 없어(domain 상수 1분) openAt=now+65s 로 변경, e2e 프로필 키 명시, bootRun 대신 bootJar + `java -jar`, coupon·ranking 미기동 |
 
 ---
 
@@ -117,6 +118,8 @@ e2e-test/                                            [신규 모듈] (구현 결
 └── src/test/java/com/queuedrop/e2e/DropFlowE2ETest.java
 scripts/e2e.sh                                       [신규]
 settings.gradle                                      [수정] include 'e2e-test'
+build.gradle                                         [수정] boot 플러그인·actuator 적용 대상에서 e2e-test 제외
+{queue,entry,user}-service/src/main/resources/application-e2e.yml  [신규] e2e 프로필 (3.6)
 ```
 
 ---
@@ -763,24 +766,25 @@ public class DrawCompletedListener {
 |------|------|------|
 | A. 단일 JVM 에서 컨텍스트 여러 개 | 한 테스트가 6개 서비스의 `SpringApplication` 을 띄움 | ❌ 모든 모듈에 `application.yml` 이 같은 이름으로 있어 클래스패스 충돌. 빈·자동 설정 충돌 정리 비용이 큼 |
 | B. Testcontainers `ComposeContainer` | 서비스 이미지를 compose 로 띄우고 테스트 | ⏳ 서비스 Dockerfile 은 8단계 산출물. 8단계 이후 이 방식으로 전환 |
-| **C. 별도 `e2e-test` 모듈 + 실행 스크립트** | 인프라는 `docker compose`, 서비스는 `bootRun` 으로 띄우고, 테스트는 Gateway 로 HTTP 만 호출 | ✅ **채택**. 지금 있는 것만으로 가능, 서비스 코드에 의존하지 않음 |
+| **C. 별도 `e2e-test` 모듈 + 실행 스크립트** | 인프라는 `docker compose`, 서비스는 `bootJar` + `java -jar` 로 띄우고, 테스트는 Gateway 로 HTTP 만 호출 | ✅ **채택**. 지금 있는 것만으로 가능, 서비스 코드에 의존하지 않음 |
 
 **구성**
 - `e2e-test` 모듈: `RestClient` + JUnit 5 + Awaitility. 서비스 모듈에 의존하지 않는다 (HTTP 계약만 검증).
 - `@Tag("e2e")` 로 분리하고 기본 `./gradlew build` 에서 제외: `tasks.test { useJUnitPlatform { excludeTags 'e2e' } }`, 별도 `e2eTest` 태스크.
-- `scripts/e2e.sh`: `docker compose up -d` → 각 서비스 `./gradlew :{svc}:bootRun --args='--spring.profiles.active=e2e'` 백그라운드 실행 → actuator health 대기 → `./gradlew :e2e-test:e2eTest` → 종료 시 프로세스 정리.
+- `scripts/e2e.sh`: 포트·도구(lsof, Java 21) 사전 검사 → `docker compose up -d` (인프라 정상·kafka-init 완료 대기) → `bootJar` 빌드 → 각 서비스 `java -jar ... --spring.profiles.active=e2e` 백그라운드 실행(로그 `build/e2e/logs/{svc}.log`) → actuator health 대기 → `./gradlew :e2e-test:e2eTest` → trap 으로 서비스 프로세스 정리 (인프라 컨테이너는 남김).
 - `e2e` 프로필 설정
-  - product: 드로우 최소 오픈 지연을 5초로 단축 (`product.drop.min-lead-time: 5s`, 2단계 설정값 재사용)
-  - queue: 입장 주기 200ms
-  - entry: 추첨 주기 1초
-  - user: 관리자 계정 시드 (1단계에서 정한 방식 사용)
+  - product: 변경 없음. 최소 오픈 지연은 domain 상수 `Drop.MIN_OPEN_LEAD_TIME`(1분)이라 설정으로 줄일 수 없다 — E2E 는 openAt 을 1분 뒤로 잡는다 (v1.13, 프로덕션 변경 없이 테스트 시간 약 1분 증가)
+  - queue: 입장 주기 200ms (`queue.admission.interval-ms: 200`)
+  - entry: 추첨 주기 1초 (`entry.draw.interval-ms: 1000`)
+  - user: 관리자 계정 시드 (`queuedrop.admin.email`·`queuedrop.admin.password`, 테스트 기본값과 같게)
+- 서비스 기동: bootRun 을 서비스마다 동시에 돌리면 Gradle 빌드 락·common 컴파일이 겹치므로 `bootJar` 를 한 번 빌드한 뒤 `java -jar` 로 띄운다. coupon·ranking 은 이 시나리오에 필요 없어 띄우지 않는다.
 
 **시나리오 (`DropFlowE2ETest`)**
-1. 관리자 로그인 → 상품 등록 → 드로우 등록 (정원 M=5, 당첨 K=2, openAt=now+5s, closeAt=now+20s)
+1. 관리자 로그인 → 상품 등록 → 드로우 등록 (정원 M=5, 당첨 K=2, openAt=now+65s, closeAt=openAt+15s — 최소 오픈 지연 1분 + 요청 지연 여유 5초)
 2. 사용자 7명 가입·로그인
 3. openAt 이후 7명 대기열 진입 → `ADMITTED` 될 때까지 폴링
 4. 7명 응모 → 5명 `202`, 2명 `409 SOLD_OUT`
-5. closeAt 이후 `GET /result` 가 200 이 될 때까지 폴링 (최대 30초)
+5. closeAt 이후 `GET /result` 가 200 이 될 때까지 폴링 (closeAt 부터 최대 30초). openAt 대기는 최대 90초
 6. 검증: `applicantCount=5`, `winnerCount=2`, 응모자 5명의 `/me` 가 WON 2 · LOST 3, 드로우 상세 상태 `DRAWN`
 
 ---

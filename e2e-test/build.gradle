@@ -1,0 +1,39 @@
+// E2E 시나리오 테스트 (phase-5 3.6, 방식 C)
+// - 서비스 모듈에 의존하지 않는다. Gateway 로 HTTP 만 호출해 계약을 검증한다.
+// - @Tag("e2e") 는 기본 test 에서 제외 → 루트 ./gradlew build 가 E2E 를 돌리지 않는다.
+// - 실행: scripts/e2e.sh (인프라·서비스 기동 후 :e2e-test:e2eTest)
+
+dependencies {
+    testImplementation 'org.springframework:spring-web'              // RestClient
+    testImplementation 'tools.jackson.core:jackson-databind'          // Jackson 3 (RestClient 자동 감지)
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'org.assertj:assertj-core'
+    testImplementation 'org.awaitility:awaitility'
+}
+
+tasks.named('test') {
+    useJUnitPlatform {
+        excludeTags 'e2e'
+    }
+}
+
+tasks.register('e2eTest', Test) {
+    description = 'E2E 시나리오 테스트 (서비스가 떠 있어야 한다 — scripts/e2e.sh)'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'e2e'
+    }
+    outputs.upToDateWhen { false }                      // 외부 시스템 대상이라 항상 다시 실행
+    // -Pe2e.gatewayUrl=... / -Pe2e.adminEmail=... / -Pe2e.adminPassword=... 로 덮어쓸 수 있다
+    ['e2e.gatewayUrl', 'e2e.adminEmail', 'e2e.adminPassword'].each { key ->
+        if (project.hasProperty(key)) {
+            systemProperty key, project.property(key)
+        }
+    }
+    testLogging {
+        events 'passed', 'failed', 'skipped'
+        exceptionFormat 'full'
+    }
+}

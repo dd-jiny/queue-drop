@@ -1,0 +1,4 @@
+# e2e 프로필 (phase-5 3.6): 입장을 빠르게 해 E2E 대기 시간을 줄인다
+queue:
+  admission:
+    interval-ms: 200
