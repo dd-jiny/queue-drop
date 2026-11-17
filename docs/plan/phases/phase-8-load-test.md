@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-17 | 계획 검토 반영: 응답 code 를 `{SERVICE}_{REASON}` 실제 이름으로 수정, outcome·보상 메트릭 태그 확정(`coupon.issue.compensated` 추가, T8-13 판정 COMPENSATED==0), coupon-spike 사용자 매핑 `iterationInTest` 기반·S4 별도 이벤트, 진입 404·쿠폰 NOT_STARTED 재시도, 루트 build.gradle 필터 유지, compose 의존성(kafka healthy·kafka-init 완료)·앵커 위치, 튜닝 표 정리, gateway actuator health 만 노출, 검증 스크립트 주석·lag 대상 그룹 보강, `JSON`→`HEADERS`, 준비 절차(e2e.sh 방식), Boot 4 확인 리스크 추가, 6장 결정 필요 확정 |
 | v1.3 | 2026-11-17 | compose: JWT_SECRET 필수 표기 제거(인프라 단독 기동 회귀 방지), healthcheck 앵커 병합, 실행 순서에 kafka-init 생성 단계 추가, `scripts/loadtest-up.sh`, coupon 리스너 concurrency 환경변수 |
 | v1.4 | 2026-11-17 | 6장 Boot 4 확인 항목 결과 기록 |
+| v1.5 | 2026-11-17 | 판정 메트릭 기록 방식(컨트롤러에서 기록, 핸들러 아님), 보상 Lua 실패 시 미집계, ArchUnit R3 `io.micrometer..` |
 
 ---
 
@@ -164,7 +165,8 @@ management:
 
 > **태그 값 규칙 (구현 결정)**: outcome·result 태그는 ErrorCode 접두사가 없는 **판정 이름**(`SOLD_OUT`)으로 통일한다. HTTP 응답 `code`(`ENTRY_SOLD_OUT`, `COUPON_SOLD_OUT`)와 다르다 — k6 의 `code` 태그는 응답 code 를 그대로 쓴다.
 > **보상 결과 해석**: `NOT_OURS` 는 발행 타임아웃(`await-timeout`) 경로에서 정상적으로 나올 수 있다. 정합성 이상 신호는 `COMPENSATED` 다 (T8-13).
-> **커스텀 메트릭 위치 (구현 결정)**: application 계층은 Micrometer 에 의존하지 않는다. 판정 결과 카운트는 presentation(Controller/ExceptionHandler)에서, 보상·입장 카운트는 infrastructure 어댑터(`RedisEntryGate.compensate`, `RedisCouponGate.compensate`, `RedisWaitingQueueRepository.admit`)에서 기록한다.
+> **커스텀 메트릭 위치 (구현 결정)**: application 계층은 Micrometer 에 의존하지 않는다 (ArchUnit R3 에 `io.micrometer..` 추가). 판정 결과 카운트는 presentation(Controller/ExceptionHandler)에서, 보상·입장 카운트는 infrastructure 어댑터(`RedisEntryGate.compensate`, `RedisCouponGate.compensate`, `RedisWaitingQueueRepository.admit`)에서 기록한다.
+> **판정 결과 기록 방식 (구현 결정)**: GlobalExceptionHandler 에서 세지 않는다 (다른 API 의 같은 ErrorCode 까지 잡힘). 응모·발급 컨트롤러 메서드에서 결과와 `ApplicationException` 을 보고 기록한 뒤 다시 던진다. 쿠폰 404 는 ErrorCode `EVENT_NOT_FOUND` 를 태그 `NOT_FOUND` 로 바꾼다. 보상 Lua 호출 자체가 실패(Redis 장애)하면 `compensated` 는 세지 않는다 — 해당 요청은 `outcome=TEMPORARILY_FAILED` 로 잡힌다.
 
 #### 튜닝 파라미터 환경변수화
 부하 테스트 중 재빌드 없이 바꿀 값들. 프로퍼티 이름은 1·3·4·5·6단계 구현 상세 문서와 일치시켰다 (환경변수는 Spring relaxed binding).
