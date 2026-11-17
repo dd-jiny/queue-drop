@@ -13,6 +13,7 @@
 | v1.7 | 2026-11-17 | k6 정합성 실패 판정 임계값(count==0 / ==DUP_USERS / <=CAPACITY), login_late, queue_closed·POLL_SOLD_OUT 분리 |
 | v1.8 | 2026-11-17 | 3.5 검증 스크립트 구현 기준(종료 코드, --expect/--wait-sec, SKIP 규칙(drawn_at+TTL 경과 시만, 랭킹은 dedupe Set 대조), 추가 검사, 실행 순서) |
 | v1.9 | 2026-11-17 | 모니터링 프로필 구현 기준(Prometheus v3.15.1·Grafana 13.2.6, provisioning 대시보드, 측정 시 함께 켬) — 6장 모니터링 스택 결정 갱신 |
+| v1.10 | 2026-11-17 | 측정 방식(k6 호스트 실행, 워밍업 후 측정, 서비스 재생성 시 gateway 재시작), #8 개선 P1~P3 확정(기본안) — 3.9 신설 |
 
 ---
 
@@ -974,6 +975,24 @@ done
 2. 같은 S1 파라미터로 `SPRING_PROFILES_ACTIVE=gate-db` 와 기본을 번갈아 측정한다.
 3. 비교 지표: `entry_apply` TPS·p95/p99, 5xx, PostgreSQL 락 대기(`pg_stat_activity` 의 `wait_event_type = 'Lock'` 표본), `hikaricp.connections.pending`, 정합성(둘 다 초과 0 이어야 함).
 4. 리포트 4장에 "정합성은 같고 처리량·지연이 어떻게 다른지"를 기록한다.
+
+
+### 3.9 측정 방식 · 측정 결과에 따른 조정 (#8, v1.10)
+
+**측정 방식 (확정(기본안), 2026-11-17)**
+- **k6 는 호스트(macOS)에서 실행**한다 (`k6 run -e BASE_URL=http://localhost:8080 -e RESULTS_DIR=docs/report/results ...`). Docker VM 메모리(7.7GB) 중 약 6GB 를 서비스·인프라가 써서 수천 VU 를 VM 안에서 돌리면 OOM 위험이 있다. 호스트 포트 포워딩 비용은 같은 2,000 VU 비교에서 p99 108ms(호스트) vs 74ms(네트워크 내부) — 리포트에 명시.
+- 요약 통계에 p99 를 넣기 위해 `--summary-trend-stats "avg,min,med,max,p(90),p(95),p(99)"` 를 준다.
+- **워밍업 후 측정**: 서비스·gateway 를 재시작한 직후(JIT 미완료)는 같은 요청이 p99 577ms → 4회 반복 후 19ms 로 떨어졌다. 시나리오마다 워밍업 1회 후 측정값을 쓰고, 콜드 스타트 수치는 별도로 기록한다.
+- **서비스 컨테이너를 재생성하면 gateway 도 재시작**한다. 컨테이너 IP 가 바뀌면 gateway 가 이전 IP 로 연결해 `No route to host` 500 이 난다.
+
+**조정 (확정(기본안), 설계 방향 변경 없음)**
+| ID | 관찰 (1차 측정) | 원인 (근거) | 조정 |
+|----|-----------------|-------------|------|
+| P1 | S2 로그인 5,000 동시 → 647건 `Connection reset`, S3 쿠폰 4,000 동시 → 다수 리셋 | gateway 업스트림 풀 기본 ELASTIC(무제한) → 동시 요청 수만큼 새 연결 → 서비스 Tomcat accept 큐(기본 100) 초과. user-service `ListenOverflows` 7,745, `SyncookiesFailed` 647(= 실패 수) | gateway `httpclient.pool.type=FIXED`, `max-connections=200`(`GATEWAY_POOL_MAX_CONNECTIONS`, 대기 큐 무제한, acquire-timeout 30s — 초과 시 `PoolAcquireTimeoutException` → gateway 기본 오류 처리로 500, max-idle-time 30s < Tomcat 기본 connectionTimeout 60s), 서비스 `server.tomcat.accept-count=1024`(`TOMCAT_ACCEPT_COUNT`). 풀 1000 과 비교해 워밍업 후 p99 차이 없음(160~204ms vs 153~273ms) → 200 유지 |
+| P2 | S3 중 gateway 컨테이너 재시작 (메모리 761.8/768MiB 후 재기동) | `MaxRAMPercentage=75` → 힙 576MB, 남은 192MB 로 Netty 다이렉트 버퍼·메타스페이스·스레드 부족 → OOM kill | gateway 만 메모리 한도 1024m, `-XX:MaxRAMPercentage=50 -XX:MaxDirectMemorySize=256m` |
+| P3 | 로그인 3,000 동시 → p99 3.3s, `hikaricp_connections_pending` 최대 189 | `UserService.login` 의 `@Transactional(readOnly=true)` 가 BCrypt 비교 동안 커넥션을 쥠 (풀 10) | login 트랜잭션 제거 — 조회는 저장소 호출 단위 트랜잭션 |
+
+- 기각한 가설 (리포트 3장에 기록): 쿠폰 지연이 Tomcat 스레드 대기 때문 → 가상 스레드로 바꿔도 개선 없음 / 예외 WARN 로그 동기 출력 때문 → 로그를 꺼도 콜드 상태에선 동일, 워밍업 후엔 로그 켜도 p99 19ms. 둘 다 원인은 JIT 워밍업.
 
 ---
 
