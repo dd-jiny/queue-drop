@@ -1,5 +1,6 @@
 package com.queuedrop.entry.presentation.listener;
 
+import static com.queuedrop.entry.support.KafkaTopicReadiness.awaitTopicMetadata;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
@@ -52,6 +53,8 @@ class DropCreatedRedeliveryTest {
             return null;
         });
         jdbc.update("TRUNCATE TABLE entries, drop_snapshots");
+        // NewTopic 직후 첫 send 가 max.block.ms(1초) 안에 메타데이터를 못 받는 것을 막는다
+        awaitTopicMetadata(kafkaTemplate, Topics.DROP_CREATED);
     }
 
     private void publish(DropCreated event) throws Exception {

@@ -1,5 +1,6 @@
 package com.queuedrop.entry.scenario;
 
+import static com.queuedrop.entry.support.KafkaTopicReadiness.awaitTopicMetadata;
 import static org.awaitility.Awaitility.await;
 
 import com.queuedrop.common.event.EntryCreated;
@@ -63,6 +64,7 @@ abstract class ScenarioTestBase {
         if (producerWarmedUp) {
             return;
         }
+        awaitTopicMetadata(kafkaTemplate, Topics.ENTRY_CREATED);   // NewTopic 직후 메타데이터 전파 대기
         kafkaTemplate.send(Topics.ENTRY_CREATED, "0:0",
                         new EntryCreated(UUID.randomUUID().toString(), 0L, 0L, 1, ScenarioTestSupport.NOW))
                 .get(10, TimeUnit.SECONDS);
