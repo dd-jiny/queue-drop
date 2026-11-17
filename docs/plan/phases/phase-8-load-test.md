@@ -9,6 +9,8 @@
 | v1.3 | 2026-11-17 | compose: JWT_SECRET 필수 표기 제거(인프라 단독 기동 회귀 방지), healthcheck 앵커 병합, 실행 순서에 kafka-init 생성 단계 추가, `scripts/loadtest-up.sh`, coupon 리스너 concurrency 환경변수 |
 | v1.4 | 2026-11-17 | 6장 Boot 4 확인 항목 결과 기록 |
 | v1.5 | 2026-11-17 | 판정 메트릭 기록 방식(컨트롤러에서 기록, 핸들러 아님), 보상 Lua 실패 시 미집계, ArchUnit R3 `io.micrometer..` |
+| v1.6 | 2026-11-17 | 3.4 구현 기준 메모(k6 2.4.0, iterationInTest 매핑, RESULTS_DIR, 입력 가드, 재시도 소진 분류 등), S2 queue_sold_out 합계 해석, 앱만 내리는 명령 |
+| v1.7 | 2026-11-17 | k6 정합성 실패 판정 임계값(count==0 / ==DUP_USERS / <=CAPACITY), login_late, queue_closed·POLL_SOLD_OUT 분리 |
 
 ---
 
@@ -343,7 +345,8 @@ services:
       kafka-init: { condition: service_completed_successfully }
 
   k6:
-    image: grafana/k6:0.54.0                 # 태그는 구현 시 확인
+    image: grafana/k6:2.4.0                  # 2026-11-12 안정판 (로컬 k6 v2.3.0 과 호환)
+    user: "${K6_USER:-12345:12345}"           # Linux 에서 결과 디렉터리 권한이 막히면 호스트 uid 로
     profiles: ["loadtest"]
     environment:
       BASE_URL: http://gateway:8080
@@ -401,12 +404,23 @@ docker compose up -d                                  # 인프라 + kafka-init �
 docker compose up -d --wait postgres redis kafka      # 인프라 healthy 대기
 [[ "$(docker wait queuedrop-kafka-init)" == "0" ]] || { docker logs queuedrop-kafka-init; exit 1; }   # 토픽 생성 확인
 docker compose --profile app up -d --build --wait     # 서비스 7개 healthy 대기
+# 내리기: docker compose --profile app stop gateway user-service product-service queue-service coupon-service entry-service ranking-service  (서비스 미지정 시 인프라까지 멈춤)
 docker compose ps                                  # 전부 healthy 확인
 curl -fs localhost:8080/actuator/health            # gateway OK
 curl -s  localhost:8085/actuator/health || echo "내부 포트 비노출 확인"
 ```
 
 ### 3.4 k6 스크립트
+
+> **구현 기준 (v1.6)**: 실제 스크립트는 `load-test/` 가 기준이며 아래 코드는 설계 초안이다. 구현에서 달라진 점:
+> - 사용자 번호는 drop-open 도 `exec.scenario.iterationInTest + 1` (k6 v2 에서 VU id 가 시나리오끼리 섞여 배정됨을 확인).
+> - `handleSummary` 는 jslib `k6-summary/0.1.0` 을 쓰고 `lib/api.js` 의 `summary()` 로 공통화. 결과 경로는 `RESULTS_DIR`(기본 `/results`; 로컬 k6 는 `-e RESULTS_DIR=docs/report/results -e BASE_URL=http://localhost:8080`).
+> - setup 에서 관리자 로그인·등록 응답이 기대와 다르면 즉시 throw. 입력 가드: `OPEN_DELAY_SEC ≥ 61`(드로우 오픈 최소 1분), `WINNERS ≤ CAPACITY`, `START_DELAY_SEC ≥ 5`(`issueStartAt @Future`).
+> - 재시도를 소진해도 `QUEUE_NOT_OPEN`·`COUPON_NOT_STARTED` 면 `unexpected` 로 센다. prepare-users 는 `signup_created`/`signup_existed`/`unexpected` 카운터와 임계값으로 T8-04 를 판정.
+> - spike 에 `coupon_ok{scenario:spike} count<=QUANTITY` 임계값 추가. 3.6 관찰 지표가 요약에 남도록 항상 통과하는 관찰용 임계값을 둔다. 파일로 넘길 때 `-e NO_COLOR=1`.
+> - 결과 JSON(`docs/report/results/*.json`)은 커밋하지 않는다 (.gitignore). 검증 스크립트 출력(.txt)은 커밋 가능.
+> - **정합성 실패 판정 임계값 (v1.7)**: drop-open — `entry_ok count<=CAPACITY`, `entry_rejected{code:ENTRY_DUPLICATE} count==0`, `unexpected count==0`, `checks rate==1`, `login_late count==0`. coupon — `coupon_ok{scenario:spike} count<=QUANTITY`, `coupon_ok{scenario:dup_burst} count==DUP_USERS`(발급 유실도 검출), `coupon_rejected{scenario:spike,code:COUPON_DUPLICATE} count==0`, `coupon_rejected{scenario:dup_burst,code:COUPON_SOLD_OUT} count==0`, `login_late count==0`.
+> - 카운터: 진입 409 `QUEUE_CLOSED` 는 `queue_closed`, 폴링 중 SOLD_OUT 은 `queue_sold_out{code:POLL_SOLD_OUT}`. 로그인 직후 오픈(발급 시작) 시각을 지났으면 `login_late` (6장 BCrypt 리스크 검출).
 
 #### 설계 원칙 (구현 결정)
 - **사용자 1명 = VU 1개** (`per-vu-iterations`, iterations=1). 대기열은 "진입 → 폴링 → 응모"가 한 사람의 순차 흐름이라 도착률 기반 실행기보다 자연스럽다.
@@ -865,7 +879,7 @@ done
 | ID | 시나리오 | 파라미터 (기본) | 관찰 지표 | 초기 목표 (구현 결정) |
 |----|----------|-----------------|-----------|------------------------|
 | S1 | 드로우 오픈 스파이크 | USERS 3,000 / M 1,000 / K 100 / 배치 100·1초 | 진입·응모 TPS, `queue_enter`·`entry_apply` p95/p99, 5xx 비율, `queue_wait_ms`, entry-service lag 최대값·해소 시간 | 응모 p99 < 500ms, 5xx < 0.1%, lag 30초 내 해소, **초과·중복 0** |
-| S2 | 정원 조기 소진 | USERS 5,000 / M 100 / K 10 | `entry_rejected{code:ENTRY_SOLD_OUT}`, `queue_sold_out{code:QUEUE_SOLD_OUT}`, 소진 후 입장 중단 여부 | 성공 정확히 100, 소진 이후 토큰 발급 중단 |
+| S2 | 정원 조기 소진 | USERS 5,000 / M 100 / K 10 | `entry_rejected{code:ENTRY_SOLD_OUT}`, `queue_sold_out` (진입 409 `QUEUE_SOLD_OUT` + 폴링 `POLL_SOLD_OUT`), 소진 후 입장 중단 여부 | 성공 정확히 100, 소진 이후 토큰 발급 중단 |
 | S3 | 쿠폰 스파이크 | USERS 3,000 / 수량 500 | `coupon_issue` TPS·p95/p99, `coupon_rejected{code:COUPON_SOLD_OUT}`, `coupon_not_started` | 발급 p99 < 500ms, 발급 정확히 500 |
 | S4 | 쿠폰 중복 버스트 | DUP_USERS 200 × BURST 5, S3 와 별도 이벤트 (수량 1,000) | `coupon_ok{scenario:dup_burst}`, `coupon_rejected{code:COUPON_DUPLICATE}`, DB 발급 수 | 202 정확히 200, DB 200, 나머지 800건 `COUPON_DUPLICATE` |
 | S5 | 입장 배치 크기 비교 | S1 고정, `QUEUE_ADMISSION_BATCH_SIZE` 50 / 100 / 500 | `queue_wait_ms` vs `entry_apply` p99 트레이드오프 | 결과 기록 (목표 없음) |
