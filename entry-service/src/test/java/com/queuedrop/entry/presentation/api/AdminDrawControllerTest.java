@@ -19,6 +19,7 @@ import com.queuedrop.entry.application.dto.ManualDrawCommand;
 import com.queuedrop.entry.application.dto.Requester;
 import com.queuedrop.entry.application.exception.DrawErrorCode;
 import com.queuedrop.entry.application.service.DrawService;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -43,7 +44,7 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
 
 /** 관리자 수동 추첨 슬라이스 (단계 문서 5단계 3.4 D5-1, T5-32). domain 타입 import 금지 */
 @WebMvcTest(AdminDrawController.class)
-@Import({GlobalExceptionHandler.class, AdminDrawControllerTest.FixedClockConfig.class})
+@Import({GlobalExceptionHandler.class, AdminDrawControllerTest.FixedClockConfig.class, SimpleMeterRegistry.class})
 class AdminDrawControllerTest {
 
     private static final String DRAW_PATH = "/api/entries/admin/drops/{dropId}/draw";

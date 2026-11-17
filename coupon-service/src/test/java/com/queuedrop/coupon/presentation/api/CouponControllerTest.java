@@ -20,6 +20,7 @@ import com.queuedrop.coupon.application.dto.MyCouponResult;
 import com.queuedrop.coupon.application.exception.CouponErrorCode;
 import com.queuedrop.coupon.application.service.CouponIssueService;
 import com.queuedrop.coupon.application.service.CouponQueryService;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Instant;
 import java.util.List;
 import java.util.stream.Stream;
@@ -42,7 +43,7 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
 
 /** 발급·내 쿠폰 API 슬라이스 (단계 문서 3.4, T6-18). domain 타입(IssueOutcome 등)은 import 하지 않는다. */
 @WebMvcTest(CouponController.class)
-@Import(GlobalExceptionHandler.class)
+@Import({GlobalExceptionHandler.class, SimpleMeterRegistry.class})
 class CouponControllerTest {
 
     private static final String ISSUE_PATH = "/api/coupons/events/{eventId}/issue";

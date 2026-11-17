@@ -69,8 +69,9 @@ public class UserService {
     /**
      * 이메일 없음·비밀번호 불일치·형식 오류를 같은 코드로 응답한다 (계정 존재 여부 노출 방지).
      * 이메일이 없어도 더미 해시로 비교를 한 번 수행해 응답 시간 차이로 존재 여부가 드러나지 않게 한다.
+     *
+     * 트랜잭션을 걸지 않는다: BCrypt 비교 동안 DB 커넥션을 쥐지 않도록 조회만 저장소 호출 단위 트랜잭션으로 한다 (phase-8 #8 P3).
      */
-    @Transactional(readOnly = true)
     public LoginResult login(LoginCommand command) {
         Email email = toEmail(command.email(), UserErrorCode.INVALID_CREDENTIALS);
         Optional<User> found = userRepository.findByEmail(email);

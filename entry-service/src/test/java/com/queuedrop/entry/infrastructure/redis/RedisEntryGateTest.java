@@ -13,6 +13,9 @@ import com.queuedrop.entry.infrastructure.config.RedisScriptConfig;
 import java.time.Duration;
 import java.time.Instant;
 import io.lettuce.core.RedisClient;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.api.StatefulRedisConnection;
 import java.util.List;
@@ -39,7 +42,7 @@ import org.springframework.data.redis.core.script.RedisScript;
  * 키 이름은 architecture.md 5장 문자열을 테스트가 독립적으로 고정한다 (EntryRedisKeys 와 교차 검증).
  */
 @DataRedisTest
-@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisEntryGate.class})
+@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisEntryGate.class, SimpleMeterRegistry.class})
 class RedisEntryGateTest {
 
     private static final long DROP_ID = 42L;
@@ -51,6 +54,10 @@ class RedisEntryGateTest {
 
     @Autowired
     private StringRedisTemplate redis;
+
+    /** 8단계: entry.apply.compensated{result} 카운터 확인용 */
+    @Autowired
+    private MeterRegistry meterRegistry;
 
     /** T4-39: CLIENT PAUSE 를 보낼 별도 연결의 접속 정보 */
     @Autowired
@@ -1112,6 +1119,111 @@ class RedisEntryGateTest {
             } finally {
                 client.shutdown();
             }
+        }
+    }
+
+    @Nested
+    @DisplayName("보상 메트릭 entry.apply.compensated (8단계 3.2, T8-13)")
+    class CompensationMetric {
+
+        private static final String METRIC = "entry.apply.compensated";
+
+        private double count(String result) {
+            Counter counter = meterRegistry.find(METRIC).tag("result", result).counter();
+            return counter == null ? 0 : counter.count();
+        }
+
+        private double total() {
+            return meterRegistry.find(METRIC).counters().stream().mapToDouble(Counter::count).sum();
+        }
+
+        @Test
+        @DisplayName("[T8-13] 보상 성공 → entry.apply.compensated{result=COMPENSATED} 1 증가 (정합성 이상 신호)")
+        void compensatedIsCounted() {
+            // Given
+            initialize(3);
+            applyWithToken(USER_A);
+            double before = count("COMPENSATED");
+            double totalBefore = total();
+
+            // When
+            CompensationResult result = gate.compensate(DROP_ID, USER_A, eventId(USER_A));
+
+            // Then
+            assertThat(result).isEqualTo(CompensationResult.COMPENSATED);
+            assertThat(count("COMPENSATED") - before).isEqualTo(1.0);
+            assertThat(total() - totalBefore).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("[T8-13] 우리 요청이 아니면(NOT_OURS) 변화는 없어도 result=NOT_OURS 로 센다 (타임아웃 경로의 정상 결과)")
+        void notOursIsCounted() {
+            // Given
+            initialize(3);
+            applyWithToken(USER_A);
+            double before = count("NOT_OURS");
+            double compensatedBefore = count("COMPENSATED");
+
+            // When
+            CompensationResult result = gate.compensate(DROP_ID, USER_B, eventId(USER_B));
+
+            // Then
+            assertThat(result).isEqualTo(CompensationResult.NOT_OURS);
+            assertThat(count("NOT_OURS") - before).isEqualTo(1.0);
+            assertThat(count("COMPENSATED")).as("NOT_OURS 를 COMPENSATED 로 세면 T8-13 판정이 틀어진다")
+                    .isEqualTo(compensatedBefore);
+        }
+
+        @Test
+        @DisplayName("[T8-13] 같은 eventId 로 보상 2번 → COMPENSATED 1, NOT_OURS 1 (호출마다 결과대로 센다)")
+        void eachCallIsCountedByResult() {
+            // Given
+            initialize(3);
+            applyWithToken(USER_A);
+            double compensatedBefore = count("COMPENSATED");
+            double notOursBefore = count("NOT_OURS");
+
+            // When
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
+
+            // Then
+            assertThat(count("COMPENSATED") - compensatedBefore).isEqualTo(1.0);
+            assertThat(count("NOT_OURS") - notOursBefore).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("[T8-13] 저장 확정 후 보상 → result=ALREADY_PERSISTED 1 증가")
+        void alreadyPersistedIsCounted() {
+            // Given
+            initialize(3);
+            applyWithToken(USER_A);
+            assertThat(gate.claimForSave(DROP_ID, USER_A, eventId(USER_A))).isTrue();
+            double before = count("ALREADY_PERSISTED");
+            double totalBefore = total();
+
+            // When
+            CompensationResult result = gate.compensate(DROP_ID, USER_A, eventId(USER_A));
+
+            // Then
+            assertThat(result).isEqualTo(CompensationResult.ALREADY_PERSISTED);
+            assertThat(count("ALREADY_PERSISTED") - before).isEqualTo(1.0);
+            assertThat(total() - totalBefore).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("[T8-13] 판정(tryApply)·저장 확정(claimForSave)은 보상 카운터를 올리지 않는다")
+        void otherOperationsAreNotCounted() {
+            // Given
+            initialize(3);
+            double totalBefore = total();
+
+            // When
+            applyWithToken(USER_A);
+            gate.claimForSave(DROP_ID, USER_A, eventId(USER_A));
+
+            // Then
+            assertThat(total()).isEqualTo(totalBefore);
         }
     }
 }

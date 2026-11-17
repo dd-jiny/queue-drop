@@ -19,6 +19,7 @@
 | v2.3 | 2026-11-17 | 6단계 완료: 진행 현황·작업·완료 조건 갱신 |
 | v2.4 | 2026-11-17 | 7단계 착수: 사용자 결정 2건(인기 드로우 = 진행 중만, 동점 = member 사전순) 확정, 종료 드로우 lazy 제거 기본안 4장 표에 추가 |
 | v2.5 | 2026-11-17 | 7단계 완료: 진행 현황·작업·완료 조건 갱신 |
+| v2.6 | 2026-11-17 | 8단계 완료: 진행 현황·작업·완료 조건 갱신 (DB 락 비교 미수행) |
 
 ---
 
@@ -98,7 +99,7 @@ flowchart LR
 | 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ✅ 완료 (2026-11-17) |
 | 6. 쿠폰 | `feat/phase-6-coupon` | [phase-6-coupon.md](phases/phase-6-coupon.md) | ✅ 완료 (2026-11-17) |
 | 7. 랭킹 | `feat/phase-7-ranking` | [phase-7-ranking.md](phases/phase-7-ranking.md) | ✅ 완료 (2026-11-17) |
-| 8. 검증 | `test/phase-8-load-test` | [phase-8-load-test.md](phases/phase-8-load-test.md) | ⬜ 대기 |
+| 8. 검증 | `test/phase-8-load-test` | [phase-8-load-test.md](phases/phase-8-load-test.md) | ✅ 완료 (2026-11-17) — [리포트](../report/load-test-report.md) |
 
 ---
 
@@ -321,20 +322,20 @@ flowchart LR
 **참고**: [infrastructure.md](../design/03-infrastructure/infrastructure.md) 6장
 
 **작업**
-- [ ] 서비스 컨테이너화 (서비스별 Dockerfile, compose `app` 프로필, 내부 포트 비노출)
-- [ ] 관측: Actuator 메트릭 (선택: Prometheus + Grafana)
-- [ ] k6 시나리오
+- [x] 서비스 컨테이너화 (서비스별 Dockerfile, compose `app` 프로필, 내부 포트 비노출)
+- [x] 관측: Actuator 메트릭 + Prometheus·Grafana (monitoring 프로필)
+- [x] k6 시나리오 (기본 3,000~5,000명, 확대 10,000~20,000명)
   - 드로우 오픈 스파이크: N명 동시 대기열 진입 → 입장 → 응모
   - 쿠폰 스파이크: N명 동시 발급 요청
-- [ ] 결과 검증 스크립트: DB 응모 수 ≤ M, 쿠폰 발급 수 ≤ 수량, 중복 0
-- [ ] 리포트 작성 (`docs/report/`): 처리량, p95/p99, 병목 분석, 개선 전후 비교
+- [x] 결과 검증 스크립트: DB 응모 수 ≤ M, 쿠폰 발급 수 ≤ 수량, 중복 0
+- [x] 리포트 작성 (`docs/report/`): 처리량, p95/p99, 병목 분석, 개선 전후 비교
 
 **선택 (시간 여유 시)**
-- [ ] 비교 실험: DB 락 방식 판정과 Redis Lua 방식의 처리량·지연 비교
+- [ ] (미수행) 비교 실험: DB 락 방식 판정과 Redis Lua 방식의 처리량·지연 비교
 
 **완료 조건**
-- [ ] 부하 테스트 중 정원·수량 초과 0, 중복 0
-- [ ] 리포트에 측정 조건·수치·해석 기록
+- [x] 부하 테스트 중 정원·수량 초과 0, 중복 0 (모든 실행)
+- [x] 리포트에 측정 조건·수치·해석 기록
 
 ---
 

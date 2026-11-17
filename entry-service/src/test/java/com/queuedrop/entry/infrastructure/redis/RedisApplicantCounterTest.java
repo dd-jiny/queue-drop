@@ -13,6 +13,7 @@ import com.queuedrop.entry.infrastructure.config.RedisScriptConfig;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.api.StatefulRedisConnection;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.time.Instant;
 import org.junit.jupiter.api.AfterEach;
@@ -32,7 +33,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
  * 응모자 Set 은 실제 게이트(Lua)로 만들어 같은 키를 세는지 교차 검증한다.
  */
 @DataRedisTest
-@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisEntryGate.class, RedisApplicantCounter.class})
+@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisEntryGate.class, RedisApplicantCounter.class, SimpleMeterRegistry.class})
 class RedisApplicantCounterTest {
 
     private static final long DROP_ID = 62L;

@@ -5,6 +5,7 @@ import com.queuedrop.entry.application.port.EntryGate;
 import com.queuedrop.entry.application.port.GateResult;
 import com.queuedrop.entry.application.port.GateUnavailableException;
 import com.queuedrop.entry.domain.model.ApplyOutcome;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -22,12 +23,16 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class RedisEntryGate implements EntryGate {
 
+    private static final String COMPENSATED_METRIC = "entry.apply.compensated";
+
     private final StringRedisTemplate redis;
     private final RedisScript<Long> entryInitializeScript;
     @SuppressWarnings("rawtypes")
     private final RedisScript<List> entryApplyScript;
     private final RedisScript<Long> entryCompensateScript;
     private final RedisScript<Long> entryClaimScript;
+    /** entry.apply.compensated{result} 기록용 (8단계 3.2, T8-13) */
+    private final MeterRegistry meterRegistry;
 
     @Override
     public GateResult tryApply(long dropId, long userId, String eventId, Instant now) {
@@ -50,12 +55,15 @@ public class RedisEntryGate implements EntryGate {
                 List.of(EntryRedisKeys.remaining(dropId), EntryRedisKeys.applicants(dropId),
                         EntryRedisKeys.requests(dropId), EntryRedisKeys.persisted(dropId)),
                 String.valueOf(userId), eventId));
-        return switch (result.intValue()) {
+        CompensationResult compensation = switch (result.intValue()) {
             case 1 -> CompensationResult.COMPENSATED;
             case 0 -> CompensationResult.NOT_OURS;
             case 2 -> CompensationResult.ALREADY_PERSISTED;
             default -> throw new IllegalStateException("알 수 없는 보상 결과: " + result);
         };
+        // Lua 호출 자체가 실패하면 위에서 예외로 빠져 세지 않는다 (요청은 outcome=TEMPORARILY_FAILED 로 잡힌다)
+        meterRegistry.counter(COMPENSATED_METRIC, "result", compensation.name()).increment();
+        return compensation;
     }
 
     @Override

@@ -1,5 +1,7 @@
 server:
   port: 8082
+  tomcat:
+    accept-count: ${TOMCAT_ACCEPT_COUNT:1024}   # 기본 100 → 스파이크 시 listen backlog 초과로 연결 리셋 (phase-8 #8 P1)
 
 spring:
   application:
@@ -40,3 +42,22 @@ spring:
         spring.json.trusted.packages: com.queuedrop.common.event
     listener:
       ack-mode: record             # 레코드 단위로 처리 성공 후 커밋 (entry 와 같음)
+
+# Actuator · 메트릭 (phase-8 3.2)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99

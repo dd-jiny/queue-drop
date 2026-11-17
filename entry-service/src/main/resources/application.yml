@@ -1,5 +1,7 @@
 server:
   port: 8085
+  tomcat:
+    accept-count: ${TOMCAT_ACCEPT_COUNT:1024}   # 기본 100 → 스파이크 시 listen backlog 초과로 연결 리셋 (phase-8 #8 P1)
 
 spring:
   application:
@@ -54,3 +56,22 @@ entry:
     interval-ms: 5000              # 추첨 스케줄러 주기
     closing-warn-threshold: 5m     # CLOSING 장기화 경고 기준 (경고 후 관리자 수동 추첨, D5-1)
     key-ttl-after-draw: 1d         # 추첨 커밋 후 응모 Redis 키 만료 (E-42)
+
+# Actuator · 메트릭 (phase-8 3.2)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99

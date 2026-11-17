@@ -24,6 +24,9 @@ import com.queuedrop.coupon.application.dto.Requester;
 import com.queuedrop.coupon.application.exception.CouponErrorCode;
 import com.queuedrop.coupon.application.service.CouponEventService;
 import com.queuedrop.coupon.application.service.CouponQueryService;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Instant;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.DisplayName;
@@ -49,7 +52,7 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
  * @Future 는 Bean Validation 기본 ClockProvider(시스템 시각) 기준이라 과거·미래 값은 시스템 시각과 멀리 둔다.
  */
 @WebMvcTest(CouponEventController.class)
-@Import(GlobalExceptionHandler.class)
+@Import({GlobalExceptionHandler.class, SimpleMeterRegistry.class})
 class CouponEventControllerTest {
 
     private static final String EVENTS_PATH = "/api/coupons/events";
@@ -58,6 +61,7 @@ class CouponEventControllerTest {
     private static final Instant FUTURE_START = Instant.parse("2099-01-01T00:00:00Z");
 
     @Autowired MockMvc mockMvc;
+    @Autowired MeterRegistry meterRegistry;
     @MockitoBean CouponEventService eventService;
     @MockitoBean CouponQueryService queryService;
 
@@ -356,6 +360,45 @@ class CouponEventControllerTest {
             result.andExpect(status().isNotFound())
                     .andExpect(jsonPath("$.code").value("COMMON_NOT_FOUND"));
             verifyNoInteractions(eventService);
+        }
+    }
+
+    @Nested
+    @DisplayName("발급 판정 메트릭과의 분리 (8단계 3.2)")
+    class IssueOutcomeMetric {
+
+        private double issueOutcomeTotal() {
+            return meterRegistry.find("coupon.issue.outcome").counters().stream().mapToDouble(Counter::count).sum();
+        }
+
+        @Test
+        @DisplayName("[8단계 메트릭] 이벤트 조회 404 COUPON_EVENT_NOT_FOUND 는 발급 판정이 아니므로 coupon.issue.outcome{NOT_FOUND} 로 세지 않는다")
+        void eventLookupNotFoundIsNotCounted() throws Exception {
+            // Given
+            willThrow(new ApplicationException(CouponErrorCode.EVENT_NOT_FOUND)).given(queryService).event(anyLong());
+            double before = issueOutcomeTotal();
+
+            // When
+            ResultActions result = mockMvc.perform(get(EVENT_PATH, "5"));
+
+            // Then
+            result.andExpect(status().isNotFound());
+            assertThat(issueOutcomeTotal()).isEqualTo(before);
+        }
+
+        @Test
+        @DisplayName("[8단계 메트릭] 재초기화 503 COUPON_TEMPORARILY_FAILED 는 coupon.issue.outcome 에 세지 않는다")
+        void reinitializeFailureIsNotCounted() throws Exception {
+            // Given
+            willThrow(new ApplicationException(CouponErrorCode.TEMPORARILY_FAILED)).given(eventService).reinitialize(any());
+            double before = issueOutcomeTotal();
+
+            // When
+            ResultActions result = reinitialize("5", "1", "ADMIN");
+
+            // Then
+            result.andExpect(status().isServiceUnavailable());
+            assertThat(issueOutcomeTotal()).isEqualTo(before);
         }
     }
 }

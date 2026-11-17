@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-16 | R1 허용 목록에 `lombok..` 추가 (Lombok 생성 코드의 `@lombok.Generated` 가 바이트코드에 남는 것을 확인), R3 금지 목록에 기술 클라이언트(`org.hibernate`, `org.apache.kafka`, `io.lettuce`, `redis.clients`) 추가 | phase-0 커밋 #4 |
 | v1.3 | 2026-11-16 | 4.5: `X-User-Id` 누락 코드 `COMMON_MISSING_USER_HEADER`(400) 로 공통화, 에러 코드 명명 규칙 `{SERVICE}_{REASON}`, 응답 메시지는 코드별 고정(도메인 상세 메시지는 로그만), 서비스 예외는 `ApplicationException` 상속·`GlobalExceptionHandler` 단일화 | phase-0 커밋 #7 |
 | v1.4 | 2026-11-16 | 4.5: 예시를 `ApplicationException(EntryErrorCode.SOLD_OUT)` 로 정정, 리스너 경로의 불변식 위반 메시지는 application 이 로그 후 스킵(재시도·DLT 없음)으로 변경 (`InvalidDropSnapshotException` 제거) | phase-4 구현 상세 v1.2 |
+| v1.5 | 2026-11-17 | R3 금지 목록에 `io.micrometer..` 추가 (메트릭은 presentation·infrastructure 에서 기록) | phase-8 커밋 #3 |
 
 ## 1. 쉬운 설명 (한눈에)
 > 가게로 비유하면 **창구(presentation)** 는 손님 말을 주문서로 옮겨 적고, **매니저(application)** 는 주문서를 보고 일을 지시하고,
@@ -142,7 +143,7 @@ com.queuedrop.{service}
 |---|------|------|
 | R1 | `domain..` 은 `domain..`, `java..`, `lombok..` 외에 의존하지 않는다 | domain 순수성 (Spring·JPA 의존 금지, 컴파일 타임 Lombok 허용*) |
 | R2 | `application..` 은 `presentation..`, `infrastructure..` 에 의존하지 않는다 | 상위·기술 계층 모름 |
-| R3 | `application..` 은 `jakarta.persistence..`, `org.hibernate..`, `org.springframework.data..`, `org.springframework.kafka..`, `org.springframework.web..`, `org.apache.kafka..`, `io.lettuce..`, `redis.clients..`, `com.queuedrop.common.event..` 에 의존하지 않는다 | 기술 의존 금지(Spring 추상화와 클라이언트 라이브러리 모두), 메시지 계약 직접 의존 금지(4.4) |
+| R3 | `application..` 은 `jakarta.persistence..`, `org.hibernate..`, `org.springframework.data..`, `org.springframework.kafka..`, `org.springframework.web..`, `org.apache.kafka..`, `io.lettuce..`, `redis.clients..`, `io.micrometer..`, `com.queuedrop.common.event..` 에 의존하지 않는다 | 기술 의존 금지(Spring 추상화와 클라이언트 라이브러리 모두), 메시지 계약 직접 의존 금지(4.4) |
 | R4 | `presentation..` 은 `domain..`, `infrastructure..` 에 의존하지 않는다 | **모델 비노출** |
 | R5 | `infrastructure..` 는 `presentation..` 에 의존하지 않는다 | 역방향 금지 |
 | R6 | `application.service..` 의 public 메서드는 `domain.model..` 타입을 파라미터·반환으로 쓰지 않는다 | **모델 비노출 (메서드 시그니처 수준)** |

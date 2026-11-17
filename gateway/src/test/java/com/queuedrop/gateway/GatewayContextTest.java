@@ -11,6 +11,7 @@ import org.springframework.cloud.gateway.filter.RemoveCachedBodyFilter;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.AnnotationAwareOrderComparator;
 import org.springframework.context.ApplicationContext;
+import org.springframework.test.web.reactive.server.WebTestClient;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.util.ArrayList;
@@ -54,5 +55,31 @@ class GatewayContextTest {
                 assertThat(f.getClass()).isIn(HeaderSanitizeFilter.class, RemoveCachedBodyFilter.class));
         assertThat(((Ordered) sorted.get(sanitize)).getOrder()).isEqualTo(Ordered.HIGHEST_PRECEDENCE);
         assertThat(((Ordered) sorted.get(jwt)).getOrder()).isEqualTo(Ordered.HIGHEST_PRECEDENCE + 1);
+    }
+
+    // ---- 8단계 커밋 #2: Actuator 노출 범위 (phase-8 3.2) ----
+    // gateway 의 actuator 는 라우트에 걸리지 않아 GlobalFilter(JWT 인증)를 거치지 않는다. 토큰 없이 호출해 실제 응답을 확인한다.
+
+    @Test
+    @DisplayName("[8단계 Actuator] gateway 는 토큰 없이 /actuator/health 와 health 프로브(liveness·readiness)에 200 으로 응답한다")
+    void gatewayExposesHealthAndProbes() {
+        // Given
+        WebTestClient client = WebTestClient.bindToApplicationContext(context).build();
+
+        // When / Then
+        client.get().uri("/actuator/health").exchange().expectStatus().isOk();
+        client.get().uri("/actuator/health/liveness").exchange().expectStatus().isOk();
+        client.get().uri("/actuator/health/readiness").exchange().expectStatus().isOk();
+    }
+
+    @Test
+    @DisplayName("[8단계 Actuator] gateway 는 외부 공개 포트라 /actuator/prometheus·/actuator/metrics 를 노출하지 않는다 (404)")
+    void gatewayDoesNotExposeMetrics() {
+        // Given
+        WebTestClient client = WebTestClient.bindToApplicationContext(context).build();
+
+        // When / Then
+        client.get().uri("/actuator/prometheus").exchange().expectStatus().isNotFound();
+        client.get().uri("/actuator/metrics").exchange().expectStatus().isNotFound();
     }
 }

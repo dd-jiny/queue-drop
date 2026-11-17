@@ -1,5 +1,7 @@
 server:
   port: 8083
+  tomcat:
+    accept-count: ${TOMCAT_ACCEPT_COUNT:1024}   # 기본 100 → 스파이크 시 listen backlog 초과로 연결 리셋 (phase-8 #8 P1)
 
 spring:
   application:
@@ -35,3 +37,22 @@ queue:
     batch-size: 100           # 주기당·드로우당 입장 인원 N (1~1000)
     token-ttl-seconds: 300    # 입장 토큰 TTL
     scheduler-enabled: true   # false 면 AdmissionScheduler 빈을 만들지 않는다 (테스트에서 admit() 직접 호출)
+
+# Actuator · 메트릭 (phase-8 3.2)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99

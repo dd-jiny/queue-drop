@@ -1,0 +1,10 @@
+.git
+.gradle
+.idea
+**/build/tmp
+**/build/classes
+**/build/resources
+**/src
+docs
+load-test
+node_modules
