@@ -21,10 +21,10 @@ public class EntrySaveService {
     private final EntryGate entryGate;
 
     public void save(EntrySaveCommand command) {
-        // ① 보상된 응모(유령 이벤트) 거르기: Redis 응모자에 없으면 저장하지 않는다
-        if (!entryGate.isApplicant(command.dropId(), command.userId())) {
-            log.warn("보상된 응모 이벤트 무시 dropId={} userId={} seq={}",
-                    command.dropId(), command.userId(), command.entrySeq());
+        // ① 저장 확정: 보상된 응모 또는 이전 시도의 유령 이벤트면 false. true 이후 보상은 거절된다 (E-40)
+        if (!entryGate.claimForSave(command.dropId(), command.userId(), command.eventId())) {
+            log.warn("유령 응모 이벤트 무시 dropId={} userId={} seq={} eventId={}",
+                    command.dropId(), command.userId(), command.entrySeq(), command.eventId());
             return;
         }
 

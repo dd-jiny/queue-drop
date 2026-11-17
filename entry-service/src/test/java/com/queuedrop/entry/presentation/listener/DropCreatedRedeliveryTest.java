@@ -86,7 +86,7 @@ class DropCreatedRedeliveryTest {
         awaitRegistered(dropId);
         for (long userId = 1; userId <= 30; userId++) {
             redis.opsForValue().set("queue:" + dropId + ":token:" + userId, "1", Duration.ofMinutes(5));
-            assertThat(entryGate.tryApply(dropId, userId, NOW).isOk()).isTrue();
+            assertThat(entryGate.tryApply(dropId, userId, "e-" + userId, NOW).isOk()).isTrue();
         }
         assertThat(redis.opsForValue().get("entry:" + dropId + ":remaining")).isEqualTo("70");
 
@@ -112,7 +112,7 @@ class DropCreatedRedeliveryTest {
         awaitRegistered(dropId);
         for (long userId = 1; userId <= 30; userId++) {
             redis.opsForValue().set("queue:" + dropId + ":token:" + userId, "1", Duration.ofMinutes(5));
-            assertThat(entryGate.tryApply(dropId, userId, NOW).isOk()).isTrue();
+            assertThat(entryGate.tryApply(dropId, userId, "e-" + userId, NOW).isOk()).isTrue();
         }
 
         // When — 같은 dropId, 정원 50 인 메시지 재수신 → 확인용 메시지

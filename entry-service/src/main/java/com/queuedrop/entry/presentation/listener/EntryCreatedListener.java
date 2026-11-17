@@ -20,7 +20,7 @@ public class EntryCreatedListener {
 
     @KafkaListener(id = "entry-saver", idIsGroup = false, topics = Topics.ENTRY_CREATED)
     public void on(EntryCreated message) {
-        entrySaveService.save(new EntrySaveCommand(
+        entrySaveService.save(new EntrySaveCommand(message.eventId(),
                 message.dropId(), message.userId(), message.entrySeq(), message.appliedAt()));
     }
 }

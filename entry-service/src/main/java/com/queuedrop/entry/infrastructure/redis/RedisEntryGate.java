@@ -1,5 +1,6 @@
 package com.queuedrop.entry.infrastructure.redis;
 
+import com.queuedrop.entry.application.port.CompensationResult;
 import com.queuedrop.entry.application.port.EntryGate;
 import com.queuedrop.entry.application.port.GateResult;
 import com.queuedrop.entry.domain.model.ApplyOutcome;
@@ -22,7 +23,7 @@ public class RedisEntryGate implements EntryGate {
     private final RedisScript<Long> entryCompensateScript;
 
     @Override
-    public GateResult tryApply(long dropId, long userId, Instant now) {
+    public GateResult tryApply(long dropId, long userId, String eventId, Instant now) {
         List<?> result = redis.execute(entryApplyScript,
                 List.of(EntryRedisKeys.meta(dropId), EntryRedisKeys.remaining(dropId),
                         EntryRedisKeys.applicants(dropId), EntryRedisKeys.seq(dropId),
@@ -37,10 +38,18 @@ public class RedisEntryGate implements EntryGate {
     }
 
     @Override
-    public void compensate(long dropId, long userId) {
-        redis.execute(entryCompensateScript,
+    public CompensationResult compensate(long dropId, long userId, String eventId) {
+        // TODO(#10b): entry-compensate.lua 3결과로 교체. 지금은 기존 Lua(1 = 되돌림, 0 = 응모자 아님)를 매핑만 한다
+        Long result = redis.execute(entryCompensateScript,
                 List.of(EntryRedisKeys.remaining(dropId), EntryRedisKeys.applicants(dropId)),
                 String.valueOf(userId));
+        return Long.valueOf(1L).equals(result) ? CompensationResult.COMPENSATED : CompensationResult.NOT_OURS;
+    }
+
+    @Override
+    public boolean claimForSave(long dropId, long userId, String eventId) {
+        // TODO(#10b): entry-claim.lua 로 교체. 지금은 기존 저장 전 확인(isApplicant)과 같다
+        return isApplicant(dropId, userId);
     }
 
     @Override

@@ -91,9 +91,14 @@ class RedisEntryGateTest {
         return Boolean.TRUE.equals(redis.opsForSet().isMember(applicantsKey(DROP_ID), String.valueOf(userId)));
     }
 
+    /** v1.5 시그니처 맞춤용 사용자별 고정 요청 ID (요청 ID 의미 검증은 커밋 #10b 의 T4-16·36~39) */
+    private static String eventId(long userId) {
+        return "e-" + userId;
+    }
+
     private GateResult applyWithToken(long userId) {
         issueToken(userId);
-        return gate.tryApply(DROP_ID, userId, NOW);
+        return gate.tryApply(DROP_ID, userId, eventId(userId), NOW);
     }
 
     @Nested
@@ -186,7 +191,7 @@ class RedisEntryGateTest {
             issueToken(USER_A);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.OK);
@@ -208,7 +213,7 @@ class RedisEntryGateTest {
             String before = redis.opsForValue().get(tokenKey(DROP_ID, USER_A));
 
             // When
-            gate.tryApply(DROP_ID, USER_A, NOW);
+            gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(redis.opsForValue().get(tokenKey(DROP_ID, USER_A))).isEqualTo(before);
@@ -239,7 +244,7 @@ class RedisEntryGateTest {
             issueToken(USER_A);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.CLOSED);
@@ -258,7 +263,7 @@ class RedisEntryGateTest {
             issueToken(USER_A);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.CLOSED);
@@ -274,7 +279,7 @@ class RedisEntryGateTest {
             issueToken(USER_A);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, OPEN_AT.minusMillis(1));
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), OPEN_AT.minusMillis(1));
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.CLOSED);
@@ -289,7 +294,7 @@ class RedisEntryGateTest {
             issueToken(USER_A);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, CLOSE_AT);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), CLOSE_AT);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.CLOSED);
@@ -306,8 +311,8 @@ class RedisEntryGateTest {
             issueToken(USER_B);
 
             // When
-            GateResult atOpen = gate.tryApply(DROP_ID, USER_A, OPEN_AT);
-            GateResult justBeforeClose = gate.tryApply(DROP_ID, USER_B, CLOSE_AT.minusMillis(1));
+            GateResult atOpen = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), OPEN_AT);
+            GateResult justBeforeClose = gate.tryApply(DROP_ID, USER_B, eventId(USER_B), CLOSE_AT.minusMillis(1));
 
             // Then
             assertThat(atOpen.outcome()).isEqualTo(ApplyOutcome.OK);
@@ -321,7 +326,7 @@ class RedisEntryGateTest {
             initialize(3);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, CLOSE_AT);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), CLOSE_AT);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.CLOSED);
@@ -334,7 +339,7 @@ class RedisEntryGateTest {
             initialize(3);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.NO_TOKEN);
@@ -353,7 +358,7 @@ class RedisEntryGateTest {
             issueToken(USER_B);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.NO_TOKEN);
@@ -369,7 +374,7 @@ class RedisEntryGateTest {
             redis.delete(tokenKey(DROP_ID, USER_A));
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.NO_TOKEN);
@@ -383,7 +388,7 @@ class RedisEntryGateTest {
             applyWithToken(USER_A);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.DUPLICATE);
@@ -402,7 +407,7 @@ class RedisEntryGateTest {
             assertThat(remaining()).isEqualTo("0");
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.DUPLICATE);
@@ -468,7 +473,7 @@ class RedisEntryGateTest {
             issueToken(USER_A);
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.CLOSED);
@@ -487,7 +492,7 @@ class RedisEntryGateTest {
                     .until(() -> !Boolean.TRUE.equals(redis.hasKey(tokenKey(DROP_ID, USER_A))));
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(result.outcome()).isEqualTo(ApplyOutcome.NO_TOKEN);
@@ -519,13 +524,13 @@ class RedisEntryGateTest {
             // Given
             initialize(2);
             applyWithToken(USER_A);                                   // seq=1
-            gate.tryApply(DROP_ID, USER_A, NOW);                     // DUPLICATE
-            gate.tryApply(DROP_ID, USER_B, NOW);                     // NO_TOKEN
+            gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);                     // DUPLICATE
+            gate.tryApply(DROP_ID, USER_B, eventId(USER_B), NOW);                     // NO_TOKEN
             issueToken(USER_B);
-            gate.tryApply(DROP_ID, USER_B, CLOSE_AT);                // CLOSED
+            gate.tryApply(DROP_ID, USER_B, eventId(USER_B), CLOSE_AT);                // CLOSED
 
             // When
-            GateResult result = gate.tryApply(DROP_ID, USER_B, NOW);
+            GateResult result = gate.tryApply(DROP_ID, USER_B, eventId(USER_B), NOW);
 
             // Then
             assertThat(result.entrySeq()).isEqualTo(2);
@@ -543,7 +548,7 @@ class RedisEntryGateTest {
             redis.opsForValue().set(tokenKey(otherDrop, USER_A), "1", Duration.ofSeconds(300));
 
             // When
-            GateResult other = gate.tryApply(otherDrop, USER_A, NOW);
+            GateResult other = gate.tryApply(otherDrop, USER_A, eventId(USER_A), NOW);
             GateResult mine = applyWithToken(USER_A);
 
             // Then
@@ -568,8 +573,8 @@ class RedisEntryGateTest {
             assertThat(remaining()).isEqualTo("2");
 
             // When
-            gate.compensate(DROP_ID, USER_A);
-            gate.compensate(DROP_ID, USER_A);
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
 
             // Then
             assertThat(remaining()).isEqualTo("3");
@@ -586,7 +591,7 @@ class RedisEntryGateTest {
             applyWithToken(USER_A);
 
             // When
-            gate.compensate(DROP_ID, USER_B);
+            gate.compensate(DROP_ID, USER_B, eventId(USER_B));
 
             // Then
             assertThat(remaining()).isEqualTo("2");
@@ -602,8 +607,8 @@ class RedisEntryGateTest {
             assertThat(applyWithToken(USER_B).outcome()).isEqualTo(ApplyOutcome.SOLD_OUT);
 
             // When
-            gate.compensate(DROP_ID, USER_A);
-            GateResult retry = gate.tryApply(DROP_ID, USER_B, NOW);
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
+            GateResult retry = gate.tryApply(DROP_ID, USER_B, eventId(USER_B), NOW);
 
             // Then
             assertThat(retry.outcome()).isEqualTo(ApplyOutcome.OK);
@@ -617,7 +622,7 @@ class RedisEntryGateTest {
             initialize(3);
             GateResult a = applyWithToken(USER_A);
             assertThat(a.entrySeq()).isEqualTo(1);
-            gate.compensate(DROP_ID, USER_A);
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
 
             // When
             GateResult b = applyWithToken(USER_B);
@@ -634,10 +639,10 @@ class RedisEntryGateTest {
             // Given
             initialize(3);
             applyWithToken(USER_A);
-            gate.compensate(DROP_ID, USER_A);
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
 
             // When
-            GateResult again = gate.tryApply(DROP_ID, USER_A, NOW);
+            GateResult again = gate.tryApply(DROP_ID, USER_A, eventId(USER_A), NOW);
 
             // Then
             assertThat(again.outcome()).isEqualTo(ApplyOutcome.OK);
@@ -651,7 +656,7 @@ class RedisEntryGateTest {
             initialize(3);
             applyWithToken(USER_A);
             applyWithToken(USER_B);
-            gate.compensate(DROP_ID, USER_A);
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
             assertThat(seq()).isEqualTo("2");
 
             // When
@@ -667,7 +672,7 @@ class RedisEntryGateTest {
         @DisplayName("[T4-16] 초기화 전 드로우에 보상 → remaining 키를 만들지 않는다 (queue 가 입장 허용으로 오판 방지)")
         void compensateOnUninitializedDropCreatesNothing() {
             // When
-            gate.compensate(DROP_ID, USER_A);
+            gate.compensate(DROP_ID, USER_A, eventId(USER_A));
 
             // Then
             assertThat(redis.hasKey(remainingKey(DROP_ID))).isFalse();
