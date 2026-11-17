@@ -225,6 +225,7 @@
   - strength 를 낮추는 것(예: 8 → 약 13ms)은 보안 수준을 낮추므로 부하 테스트 프로필에서만 고려하고 기본값은 유지한다.
 - **우선순위**: 낮음 — 측정 전에는 2. 고치는 비용은 작지만 지금 규모에서 체감 효과가 없다.
 - **영향 범위**: `UserService`, `phase-1-auth.md` 서비스 코드, `phase-8-load-test.md` 리스크 절(관련: E-20)
+- **상태 (2026-11-17)**: **로그인만 적용** (phase-8 #8 P3). 8단계 측정에서 3,000 동시 로그인 시 `hikaricp.connections.pending` 최대 189 → 적용 후 0 (active 최대 10 → 2). 로그인 p99 는 3.3s → 2.9s 로 CPU(BCrypt)가 상한. **가입은 미적용** (가입은 사전 준비 단계라 측정 대상 아님).
 
 ### E-17 `user.registered` 의 `afterCommit` 발행이 커넥션과 요청 스레드를 잡은 채로 최대 `max.block.ms` 블로킹
 - **단계/위치**: phase-1, `user-service/.../messaging/KafkaUserEventPublisher.java:28-48` (관련: E-02, E-10)

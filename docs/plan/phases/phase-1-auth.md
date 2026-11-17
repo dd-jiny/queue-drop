@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 관리자 계정 생성(ADMIN_EMAIL / ADMIN_PASSWORD 기동 시 생성) 확정 및 구현 상세·테스트·커밋 추가, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-16 | 0단계 결과 반영: 헤더 누락 400 `COMMON_MISSING_USER_HEADER`(3.8), Lombok/R1 설명 정정, user-service Kafka 블록을 0단계 공통 설정으로, jjwt 0.13.0. Access token 만료 1시간 기본안 확정. gateway 에러 코드 접두어 `AUTH_` 는 인증 도메인 이름으로 명명 규칙 예외 |
 | v1.3 | 2026-11-16 | 단계 검증 반영: `createAdminIfAbsent` 트랜잭션 제거(동시 기동 시 UnexpectedRollbackException), 비밀번호 UTF-8 72바이트 상한(BCrypt), 3.7 gateway 구현 결정 기록, 리스크(JWT_SECRET fallback) 추가, 로그인 시 더미 해시 비교(E-15) |
+| v1.4 | 2026-11-17 | `login` 트랜잭션 제거 — 8단계 부하 측정에서 3,000 동시 로그인 시 `hikaricp.connections.pending` 최대 189 확인 ([phase-8](phase-8-load-test.md) 3.9 P3, E-16) |
 
 ---
 
@@ -462,7 +463,7 @@ public class UserService {
         return SignupResult.from(saved);
     }
 
-    @Transactional(readOnly = true)
+    // 트랜잭션 없음 (phase-8 #8 P3): BCrypt 비교 동안 DB 커넥션을 쥐지 않도록 조회만 저장소 호출 단위 트랜잭션
     public LoginResult login(LoginCommand command) {
         Email email = toEmail(command.email(), UserErrorCode.INVALID_CREDENTIALS);
         User user = userRepository.findByEmail(email)
