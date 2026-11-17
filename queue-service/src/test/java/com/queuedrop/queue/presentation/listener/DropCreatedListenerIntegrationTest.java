@@ -8,6 +8,7 @@ import com.queuedrop.common.event.Topics;
 import com.queuedrop.common.test.container.KafkaContainerConfig;
 import com.queuedrop.common.test.container.RedisContainerConfig;
 import com.queuedrop.queue.presentation.scheduler.AdmissionScheduler;
+import com.queuedrop.queue.support.KafkaTopicReadiness;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -69,6 +70,7 @@ class DropCreatedListenerIntegrationTest {
     }
 
     private void publish(DropCreated event) throws Exception {
+        KafkaTopicReadiness.awaitTopicMetadata(kafkaTemplate, Topics.DROP_CREATED);
         kafkaTemplate.send(Topics.DROP_CREATED, String.valueOf(event.dropId()), event).get(5, TimeUnit.SECONDS);
     }
 
@@ -177,6 +179,9 @@ class DropCreatedListenerIntegrationTest {
         KafkaTemplate<String, String> rawTemplate = new KafkaTemplate<>((ProducerFactory) producerFactory,
                 Map.of(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class));
         Instant at = base.plus(Duration.ofHours(1));
+
+        // 설정을 덮어쓴 템플릿은 별도 producer 라 메타데이터를 따로 받는다
+        KafkaTopicReadiness.awaitTopicMetadata(rawTemplate, Topics.DROP_CREATED);
 
         // When
         rawTemplate.send(Topics.DROP_CREATED, "110", "not-a-json").get(5, TimeUnit.SECONDS);

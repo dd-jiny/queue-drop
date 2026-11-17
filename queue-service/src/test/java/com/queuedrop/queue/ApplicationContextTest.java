@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.queuedrop.common.event.DropCreated;
 import com.queuedrop.common.test.container.KafkaContainerConfig;
 import com.queuedrop.common.test.container.RedisContainerConfig;
+import com.queuedrop.queue.support.KafkaTopicReadiness;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -109,6 +110,7 @@ class ApplicationContextTest {
     void dropCreatedRoundTrip() throws Exception {
         // Given: 운영과 같이 자동 생성에 기대지 않고 토픽을 명시적으로 만든다
         kafkaAdmin.createOrModifyTopics(TopicBuilder.name(TEST_TOPIC).partitions(1).replicas(1).build());
+        KafkaTopicReadiness.awaitTopicMetadata(kafkaTemplate, TEST_TOPIC);
         DropCreated event = new DropCreated(
                 1L, 10L, "한정판 스니커즈", 1000, 100,
                 Instant.parse("2026-12-01T10:00:00.123456Z"),

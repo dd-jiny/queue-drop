@@ -11,6 +11,7 @@ import com.queuedrop.common.test.container.KafkaContainerConfig;
 import com.queuedrop.common.test.container.RedisContainerConfig;
 import com.queuedrop.queue.application.dto.QueueMetaRegisterCommand;
 import com.queuedrop.queue.application.service.QueueMetaRegisterService;
+import com.queuedrop.queue.support.KafkaTopicReadiness;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -47,6 +48,7 @@ class DropCreatedListenerRetryIntegrationTest {
     private void publish(Long dropId) throws Exception {
         Instant openAt = Instant.now().plus(Duration.ofHours(1));
         DropCreated event = new DropCreated(dropId, 3L, "한정판 스니커즈", 100, 10, openAt, openAt.plus(Duration.ofHours(2)));
+        KafkaTopicReadiness.awaitTopicMetadata(kafkaTemplate, Topics.DROP_CREATED);
         kafkaTemplate.send(Topics.DROP_CREATED, String.valueOf(dropId), event).get(5, TimeUnit.SECONDS);
     }
 
