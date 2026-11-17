@@ -1,3 +1,40 @@
+# 8단계 app 프로필 공통 설정 (phase-8 3.3). 앵커는 참조보다 먼저 정의돼야 하므로 최상위에 둔다
+# - docker compose up -d                       → 인프라만 (기존 개발 방식)
+# - docker compose --profile app up -d --build → 인프라 + 서비스 7개 (사전에 ./gradlew clean bootJar)
+x-app-common: &app-common
+  build:
+    context: .
+    dockerfile: docker/service.Dockerfile
+  profiles: ["app"]
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        memory: 768m        # 측정 환경에 맞게 조정 (리포트에 기록)
+  healthcheck: &app-healthcheck   # 서비스별 healthcheck 는 이 앵커를 병합해 test 만 더한다 (<< 는 얕은 병합)
+    interval: 5s
+    timeout: 3s
+    retries: 30
+
+x-db-env: &db-env
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_USERNAME: queuedrop
+  DB_PASSWORD: queuedrop
+
+x-redis-env: &redis-env
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092     # 컨테이너 간에는 INTERNAL 리스너
+
+x-infra-deps: &infra-deps
+  postgres: { condition: service_healthy }
+  redis: { condition: service_healthy }
+  kafka: { condition: service_healthy }
+  kafka-init: { condition: service_completed_successfully }   # 토픽 생성 완료 후 기동
+
 services:
   postgres:
     image: postgres:17
@@ -74,6 +111,114 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+
+  # ---- 애플리케이션 서비스 (app 프로필). 외부 노출은 gateway 만 ----
+  gateway:
+    <<: *app-common
+    build: { context: ., dockerfile: docker/service.Dockerfile, args: { MODULE: gateway } }
+    container_name: queuedrop-gateway
+    ports:
+      - "8080:8080"                         # 외부에 노출되는 유일한 애플리케이션 포트
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-}   # 필수. ":?" 는 프로필 무관하게 보간돼 인프라만 띄울 때도 실패하므로 쓰지 않는다. 비면 기동 시 WeakKeyException
+      USER_SERVICE_URL: http://user-service:8081
+      PRODUCT_SERVICE_URL: http://product-service:8082
+      QUEUE_SERVICE_URL: http://queue-service:8083
+      COUPON_SERVICE_URL: http://coupon-service:8084
+      ENTRY_SERVICE_URL: http://entry-service:8085
+      RANKING_SERVICE_URL: http://ranking-service:8086
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/actuator/health"]
+    depends_on:
+      user-service: { condition: service_healthy }
+      product-service: { condition: service_healthy }
+      queue-service: { condition: service_healthy }
+      entry-service: { condition: service_healthy }
+      coupon-service: { condition: service_healthy }
+      ranking-service: { condition: service_healthy }
+
+  user-service:
+    <<: *app-common
+    build: { context: ., dockerfile: docker/service.Dockerfile, args: { MODULE: user-service } }
+    container_name: queuedrop-user
+    # ports 없음: 내부 네트워크에서만 접근
+    environment:
+      <<: [*db-env, *kafka-env]
+      JWT_SECRET: ${JWT_SECRET:-}   # 필수. ":?" 는 프로필 무관하게 보간돼 인프라만 띄울 때도 실패하므로 쓰지 않는다. 비면 기동 시 WeakKeyException
+      QUEUEDROP_JWT_ACCESS_TOKEN_TTL: ${QUEUEDROP_JWT_ACCESS_TOKEN_TTL:-2h}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@queuedrop.test}         # 1단계 관리자 계정 초기화 (확정)
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin!2345}
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD", "curl", "-fs", "http://localhost:8081/actuator/health"]
+    depends_on: *infra-deps
+
+  product-service:
+    <<: *app-common
+    build: { context: ., dockerfile: docker/service.Dockerfile, args: { MODULE: product-service } }
+    container_name: queuedrop-product
+    environment:
+      <<: [*db-env, *kafka-env]
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD", "curl", "-fs", "http://localhost:8082/actuator/health"]
+    depends_on: *infra-deps
+
+  queue-service:
+    <<: *app-common
+    build: { context: ., dockerfile: docker/service.Dockerfile, args: { MODULE: queue-service } }
+    container_name: queuedrop-queue
+    environment:
+      <<: [*redis-env, *kafka-env]
+      QUEUE_ADMISSION_BATCH_SIZE: ${QUEUE_ADMISSION_BATCH_SIZE:-100}
+      QUEUE_ADMISSION_INTERVAL_MS: ${QUEUE_ADMISSION_INTERVAL_MS:-1000}
+      QUEUE_ADMISSION_TOKEN_TTL_SECONDS: ${QUEUE_ADMISSION_TOKEN_TTL_SECONDS:-300}
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD", "curl", "-fs", "http://localhost:8083/actuator/health"]
+    depends_on: *infra-deps
+
+  coupon-service:
+    <<: *app-common
+    build: { context: ., dockerfile: docker/service.Dockerfile, args: { MODULE: coupon-service } }
+    container_name: queuedrop-coupon
+    environment:
+      <<: [*db-env, *redis-env, *kafka-env]
+      COUPON_PUBLISH_AWAIT_TIMEOUT: ${COUPON_PUBLISH_AWAIT_TIMEOUT:-3500ms}
+      SPRING_KAFKA_LISTENER_CONCURRENCY: ${COUPON_LISTENER_CONCURRENCY:-3}
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD", "curl", "-fs", "http://localhost:8084/actuator/health"]
+    depends_on: *infra-deps
+
+  entry-service:
+    <<: *app-common
+    build: { context: ., dockerfile: docker/service.Dockerfile, args: { MODULE: entry-service } }
+    container_name: queuedrop-entry
+    environment:
+      <<: [*db-env, *redis-env, *kafka-env]
+      ENTRY_PUBLISH_AWAIT_TIMEOUT: ${ENTRY_PUBLISH_AWAIT_TIMEOUT:-3500ms}
+      ENTRY_DRAW_INTERVAL_MS: ${ENTRY_DRAW_INTERVAL_MS:-5000}
+      SPRING_KAFKA_LISTENER_CONCURRENCY: ${ENTRY_LISTENER_CONCURRENCY:-3}
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD", "curl", "-fs", "http://localhost:8085/actuator/health"]
+    depends_on: *infra-deps
+
+  ranking-service:
+    <<: *app-common
+    build: { context: ., dockerfile: docker/service.Dockerfile, args: { MODULE: ranking-service } }
+    container_name: queuedrop-ranking
+    environment:
+      <<: [*redis-env, *kafka-env]
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD", "curl", "-fs", "http://localhost:8086/actuator/health"]
+    depends_on:
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
 
 volumes:
   postgres-data:

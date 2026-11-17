@@ -56,6 +56,8 @@ configure(subprojects.findAll { !(it.name in ['common', 'e2e-test']) }) {
         implementation 'org.springframework.boot:spring-boot-starter-actuator'
         testImplementation 'org.springframework.boot:spring-boot-starter-test'
     }
+
+    jar { enabled = false }   // -plain.jar 생성 안 함 → build/libs 에 실행 jar 1개 (phase-8 3.1)
 }
 
 // 4계층 서비스: 공통 계층 규칙(ArchUnit)과 Testcontainers 지원을 test fixtures 로 공유
