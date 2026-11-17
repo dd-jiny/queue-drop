@@ -12,6 +12,7 @@
 | v1.6 | 2026-11-17 | 3.4 구현 기준 메모(k6 2.4.0, iterationInTest 매핑, RESULTS_DIR, 입력 가드, 재시도 소진 분류 등), S2 queue_sold_out 합계 해석, 앱만 내리는 명령 |
 | v1.7 | 2026-11-17 | k6 정합성 실패 판정 임계값(count==0 / ==DUP_USERS / <=CAPACITY), login_late, queue_closed·POLL_SOLD_OUT 분리 |
 | v1.8 | 2026-11-17 | 3.5 검증 스크립트 구현 기준(종료 코드, --expect/--wait-sec, SKIP 규칙(drawn_at+TTL 경과 시만, 랭킹은 dedupe Set 대조), 추가 검사, 실행 순서) |
+| v1.9 | 2026-11-17 | 모니터링 프로필 구현 기준(Prometheus v3.15.1·Grafana 13.2.6, provisioning 대시보드, 측정 시 함께 켬) — 6장 모니터링 스택 결정 갱신 |
 
 ---
 
@@ -195,6 +196,12 @@ management:
 - `docker compose --profile app up -d --build` → 인프라 + 서비스 7개
 - `docker compose --profile loadtest run --rm k6 run /scripts/...` → k6 실행
 - `docker compose --profile monitoring up -d` → Prometheus + Grafana (선택)
+
+> **모니터링 구현 기준 (v1.9)**
+> - 이미지: `prom/prometheus:v3.15.1`, `grafana/grafana:13.2.6` (2026-11-17 기준 안정 태그. 3.16.0 은 출시 직후라 보류). Prometheus 보존 7일, `prometheus-data` 볼륨.
+> - Grafana: 익명 Viewer, 데이터소스·대시보드를 `infra/monitoring/grafana/provisioning` 으로 자동 등록. 홈 대시보드 `queue-drop 부하 테스트` (http://localhost:3000).
+> - 패널: HTTP 처리량·p95·p99·5xx(서비스·uri), 응모·쿠폰 outcome 누적, 보상(compensated) 누적, 입장 속도, consumer lag max, Hikari active/pending, JVM 힙·GC·CPU·스레드. `tomcat_threads_*` 는 노출되지 않아(mbean registry 비활성) JVM 스레드로 대체.
+> - 측정(#7)은 모니터링을 **켠 상태**로 수행하고 리포트 환경에 기록한다 (같은 호스트 자원 공유). Redis·Postgres exporter 는 넣지 않는다 — 병목 분석에 필요해지면 #8 에서 추가.
 
 ```yaml
 # docker-compose.yml 추가분
@@ -1016,7 +1023,7 @@ done
 | 이미지 빌드 방식 | **호스트 bootJar + 공용 Dockerfile** — 확정(기본안, 2026-11-17) | 재현성이 중요해지면 멀티 스테이지로 전환 |
 | 초기 목표 수치 | 3.6 표 — 확정(기본안, 2026-11-17) | 첫 측정 후 근거와 함께 조정 |
 | 사용자 수 기본값 | USERS 3,000 — 확정(기본안, 2026-11-17) | k6 VU 메모리에 따라 조정 (아래 리스크) |
-| 모니터링 스택 | Actuator + CLI 우선, Prometheus·Grafana 는 선택 — 확정(기본안, 2026-11-17) | 병목 분석이 막히면 도입 |
+| 모니터링 스택 | Actuator + CLI 우선, Prometheus·Grafana 는 선택 — 확정(기본안, 2026-11-17) → **도입 (사용자 요청, 2026-11-17, v1.9)** | 측정 시 함께 켜고 리포트 환경에 기록 |
 
 ### 설계 수정 필요
 - **관리자 계정 생성 방법이 설계에 없다.** 드로우·쿠폰 이벤트 등록은 ADMIN 권한이 필요한데, 회원가입은 USER 만 만든다. **확정 (2026-11-16)**: user-service 기동 시 `ADMIN_EMAIL`/`ADMIN_PASSWORD` 환경변수가 있으면 관리자 계정을 없을 때만 생성 — 1단계에서 구현([phase-1-auth.md](phase-1-auth.md) 3.6). [requirements.md](../../design/01-requirements/requirements.md) 액터(관리자)·[architecture.md](../../design/02-architecture/architecture.md) 6장에 생성 방식 명시 필요. → 설계 반영 완료 (2026-11-16)
@@ -1043,7 +1050,7 @@ done
 |-----------------------|-----------|
 | [ ] 서비스 컨테이너화 (Dockerfile, app 프로필) | T8-01 |
 | [ ] 내부 포트 비노출 | T8-02, T8-03 |
-| [ ] 관측: Actuator 메트릭 (+ 선택 Prometheus·Grafana) | T8-12, T8-13 |
+| [ ] 관측: Actuator 메트릭 + Prometheus·Grafana (monitoring 프로필) | T8-12, T8-13 |
 | [ ] k6 드로우 오픈 스파이크 | T8-05, T8-07 |
 | [ ] k6 쿠폰 스파이크 (S3·S4 별도 이벤트) | T8-08, T8-09 |
 | [ ] 결과 검증 스크립트: DB 응모 수 ≤ M, 쿠폰 발급 수 ≤ 수량, 중복 0 | T8-05~T8-09, T8-11 |

@@ -1,0 +1,15 @@
+# phase-8 3.3 (선택) — docker compose --profile monitoring up -d
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+scrape_configs:
+  - job_name: queue-drop
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:                   # gateway 는 prometheus 비노출이라 제외 (phase-8 3.2)
+          - user-service:8081
+          - product-service:8082
+          - queue-service:8083
+          - coupon-service:8084
+          - entry-service:8085
+          - ranking-service:8086
