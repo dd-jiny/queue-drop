@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 5.2 응모 번호 재사용 문제 해결 반영 (별도 seq 카운터) 및 해결 후 시퀀스 추가 | NFR-03 |
 | v1.2 | 2026-11-16 | 5.1 애플리케이션 재시도 제거(producer 내부 재시도), 저장 컨슈머의 저장 전 Redis 확인·ON CONFLICT 반영 (응모·쿠폰) | D2, phase-4·6 구현 상세 6장 |
 | v1.3 | 2026-11-17 | 응모 유령 이벤트·Redis 타임아웃 대응 반영 (사용자 결정, E-40·E-41): 2.2 ③ 에 eventId·claim Lua, 5.1 보상 3결과, 5.2 를 "보상이 먼저 / 소비가 먼저" 두 순서로 재작성하고 재응모 예시를 requests 기준으로 갱신, 5.5 Redis 타임아웃 추가. 쿠폰(3장)은 6단계에서 갱신 | D2 v1.3 |
+| v1.4 | 2026-11-17 | 3장 쿠폰을 응모와 같은 유령 이벤트·타임아웃 대응으로 갱신 (requestId, claim Lua, 보상 3결과, Redis 예외 시 보상 후 503, NOT_FOUND 404) | phase-6 구현 상세 v1.4 |
 
 ## 쉬운 설명
 > 기능 문서(`05-features/`)의 시퀀스가 "창구 하나에서 무슨 일이 일어나는지"라면,
@@ -213,15 +214,30 @@ sequenceDiagram
     U->>GW: POST /api/coupons/events/{id}/issue
     GW->>CS: X-User-Id
     rect rgb(235, 255, 235)
-    CS->>R: Lua: 시작 시각·중복·잔여 검사 + DECR + SADD
+    Note over CS: requestId = UUID (판정 전 생성)
+    CS->>R: Lua: 시작 시각·중복·잔여 검사 + DECR + SADD + HSET requests
     end
-    alt NOT_STARTED / DUPLICATE / SOLD_OUT
+    alt Redis 예외 (타임아웃 1s 포함)
+        CS->>R: compensate.lua (requestId) — 실행됐으면 되돌림, 아니면 NOT_OURS
+        CS-->>U: 503
+    else NOT_FOUND
+        CS-->>U: 404
+    else NOT_STARTED / DUPLICATE / SOLD_OUT
         CS-->>U: 409
     else OK
-        CS->>K: coupon.issued (ack 대기)
-        CS-->>U: 202
+        CS->>K: coupon.issued (eventId = requestId, ack 대기)
+        alt 성공
+            CS-->>U: 202
+        else 최종 실패
+            CS->>R: compensate.lua (requestId)
+            alt ALREADY_PERSISTED
+                CS-->>U: 202
+            else COMPENSATED / NOT_OURS
+                CS-->>U: 503
+            end
+        end
         K->>CS: CouponIssuedConsumer
-        CS->>R: SISMEMBER issued (없으면 스킵 — 초과 발급 방지)
+        CS->>R: claim.lua (issued·requests 확인 → SADD persisted, 아니면 스킵 — 초과 발급 방지)
         CS->>DB: INSERT issued_coupons ... ON CONFLICT DO NOTHING
     end
 

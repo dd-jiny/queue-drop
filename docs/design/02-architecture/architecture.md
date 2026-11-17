@@ -11,6 +11,7 @@
 | v1.5 | 2026-11-17 | Redis 키 `entry:{dropId}:requests`(요청 ID), `entry:{dropId}:persisted`(저장 확정) 추가 — 유령 이벤트·Redis 타임아웃 대응 (사용자 결정, E-40·E-41). TTL 은 5단계(E-42) | concurrency-consistency.md D2 v1.3 |
 | v1.6 | 2026-11-17 | 응모 키 6개 TTL: 추첨 커밋 후 EXPIRE 1일 (E-42 기본안) | draw.md v1.2 |
 | v1.7 | 2026-11-17 | product `draw.completed` 컨슈머를 DB 저장 컨슈머로 분류: 3회 재시도 후 `draw.completed.DLT` (드로우 없음은 로그 후 커밋). 추첨 완료 반영 누락을 DLT 재처리로 복구 | phase-5 구현 상세 v1.12 |
+| v1.8 | 2026-11-17 | Redis 키 `coupon:{eventId}:requests`, `coupon:{eventId}:persisted` 추가 — 응모와 같은 유령 이벤트·타임아웃 대응 | phase-6 구현 상세 v1.4 |
 
 ---
 
@@ -108,6 +109,8 @@ flowchart LR
 | `coupon:{eventId}:meta` | Hash | coupon | coupon | issueStartAt |
 | `coupon:{eventId}:remaining` | String | coupon | coupon | 잔여 수량 |
 | `coupon:{eventId}:issued` | Set | coupon | coupon | 발급 userId (중복 방지) |
+| `coupon:{eventId}:requests` | Hash | coupon | coupon | userId → 발급 자리를 잡은 요청 ID (E-40) |
+| `coupon:{eventId}:persisted` | Set | coupon | coupon | 저장 확정된 userId (claim Lua, E-40) |
 | `rank:drop:popular` | ZSet | ranking | ranking | member=dropId, score=응모 수 |
 | `rank:user:weekly:{yyyy-Www}` | ZSet(TTL) | ranking | ranking | member=userId, score=주간 응모 수 |
 | `rank:user:all` | ZSet | ranking | ranking | member=userId, score=누적 응모 수 |

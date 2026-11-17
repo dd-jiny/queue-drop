@@ -44,6 +44,7 @@
   2. 서비스별 단계에서 각자 넣는다(지금 계획). 빠뜨릴 위험이 있다.
 - **우선순위**: 중간 — 정상 상황에서는 영향이 없다. 장애 전파를 막는 기본값이므로 비용 대비 효과가 크다.
 - **영향 범위**: 4개 서비스 `application.yml`, `phase-0-foundation.md` 3.9, phase-3·6·7 문서
+- **처리 (coupon)**: 6단계 착수 전 `coupon-service` 에 `spring.data.redis.timeout: 1s` 반영 결정 (phase-6 v1.4). queue·ranking 은 남음.
 
 ### E-04 동기 발행 구간이 Tomcat 스레드를 잡아 Kafka 지연이 처리량 상한이 됨
 - **단계/위치**: phase-0 공통 producer 설정, phase-4/6 `send().get(3.5s)`
@@ -768,6 +769,8 @@
   - 1 권장. 6단계 coupon 이 같은 설정을 복제하기 전에 넣으면 비용이 작다.
 - **우선순위**: 낮음~중간 — 유실은 없고 로그·지연뿐. 복제 전에 처리하면 한 번에 끝난다.
 - **영향 범위**: entry·product `KafkaConsumerConfig`, (6단계) coupon 동일, `architecture.md` 4장 실패 정책 표 비고
+
+- **처리 (coupon)**: 6단계에서 coupon `KafkaConsumerConfig` 는 DLT 재발행 전용 producer(`max.block.ms` 5s)로 시작 (phase-6 v1.4). entry·product 는 남음.
 
 ### E-51 추첨 쿼리 계획과 인덱스 — 현재 규모에서는 불필요, 응모자 수십만이면 커버링·부분 인덱스
 - **구분**: 고도화 (조회 최적화, 현재 규모에서는 불필요) (관련: E-26)

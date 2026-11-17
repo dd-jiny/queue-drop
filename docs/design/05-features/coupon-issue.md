@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-COUPON-01 ~ 05 |
 | v1.1 | 2026-11-16 | 저장 전 Redis 확인(필수) 추가, 발행 재시도를 producer 내부 멱등 재시도로 변경, Lua 결과 `NOT_FOUND`·재초기화 API·DLT 추가 | NFR-01·03, phase-6 구현 상세 6장 |
+| v1.2 | 2026-11-17 | 시퀀스: NOT_FOUND 404 분리, 스크립트 이름 `coupon-*.lua`, 판정 타임아웃 분기. 유령 이벤트·판정 타임아웃 대응을 응모와 같게 (요청 ID `requests`, 저장 확정 `persisted` + claim Lua, 보상 3결과, ALREADY_PERSISTED 면 202, Redis 예외 시 보상 후 503). 공통화 안 함 확정 | phase-6 구현 상세 v1.4, E-40·E-41 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-COUPON-01: 쿠폰 이벤트 등록 (총 수량, 발급 시작 시각)
@@ -27,7 +28,9 @@
 | 1 | `now ≥ issueStartAt` | `NOT_STARTED` |
 | 2 | `SISMEMBER issued userId` == 0 | `DUPLICATE` |
 | 3 | `GET remaining` > 0 | `SOLD_OUT` |
-| 4 | `DECR remaining`, `SADD issued userId` | `OK` |
+| 4 | `DECR remaining`, `SADD issued userId`, `HSET requests userId requestId` | `OK` |
+
+- `requestId` 는 애플리케이션이 판정 **전에** 만든 요청 ID 이고, `coupon.issued` 메시지의 `eventId` 로 그대로 실린다 (E-40, 응모와 동일).
 
 ### 이벤트 등록 (관리자)
 - `INSERT coupon_events` → 커밋 후 Redis 초기화 (`SET remaining NX`, meta)
@@ -35,9 +38,10 @@
 
 ### 발행·보상·저장
 - `coupon.issued` 동기 발행 확인: 응모와 같은 규칙 — `get(3.5s)`, producer 내부 멱등 재시도(`acks=all`, `enable.idempotence=true`, `delivery.timeout.ms=3000`), **애플리케이션 재시도 없음** ([D2](../04-non-functional/concurrency-consistency.md))
-- 실패 시 보상 Lua (`SREM issued` 결과가 1이면 `INCR remaining`) → 503
+- 실패 시 보상 Lua (응모 보상과 같은 3결과): `persisted` 에 있으면 `ALREADY_PERSISTED` → **202 성공**(이미 저장됨), `requests[userId] ≠ requestId` 면 `NOT_OURS`(무변화), 아니면 `SREM issued`·`HDEL requests`·`INCR remaining` → 503
+- 판정 Lua 가 Redis 예외(명령 타임아웃 1s 포함)로 끝나면 실행 여부를 모르므로 같은 requestId 로 보상을 시도한 뒤 503 (E-41)
 - 저장 컨슈머
-  1. **저장 전 Redis 확인 (필수)**: `SISMEMBER issued userId` 가 0 이면 보상된 발급(유령 이벤트)으로 보고 저장하지 않는다
+  1. **저장 확정 (claim Lua, 필수)**: `issued` 에 userId 가 있고 `requests[userId] == 메시지 eventId` 일 때만 `SADD persisted` 후 저장. 아니면 유령 이벤트로 보고 저장하지 않는다. 확정 뒤의 보상은 `ALREADY_PERSISTED` 로 거절되므로 소비가 보상보다 먼저 와도 초과 발급이 없다
      - 쿠폰에는 추첨의 건수 비교(D6) 같은 사후 안전장치가 없다. 이 확인이 없으면 유령 이벤트가 그대로 저장되어 **수량보다 많이 발급**된다
   2. `INSERT issued_coupons ... ON CONFLICT (coupon_event_id, user_id) DO NOTHING` (멱등)
   3. 처리 실패 → 3회 재시도 후 `coupon.issued.DLT`
@@ -58,7 +62,7 @@
 | 대기열 | 사용하지 않음 (요구사항) | 쿠폰은 판정 비용이 매우 작아 Redis 만으로 흡수 가능하다고 판단 |
 | 저장 | 자기 서비스 Kafka 경유 비동기 | 피크 DB 쓰기 평탄화 / 조회 시 잠깐 미반영 가능 |
 
-> 💡 응모(entry)와 쿠폰(coupon)의 **선착순 판정 패턴이 동일**하므로, Lua 실행·보상 로직을 `common` 의 공통 컴포넌트로 추출할지 구현 시 결정한다. 단, 검사 항목이 다르므로 스크립트 자체는 서비스별로 둔다.
+> 💡 응모(entry)와 쿠폰(coupon)의 **선착순 판정 패턴이 동일**하다. 공통 컴포넌트로 추출하지 않고 서비스별로 각자 구현한다 (phase-6 D6-1 확정(기본안): 중복이 클래스 2~3개 수준이라 추상화 비용이 더 크다).
 
 ## 5. 다이어그램
 
@@ -73,20 +77,29 @@ sequenceDiagram
     participant DB as coupon_db
 
     U->>CS: POST /issue
-    CS->>R: EVALSHA issue.lua
-    alt NOT_FOUND / NOT_STARTED / DUPLICATE / SOLD_OUT
+    CS->>R: EVALSHA coupon-issue.lua (requestId)
+    alt Redis 예외 (타임아웃 1s 포함)
+        CS->>R: coupon-compensate.lua (requestId)
+        CS-->>U: 503
+    else NOT_FOUND
+        CS-->>U: 404
+    else NOT_STARTED / DUPLICATE / SOLD_OUT
         CS-->>U: 409
     else OK
         CS->>K: send(coupon.issued).get(3.5s)
         alt 성공
             CS-->>U: 202
         else 최종 실패
-            CS->>R: compensate.lua
-            CS-->>U: 503
+            CS->>R: coupon-compensate.lua (requestId)
+            alt ALREADY_PERSISTED
+                CS-->>U: 202
+            else COMPENSATED / NOT_OURS
+                CS-->>U: 503
+            end
         end
     end
     K->>C: coupon.issued
-    C->>R: SISMEMBER issued (없으면 스킵)
+    C->>R: coupon-claim.lua (issued·requests 확인 → SADD persisted, 아니면 스킵)
     C->>DB: INSERT ... ON CONFLICT DO NOTHING
 ```
 

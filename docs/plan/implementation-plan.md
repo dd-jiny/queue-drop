@@ -15,6 +15,7 @@
 | v1.9 | 2026-11-17 | 4단계 완료: 진행 현황·체크리스트 갱신 (entry-service 테스트 223건, 전체 빌드, 로컬 compose 에서 등록 → 진입 → 입장 → 응모 202 → 내 응모 조회 확인) |
 | v2.0 | 2026-11-17 | 5단계 착수: 추첨 건수 불일치 정책 확정(사용자 결정, 관리자 수동 추첨) |
 | v2.1 | 2026-11-17 | 5단계 완료: 진행 현황·완료 조건 갱신 |
+| v2.2 | 2026-11-17 | 6단계 착수: D6-1~D6-4 확정 (D6-4 는 4단계 E-40·E-41 사용자 결정 적용) |
 
 ---
 
@@ -274,11 +275,11 @@ flowchart LR
 
 **작업**
 - [ ] domain: `CouponEvent`, `IssuedCoupon`, `IssueOutcome`, Repository(I) 2개
-- [ ] application: `CouponEventService`, `CouponIssueService`, `CouponSaveService`(**저장 전 Redis 발급 확인 필수**), `CouponQueryService`, 포트 `CouponGate`, `CouponEventPublisher`
-- [ ] infrastructure: `issue.lua`, `compensate.lua`, JPA, `coupon.issued` 발행 (4단계와 같은 동기 발행 정책)
+- [ ] application: `CouponEventService`, `CouponIssueService`(요청 ID, 보상 3결과), `CouponSaveService`(**저장 전 claim 필수**), `CouponQueryService`, 포트 `CouponGate`, `CouponEventPublisher`
+- [ ] infrastructure: `coupon-issue.lua`, `coupon-compensate.lua`, `coupon-claim.lua`, JPA, `coupon.issued` 발행 (4단계와 같은 동기 발행 정책)
 - [ ] presentation: `CouponEventController`, `CouponController`, `CouponIssuedListener` (3회 재시도 후 `coupon.issued.DLT`)
 
-> 응모(4단계)와 판정 패턴이 같다. Lua 실행·발행·보상 흐름을 공통 컴포넌트로 뽑을지는 4단계 구현 후 중복 정도를 보고 결정한다.
+> 응모(4단계)와 판정 패턴이 같다. 공통 컴포넌트로 뽑지 않고 서비스별로 구현한다 (D6-1 확정(기본안), 2026-11-17). 유령 이벤트·타임아웃 대응도 4단계와 같다 (D6-4).
 
 **완료 조건**
 - [ ] **동시성: 수량 100, 1,000명 동시 요청 → 발급 정확히 100**
@@ -286,6 +287,7 @@ flowchart LR
 - [ ] 발급 시작 전 요청 → `NOT_STARTED`
 - [ ] 발행 실패 → 보상 후 원상복구
 - [ ] 유령 이벤트(보상 후 실제로 기록된 발급) → DB 에 남지 않음, 초과 발급 없음
+- [ ] 유령 이벤트 소비가 보상보다 먼저 / 판정 Lua 타임아웃 → 초과 발급 없음 (D6-4)
 
 ---
 
