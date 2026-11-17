@@ -1,0 +1,1035 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>queue-drop 결과보고서</title>
+<style>
+  :root {
+    --ink: #1d232b;
+    --ink-soft: #4a5563;
+    --line: #c9d0d8;
+    --line-soft: #e3e7ec;
+    --head: #eef2f6;
+    --accent: #1f4e79;
+    --accent-soft: #e8f0f8;
+    --ok: #1e6b3a;
+    --warn: #8a5a00;
+    --code-bg: #f4f6f8;
+    --paper: #ffffff;
+  }
+  @page {
+    size: A4;
+    margin: 18mm 16mm 18mm 16mm;
+    @bottom-center {
+      content: counter(page);
+      font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+      font-size: 8.5pt;
+      color: #6b7480;
+    }
+  }
+  @page :first {
+    @bottom-center { content: none; }
+  }
+  * { box-sizing: border-box; }
+  html { background: #f0f2f5; }
+  body {
+    margin: 0 auto;
+    max-width: 210mm;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+    font-size: 10pt;
+    line-height: 1.6;
+    word-break: keep-all;
+    overflow-wrap: break-word;
+    padding: 16mm;
+  }
+  @media print {
+    html { background: none; }
+    body { max-width: none; padding: 0; }
+  }
+  h1, h2, h3, h4 { color: var(--accent); line-height: 1.35; break-after: avoid; }
+  h1 {
+    font-size: 17pt;
+    margin: 0 0 4mm;
+    padding-bottom: 2mm;
+    border-bottom: 2px solid var(--accent);
+  }
+  h1.chapter { break-before: page; }
+  h2 { font-size: 12.5pt; margin: 6mm 0 2mm; }
+  h3 { font-size: 10.8pt; margin: 4.5mm 0 1.5mm; color: #23384d; }
+  p { margin: 1.5mm 0 2.5mm; }
+  ul, ol { margin: 1mm 0 3mm; padding-left: 6mm; }
+  li { margin: 0.6mm 0; }
+  code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.86em;
+    background: var(--code-bg);
+    padding: 0.2mm 1mm;
+    border-radius: 2px;
+    word-break: normal;
+    overflow-wrap: anywhere;
+  }
+  pre.code {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 8pt;
+    line-height: 1.45;
+    background: var(--code-bg);
+    border: 1px solid var(--line-soft);
+    border-radius: 3px;
+    padding: 3mm 3.5mm;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    break-inside: avoid;
+    margin: 2mm 0 3mm;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 2mm 0 4mm;
+    font-size: 8.4pt;
+    line-height: 1.45;
+    break-inside: auto;
+  }
+  thead { display: table-header-group; }
+  tr { break-inside: avoid; }
+  th, td {
+    border: 1px solid var(--line);
+    padding: 1.3mm 1.8mm;
+    vertical-align: top;
+    text-align: left;
+  }
+  th { background: var(--head); font-weight: 700; color: #23384d; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  td.c, th.c { text-align: center; }
+  .nowrap { white-space: nowrap; }
+  .pass { color: var(--ok); font-weight: 700; }
+  .warn { color: var(--warn); font-weight: 700; }
+  .small { font-size: 8.4pt; color: var(--ink-soft); }
+  .note {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 2mm 3.5mm;
+    margin: 2mm 0 4mm;
+    break-inside: avoid;
+  }
+  .note p { margin: 0.8mm 0; }
+  .key {
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 2.5mm 3.5mm;
+    margin: 2mm 0 4mm;
+    break-inside: avoid;
+  }
+  figure {
+    margin: 3mm 0 4mm;
+    break-inside: avoid;
+    text-align: center;
+  }
+  figure .mermaid { margin: 0 auto; }
+  figure .mermaid svg { max-width: 100% !important; height: auto; }
+  figcaption { font-size: 8.5pt; color: var(--ink-soft); margin-top: 1.5mm; }
+  .fig-sm .mermaid svg { max-height: 95mm; }
+  .fig-md .mermaid svg { max-height: 125mm; }
+  .fig-lg .mermaid svg { max-height: 175mm; }
+
+  /* 표지 */
+  .cover {
+    height: 255mm;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 30mm 6mm 10mm;
+  }
+  .cover .label { font-size: 10pt; letter-spacing: 0.3em; color: var(--ink-soft); }
+  .cover .title { font-size: 28pt; font-weight: 800; color: var(--accent); margin: 6mm 0 3mm; line-height: 1.25; }
+  .cover .subtitle { font-size: 15pt; color: #23384d; margin: 0 0 10mm; }
+  .cover .rule { height: 3px; background: var(--accent); width: 40mm; margin-bottom: 8mm; }
+  .cover .summary { font-size: 10pt; color: var(--ink-soft); max-width: 150mm; }
+  .cover table.meta { width: 110mm; font-size: 10pt; }
+  .cover table.meta th { width: 30mm; }
+  .cover table.meta td { height: 9mm; }
+
+  .toc ol { list-style: none; padding-left: 0; }
+  .toc > ol { columns: 2; column-gap: 10mm; }
+  .toc > ol > li { margin: 0 0 3mm; font-weight: 700; break-inside: avoid; }
+  .toc ol ol { padding-left: 6mm; font-weight: 400; color: var(--ink-soft); }
+  .toc ol ol li { margin: 0.4mm 0; }
+
+  .kpi { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3mm; margin: 3mm 0 4mm; break-inside: avoid; }
+  .kpi div { border: 1px solid var(--line); border-radius: 3px; padding: 2.5mm 3mm; }
+  .kpi b { display: block; font-size: 14pt; color: var(--accent); }
+  .kpi span { font-size: 8.3pt; color: var(--ink-soft); }
+.shot{margin:10px 0 14px;break-inside:avoid}.shot img{width:100%;border:1px solid #d8dee8;border-radius:6px}.shot figcaption{font-size:9pt;color:#5b6475;margin-top:4px;text-align:center}
+</style>
+</head>
+<body>
+
+<!-- ============ 표지 ============ -->
+<section class="cover">
+  <div>
+    <div class="label">PROJECT REPORT</div>
+    <div class="title">queue-drop</div>
+    <div class="subtitle">한정판 선착순 드로우 서비스 결과보고서</div>
+    <div class="rule"></div>
+    <p class="summary">대기열 → 선착순 응모(정원 M) → 마감 시각 자동 추첨(K명)으로 이어지는 드로우 흐름과,
+      대기열 없는 선착순 쿠폰 발급, 응모 이벤트 기반 랭킹을 마이크로서비스 7개로 구현하고
+      부하 테스트로 정원·수량 초과 0, 중복 0 을 확인한 결과를 정리한다.</p>
+  </div>
+  <table class="meta">
+    <tr><th>문서</th><td>제출용 종합 결과보고서</td></tr>
+    <tr><th>작성일</th><td>2026-11-17</td></tr>
+    <tr><th>작성자</th><td>&nbsp;</td></tr>
+  </table>
+</section>
+
+<!-- ============ 목차 ============ -->
+<section class="toc" style="break-before: page;">
+  <h1>목차</h1>
+  <ol>
+    <li>1. 개요
+      <ol><li>1.1 문제 정의</li><li>1.2 목표와 범위</li><li>1.3 기능 요구사항 요약</li></ol></li>
+    <li>2. 시스템 구성
+      <ol><li>2.1 전체 구성도</li><li>2.2 서비스 역할과 데이터 분리</li><li>2.3 Kafka 토픽</li><li>2.4 기술 스택과 인프라</li></ol></li>
+    <li>3. 핵심 흐름
+      <ol><li>3.1 드로우 전체 흐름</li><li>3.2 대기열과 입장</li><li>3.3 선착순 응모</li><li>3.4 마감 자동 추첨</li><li>3.5 선착순 쿠폰 발급</li><li>3.6 랭킹 집계</li></ol></li>
+    <li>4. 동시성·정합성 설계 (D1~D7)
+      <ol><li>4.1 결정 요약표</li><li>4.2 D1 — Redis Lua 원자 판정</li><li>4.3 D2 — 발행 확인과 보상, 저장 확정</li><li>4.4 D3~D7</li></ol></li>
+    <li>5. 계층 구조와 규칙
+      <ol><li>5.1 4계층과 의존 방향</li><li>5.2 모델 비노출과 포트 위치</li><li>5.3 ArchUnit 규칙 R1~R7</li></ol></li>
+    <li>6. 개발 방식
+      <ol><li>6.1 단계별 계획과 진행 현황</li><li>6.2 TDD 역할 분담 (AI 에이전트 협업)</li><li>6.3 테스트 현황</li></ol></li>
+    <li>7. 검증 결과 (부하 테스트)
+      <ol><li>7.1 측정 환경</li><li>7.2 정합성 결과</li><li>7.3 기본 규모 S1~S6</li><li>7.4 병목 B1~B6</li><li>7.5 개선 P1~P4 전후 비교</li><li>7.6 확대 규모</li><li>7.7 결론</li></ol></li>
+    <li>8. 한계와 향후 과제</li>
+    <li>부록
+      <ol><li>A. 실행 방법</li><li>B. 문서 목록</li></ol></li>
+  </ol>
+</section>
+
+<!-- ============ 1. 개요 ============ -->
+<h1 class="chapter">1. 개요</h1>
+
+<h2>1.1 문제 정의</h2>
+<p>queue-drop 은 한정판 상품을 먼저 온 순서대로 응모 자격을 주고, 응모자 중에서 추첨하는 서비스다.
+오픈 순간 사람이 몰리면 대기열을 세워 조금씩 입장시키고, 정해진 인원(정원 M)이 차면 응모를 마감한다.
+마감 시각이 되면 자동으로 당첨자 K명을 뽑는다. 결제는 없다.</p>
+
+<table>
+  <thead><tr><th style="width:18%">관점</th><th>해결하려는 문제</th></tr></thead>
+  <tbody>
+    <tr><td>사용자</td><td>오픈 순간 트래픽 폭주 속에서도 <b>먼저 온 사람이 먼저 기회를 얻는 공정성</b></td></tr>
+    <tr><td>비즈니스</td><td>응모 정원·쿠폰 수량을 <b>절대 초과하지 않는 정합성</b> (오버 응모 / 오버 발급 방지)</td></tr>
+    <tr><td>시스템</td><td>짧은 순간 집중되는 쓰기 요청을 흡수하면서 <b>여러 서비스에 걸쳐 상태 일관성 유지</b></td></tr>
+  </tbody>
+</table>
+
+<h2>1.2 목표와 범위</h2>
+<p>핵심 기능은 <b>대기열</b>, <b>선착순 쿠폰 발행</b>, <b>랭킹</b> 세 가지이며, 이를 잇는 <b>선착순 응모</b>와 <b>마감 자동 추첨</b>이 드로우 흐름의 중심이다.</p>
+
+<figure class="fig-sm">
+<pre class="mermaid">
+flowchart LR
+    A[드로우 오픈] --> B[대기열 진입]
+    B --> C{입장 토큰}
+    C -- 대기 --> B
+    C -- 발급 --> D[선착순 응모<br/>정원 M]
+    D -- 정원 소진 --> E[응모 마감]
+    D -- 성공 --> F[응모 완료]
+    F --> G[마감 시각]
+    E --> G
+    G --> H[자동 추첨 K명]
+    H --> I[당첨 / 낙첨 조회]
+    F -. 이벤트 .-> R[랭킹 반영]
+</pre>
+<figcaption>그림 1-1. 전체 사용자 흐름 (출처: docs/design/README.md)</figcaption>
+</figure>
+
+<table>
+  <thead><tr><th style="width:18%">구분</th><th>내용</th></tr></thead>
+  <tbody>
+    <tr><td>비기능 목표</td><td>NFR-01 정원·수량은 동시 요청에서도 절대 초과되지 않는다 / NFR-02 중복 응모·중복 발급이 없다 / NFR-03 Redis·Kafka·DB 간 불일치는 복구 가능해야 한다 / NFR-04 추첨은 공정하고 재현·검증 가능해야 한다</td></tr>
+    <tr><td>범위 밖</td><td>결제, 배송, 구매 확정 / 당첨 후 별도 "구매 신청" 단계 (응모 = 신청) / 쿠폰 사용처 (발급·보유 조회까지만)</td></tr>
+    <tr><td>액터</td><td>사용자(회원가입·로그인, 대기열 진입, 응모, 쿠폰 발급, 랭킹 조회), 관리자(상품·드로우·쿠폰 이벤트 등록), 스케줄러(입장 처리, 마감 자동 추첨)</td></tr>
+  </tbody>
+</table>
+
+<h2>1.3 기능 요구사항 요약</h2>
+<table>
+  <thead><tr><th style="width:20%">영역 (서비스)</th><th style="width:22%">ID</th><th>요구사항</th></tr></thead>
+  <tbody>
+    <tr><td>회원 (user)</td><td>REQ-USER-01~04</td><td>회원가입, 로그인 시 JWT 발급, Gateway 에서 JWT 검증 후 userId 헤더 전달, 관리자 계정은 기동 시 환경변수로 생성</td></tr>
+    <tr><td>상품·드로우 (product)</td><td>REQ-DROP-01~03</td><td>상품 등록, 드로우 등록(정원 M, 당첨 수 K, 오픈·마감 시각, M ≥ K), 목록·상세 조회</td></tr>
+    <tr><td>대기열 (queue) — 핵심 ①</td><td>REQ-QUEUE-01~06</td><td>드로우별 대기열, 진입 순 순번, "내 앞에 N명" 조회, 주기적(1초)으로 앞에서 N명에게 입장 토큰 발급, 토큰 TTL(5분), 응모는 유효 토큰 필요</td></tr>
+    <tr><td>응모·추첨 (entry)</td><td>REQ-ENTRY-01~06</td><td>토큰으로 응모, 선착순 M명, 1인 1드로우 1응모, 취소 불가, 마감 시각에 K명 자동 무작위 추첨, 결과 조회</td></tr>
+    <tr><td>선착순 쿠폰 (coupon) — 핵심 ②</td><td>REQ-COUPON-01~05</td><td>쿠폰 이벤트 등록(총 수량, 시작 시각), 총 수량까지 선착순 발급, 1인 1매, 보유 조회, 대기열 없음</td></tr>
+    <tr><td>랭킹 (ranking) — 핵심 ③</td><td>REQ-RANK-01~03</td><td>인기 드로우 랭킹(응모 수), 유저 활동 랭킹(주간·누적, 응모 1회 = 1점), 응모 이벤트 비동기 소비</td></tr>
+  </tbody>
+</table>
+
+<!-- ============ 2. 시스템 구성 ============ -->
+<h1 class="chapter">2. 시스템 구성</h1>
+
+<h2>2.1 전체 구성도</h2>
+<figure class="fig-md">
+<pre class="mermaid">
+flowchart LR
+    U((사용자/관리자)) --> GW[Gateway<br/>JWT 검증]
+    GW --> US[user-service]
+    GW --> PS[product-service]
+    GW --> QS[queue-service]
+    GW --> ES[entry-service]
+    GW --> CS[coupon-service]
+    GW --> RS[ranking-service]
+
+    subgraph Redis
+      RQ[(queue:*)]
+      RE[(entry:*)]
+      RC[(coupon:*)]
+      RR[(rank:*)]
+    end
+
+    QS -- write --> RQ
+    ES -- read token --> RQ
+    ES -- write --> RE
+    QS -- read remaining --> RE
+    CS -- write --> RC
+    RS -- write --> RR
+
+    US == user.registered ==> K[(Kafka)]
+    PS == drop.created ==> K
+    ES == entry.created ==> K
+    ES == draw.completed ==> K
+    CS == coupon.issued ==> K
+    K ==> QS & ES & RS & PS & CS
+</pre>
+<figcaption>그림 2-1. 전체 구성도 (출처: architecture.md 3장)</figcaption>
+</figure>
+<ul>
+  <li>서비스 간 <b>동기 호출은 없다.</b> 서비스 간 데이터 전달은 Kafka 이벤트 또는 (읽기 전용) 공유 Redis 다.</li>
+  <li>Redis 공유는 두 군데뿐이다. entry 가 queue 의 <b>입장 토큰</b>을 읽고, queue 가 entry 의 <b>잔여 정원</b>을 읽는다(정원 소진 시 입장 중단). 키마다 쓰기 소유 서비스를 하나로 고정했다.</li>
+  <li>랭킹 장애는 응모에 영향을 주지 않는다(이벤트 소비 지연만 발생).</li>
+</ul>
+
+<h2>2.2 서비스 역할과 데이터 분리</h2>
+<table>
+  <thead><tr><th style="width:17%">서비스</th><th class="c" style="width:7%">포트</th><th style="width:17%">데이터 주인</th><th style="width:15%">저장소</th><th>핵심 책임</th></tr></thead>
+  <tbody>
+    <tr><td>gateway</td><td class="c">8080</td><td>-</td><td>-</td><td>라우팅, JWT 검증, <code>X-User-Id</code>/<code>X-User-Role</code> 헤더 주입 (클라이언트가 보낸 <code>X-User-*</code> 는 항상 제거)</td></tr>
+    <tr><td>user-service</td><td class="c">8081</td><td>회원</td><td>user_db</td><td>회원가입, 로그인(JWT 발급), 관리자 계정 시드</td></tr>
+    <tr><td>product-service</td><td class="c">8082</td><td>상품, 드로우</td><td>product_db</td><td>상품·드로우 등록/조회, <code>drop.created</code> 발행</td></tr>
+    <tr><td>queue-service</td><td class="c">8083</td><td>대기열, 입장 토큰</td><td>Redis</td><td>대기열 진입·순번, 주기적 입장 처리</td></tr>
+    <tr><td>entry-service</td><td class="c">8085</td><td>응모, 추첨 결과</td><td>entry_db, Redis</td><td>선착순 응모 판정, 응모 저장, 마감 자동 추첨</td></tr>
+    <tr><td>coupon-service</td><td class="c">8084</td><td>쿠폰 이벤트, 발급 쿠폰</td><td>coupon_db, Redis</td><td>선착순 쿠폰 발급</td></tr>
+    <tr><td>ranking-service</td><td class="c">8086</td><td>랭킹 집계</td><td>Redis</td><td>이벤트 소비 → 인기 드로우 / 유저 활동 랭킹</td></tr>
+  </tbody>
+</table>
+<p>DB 는 서비스별로 분리했다(user_db, product_db, entry_db, coupon_db). 로컬 리소스를 아끼기 위해 PostgreSQL 인스턴스 하나에 DB 4개를 두었고, 스키마는 Flyway 로 관리하며 <code>ddl-auto: validate</code> 로 검증한다.
+주요 테이블은 user_db <code>users</code>, product_db <code>products</code>·<code>drops</code>, entry_db <code>drop_snapshots</code>·<code>entries</code>·<code>draw_results</code>, coupon_db <code>coupon_events</code>·<code>issued_coupons</code> 이다.
+queue·ranking 은 DB 없이 Redis 만 쓴다.</p>
+
+<h2>2.3 Kafka 토픽</h2>
+<table>
+  <thead><tr><th style="width:17%">토픽</th><th style="width:9%">발행</th><th style="width:17%">소비</th><th>페이로드</th><th style="width:15%">파티션 키</th></tr></thead>
+  <tbody>
+    <tr><td><code>user.registered</code></td><td>user</td><td>ranking</td><td>userId, nickname</td><td>userId</td></tr>
+    <tr><td><code>drop.created</code></td><td>product</td><td>entry, queue, ranking</td><td>dropId, productId, title, entryCapacity, winnerCount, openAt, closeAt</td><td>dropId</td></tr>
+    <tr><td><code>entry.created</code></td><td>entry</td><td>entry(저장), ranking</td><td>eventId, dropId, userId, entrySeq, appliedAt</td><td><code>dropId:userId</code></td></tr>
+    <tr><td><code>draw.completed</code></td><td>entry</td><td>product</td><td>dropId, applicantCount, winnerCount, drawnAt</td><td>dropId</td></tr>
+    <tr><td><code>coupon.issued</code></td><td>coupon</td><td>coupon(저장)</td><td>eventId, couponEventId, userId, issuedAt</td><td><code>couponEventId:userId</code></td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>모든 컨슈머는 at-least-once 전제로 멱등하게 처리한다(DB 유니크 제약, Redis dedupe Set).</li>
+  <li>DB 에 저장하는 컨슈머는 1초 간격 3회 재시도 후 <code>{topic}.DLT</code> 로 보내고, Redis 만 쓰는 컨슈머(queue, ranking)는 3회 재시도 후 로그를 남기고 건너뛴다. 메시지 불변식 위반은 재시도 없이 WARN 로그 후 건너뛴다.</li>
+  <li>토픽 자동 생성은 끄고(<code>auto.create.topics.enable=false</code>) 기동 시 <code>kafka-init</code> 이 파티션 수를 지정해 미리 만든다. <code>entry.created</code>·<code>coupon.issued</code> 는 파티션 6, 나머지는 1. DLT 는 원본과 같은 파티션 수로 만든다.</li>
+</ul>
+
+<h2>2.4 기술 스택과 인프라</h2>
+<table>
+  <thead><tr><th style="width:25%">구분</th><th style="width:40%">기술</th><th>버전</th></tr></thead>
+  <tbody>
+    <tr><td>언어</td><td>Java</td><td>21</td></tr>
+    <tr><td>프레임워크</td><td>Spring Boot / Spring Cloud</td><td>4.1.2 / 2025.1.4</td></tr>
+    <tr><td>빌드</td><td>Gradle 멀티모듈 (wrapper)</td><td>9.8.2</td></tr>
+    <tr><td>DB</td><td>PostgreSQL (서비스별 DB, Flyway)</td><td>17</td></tr>
+    <tr><td>캐시·선착순 판정</td><td>Redis (AOF <code>appendonly yes</code>, <code>appendfsync everysec</code>)</td><td>7.4</td></tr>
+    <tr><td>메시지 브로커</td><td>Apache Kafka (KRaft, Zookeeper 없음)</td><td>4.0</td></tr>
+    <tr><td>컨테이너</td><td>Docker Compose</td><td>-</td></tr>
+  </tbody>
+</table>
+<p>Gradle 모듈은 <code>gateway</code>, <code>user-service</code>, <code>product-service</code>, <code>queue-service</code>, <code>entry-service</code>, <code>coupon-service</code>, <code>ranking-service</code>, <code>common</code>(이벤트 계약·에러 계약·ArchUnit 규칙 test fixtures) 이다.</p>
+
+<table>
+  <thead><tr><th style="width:42%">compose 명령</th><th>뜨는 것</th></tr></thead>
+  <tbody>
+    <tr><td><code>docker compose up -d</code></td><td>인프라만 (PostgreSQL, Redis, Kafka, Kafka UI :8090, kafka-init) — IDE 개발용</td></tr>
+    <tr><td><code>docker compose --profile app up -d --build</code></td><td>인프라 + 서비스 7개 (gateway 만 외부 포트 노출)</td></tr>
+    <tr><td><code>docker compose --profile monitoring up -d</code></td><td>Prometheus + Grafana (:3000)</td></tr>
+    <tr><td><code>docker compose --profile loadtest run --rm k6 ...</code></td><td>k6 부하 테스트 (측정은 호스트 k6 로 수행, 7.1 참고)</td></tr>
+  </tbody>
+</table>
+<p>Kafka producer 는 <code>acks=all</code>, <code>enable.idempotence=true</code>, <code>retries=MAX</code>, <code>request.timeout.ms=1000</code>, <code>delivery.timeout.ms=3000</code>, <code>max.block.ms=1000</code> 으로 두어 send 결과가 3초 안에 확정되게 했다(애플리케이션 재시도 없음, D2).
+내부 서비스 포트는 docker 네트워크 안에만 노출해 헤더 신뢰 기반 인증의 우회를 막는다.</p>
+
+<!-- ============ 3. 핵심 흐름 ============ -->
+<h1 class="chapter">3. 핵심 흐름</h1>
+
+<h2>3.1 드로우 전체 흐름</h2>
+<figure class="fig-lg">
+<pre class="mermaid">
+sequenceDiagram
+    actor A as 관리자
+    actor U as 사용자
+    participant PS as product
+    participant QS as queue
+    participant ES as entry
+    participant RS as ranking
+
+    A->>PS: ① 드로우 등록
+    PS-)QS: drop.created
+    PS-)ES: drop.created
+    U->>QS: ② 대기열 진입
+    QS-->>U: 입장 토큰 발급
+    U->>ES: ③ 응모
+    ES-->>U: 응모 완료
+    ES-)RS: entry.created → 랭킹 +1
+    Note over ES: ④ 마감 시각
+    ES->>ES: 추첨
+    ES-)PS: draw.completed
+    U->>ES: ⑤ 결과 조회
+    ES-->>U: 당첨 / 낙첨
+</pre>
+<figcaption>그림 3-1. 드로우 전체 흐름 (출처: sequence-diagram.md 2.1)</figcaption>
+</figure>
+<p>사용자가 응답을 기다리는 동기 구간은 ②의 진입·폴링, ③의 Lua 판정 + Kafka ack, ⑤의 조회뿐이다. DB 쓰기(③ 저장, ④ 추첨)와 랭킹 집계는 모두 사용자 응답 밖에서 일어난다.</p>
+
+<h2>3.2 대기열과 입장 (queue-service)</h2>
+<ul>
+  <li><b>진입</b>: <code>enqueue.lua</code> 하나로 원자 처리한다. 토큰 보유 확인 → 대기 여부 확인 → <code>INCR queue:{dropId}:seq</code> → <code>ZADD NX waiting seq userId</code>. 이미 WAITING/ADMITTED 면 현재 상태를 그대로 돌려준다(멱등, 새로고침해도 순번 유지). 순번은 타임스탬프 대신 카운터로 발급해 동점과 서버 간 시계 차이를 없앴다.</li>
+  <li><b>입장 스케줄러</b>: 1초마다 <code>admit.lua</code> 로 잔여 정원 확인(없거나 ≤ 0 이면 중단) → <code>ZPOPMIN waiting N</code> → 각 사용자에게 <code>SET token EX 300</code>. 대기열에서 빠졌는데 토큰이 없는 상태가 생기지 않는다.</li>
+  <li><b>다중 인스턴스 게이트</b>: <code>SET queue:admission:gate NX PX (0.9 × 주기)</code> 를 잡고 해제하지 않아 전역에서 주기당 1회만 실행된다. 대상 드로우는 인덱스 ZSet <code>queue:active-drops</code> 에서 조회하고 <code>KEYS</code>/<code>SCAN</code> 은 쓰지 않는다.</li>
+  <li><b>상태</b>: 판정 우선순위 SOLD_OUT &gt; ADMITTED &gt; WAITING &gt; NOT_IN_QUEUE. 응답의 <code>nextPollAfterMs</code>(1/3/5초)로 클라이언트 폴링 간격을 조절한다.</li>
+</ul>
+
+<h2>3.3 선착순 응모 (entry-service)</h2>
+<p>응모 요청마다 판정 <b>전에</b> 요청 ID(<code>eventId</code>, UUID)를 만들고, 응모 Lua 가 아래 순서로 한 번에 판정한다.</p>
+<table>
+  <thead><tr><th class="c" style="width:7%">순서</th><th>검사</th><th style="width:28%">실패 시 결과</th></tr></thead>
+  <tbody>
+    <tr><td class="c">1</td><td>meta 존재, state == OPEN 그리고 openAt ≤ now &lt; closeAt</td><td><code>CLOSED</code></td></tr>
+    <tr><td class="c">2</td><td><code>EXISTS queue:{dropId}:token:{userId}</code> (queue 소유 키를 읽기만 함)</td><td><code>NO_TOKEN</code></td></tr>
+    <tr><td class="c">3</td><td><code>SISMEMBER applicants userId</code> == 0</td><td><code>DUPLICATE</code></td></tr>
+    <tr><td class="c">4</td><td><code>GET remaining</code> &gt; 0</td><td><code>SOLD_OUT</code></td></tr>
+    <tr><td class="c">5</td><td><code>DECR remaining</code>, <code>SADD applicants</code>, <code>HSET requests userId eventId</code></td><td>—</td></tr>
+    <tr><td class="c">6</td><td><code>entrySeq = INCR entry:{dropId}:seq</code> 반환 (보상 시에도 되돌리지 않는 별도 카운터)</td><td><code>OK(entrySeq)</code></td></tr>
+  </tbody>
+</table>
+<p>판정이 OK 면 <code>entry.created</code> 를 동기 발행하고 브로커 수신 확인(acks=all)을 받은 뒤 <b>202 Accepted</b> 로 응답한다. DB 저장은 같은 서비스의 저장 컨슈머가 비동기로 한다. 발행 실패 시의 보상과 저장 확정은 4.3 에서 다룬다.</p>
+
+<figure class="fig-lg">
+<pre class="mermaid">
+sequenceDiagram
+    actor U as 사용자
+    participant ES as entry-service
+    participant R as Redis
+    participant K as Kafka
+    participant EDB as entry_db
+
+    U->>ES: POST /api/entries/drops/{id}
+    Note over ES: eventId(UUID) 생성 — 판정 전
+    ES->>R: 응모 Lua: 마감·토큰·중복·잔여 검사<br/>+ DECR + SADD + HSET requests
+    R-->>ES: OK(entrySeq)
+    ES->>K: entry.created(eventId) — get(3.5s)
+    alt 수신 확인
+        ES-->>U: 202 {entrySeq}
+        K->>ES: 저장 컨슈머 → claim.lua (SADD persisted)
+        ES->>EDB: INSERT ... ON CONFLICT DO NOTHING
+    else 발행 실패 / 3.5초 초과
+        ES->>R: compensate.lua(userId, eventId)
+        alt ALREADY_PERSISTED
+            ES-->>U: 202 {entrySeq} (이미 기록됨)
+        else COMPENSATED / NOT_OURS
+            ES-->>U: 503 다시 시도해 주세요
+        end
+    end
+</pre>
+<figcaption>그림 3-2. 응모 판정·발행·보상 (sequence-diagram.md 2.2 ③과 5.1 을 합쳐 축약)</figcaption>
+</figure>
+
+<h2>3.4 마감 자동 추첨 (entry-service)</h2>
+<ol>
+  <li><b>마감 잠금</b>: <code>UPDATE drop_snapshots SET status='CLOSING' WHERE status='OPEN' AND close_at &lt;= now</code>. 영향 행 1 인 인스턴스만 추첨을 맡는다. 동시에 Redis meta 를 CLOSED 로 바꿔 이후 응모 Lua 가 거부한다.</li>
+  <li><b>건수 일치 확인</b>: <code>SCARD applicants</code>(Redis) == <code>COUNT(entries)</code>(DB). 불일치면 다음 주기(5초)에 재확인한다.</li>
+  <li><b>추첨 트랜잭션</b>: 첫 문장 <code>CLOSING → DRAWN</code> 조건부 UPDATE 로 행 잠금을 잡아 중복 추첨을 막는다. 응모자를 <code>entry_seq</code> 순으로 정렬하고, <code>SecureRandom</code> 시드로 <code>Collections.shuffle(list, new Random(seed))</code> 후 앞 <code>min(K, 응모자 수)</code> 명을 WON, 나머지를 LOST 로 벌크 UPDATE 한다. 시드는 <code>draw_results</code> 에 저장한다.</li>
+  <li><b>결과 이벤트</b>: 커밋 후 <code>draw.completed</code> 발행. 실패하면 <code>published=false</code> 로 남아 다음 주기에 재발행한다. product 가 드로우 상태를 DRAWN 으로 반영한다.</li>
+</ol>
+<p>건수 불일치가 길어지면 경고 후 관리자 수동 추첨(<code>POST /api/entries/admin/drops/{dropId}/draw</code>, DB 응모 기준)으로 확정한다(사용자 결정). 추첨 뒤 늦게 저장되는 응모는 <code>LOST</code> 로 저장된다(4.4 D6).</p>
+
+<h2>3.5 선착순 쿠폰 발급 (coupon-service)</h2>
+<p>응모와 같은 판정 패턴을 쓴다. 차이는 <b>토큰 검사 대신 시작 시각 검사</b>가 들어가고 <b>대기열이 없다</b>는 점이다. 발급 Lua 는 meta 존재(<code>NOT_FOUND</code>) → <code>now ≥ issueStartAt</code>(<code>NOT_STARTED</code>) → 중복(<code>DUPLICATE</code>) → 잔여(<code>SOLD_OUT</code>) → <code>DECR</code>·<code>SADD issued</code>·<code>HSET requests</code> 순서로 판정한다.
+발행 확인·보상 3결과·claim 저장 확정은 응모와 같다. 쿠폰에는 추첨의 건수 비교 같은 사후 안전장치가 없으므로, 저장 확정(claim)이 없으면 유령 이벤트가 곧 초과 발급이 된다. 그래서 쿠폰에도 같은 처리를 필수로 적용했다.
+쿠폰 이벤트 등록은 같은 서비스 안이라 Kafka 를 거치지 않고 커밋 후 Redis 를 직접 초기화한다(<code>SET remaining NX</code>). 초기화 실패는 관리자 재초기화 API 로 복구한다.</p>
+
+<h2>3.6 랭킹 집계 (ranking-service)</h2>
+<ul>
+  <li><code>entry.created</code> 를 소비해 <code>rank.lua</code> 하나로 원자 실행한다: <code>SADD rank:dedupe:{dropId} userId</code> 가 1 일 때만 <code>rank:drop:popular</code>, <code>rank:user:weekly:{yyyy-Www}</code>, <code>rank:user:all</code> 에 <code>ZINCRBY 1</code>. 같은 이벤트가 두 번 와도 한 번만 센다.</li>
+  <li>주차는 처리 시각이 아니라 이벤트의 <code>appliedAt</code>(ISO 주차, Asia/Seoul)으로 계산한다. 주간 키는 TTL 35일로 두어 리셋 배치가 필요 없다.</li>
+  <li>인기 드로우는 <b>진행 중 드로우만</b> 보여 준다(closeAt 필터, 종료 드로우는 조회 중 lazy <code>ZREM</code>). 동점은 ZSet 기본 동작(member 사전순)이며 순번은 1, 2, … 로 매긴다. 두 정책 모두 사용자 결정이다.</li>
+  <li>Redis 장애 시 3회 재시도 후 로그를 남기고 건너뛴다. 랭킹은 진실의 원천이 아니며 누락은 Kafka 오프셋 리셋 재집계로 복구한다(<code>entry.created</code> 보존 30일).</li>
+</ul>
+
+<!-- ============ 4. 동시성·정합성 ============ -->
+<h1 class="chapter">4. 동시성·정합성 설계 (D1~D7)</h1>
+<div class="note">
+  <p>이 장은 보고서의 핵심이다. 정원·수량 초과 금지(NFR-01), 중복 금지(NFR-02), 저장소 간 불일치 복구(NFR-03), 추첨 공정성(NFR-04)을 여러 서비스에 걸쳐 어떻게 지키는지 결정 기록(<code>concurrency-consistency.md</code>)을 요약한다. 기능 설계(응모, 쿠폰, 추첨, 대기열)는 모두 이 결정을 전제로 한다.</p>
+</div>
+
+<h2>4.1 결정 요약표</h2>
+<table>
+  <thead><tr><th style="width:12%">결정</th><th style="width:20%">문제</th><th style="width:24%">선택</th><th style="width:17%">포기한 대안</th><th>트레이드오프</th></tr></thead>
+  <tbody>
+    <tr><td><b>D1</b> 선착순 판정 위치 / 진실의 원천</td>
+        <td>피크 순간 정원·중복 판정을 원자적으로, 빠르게 해야 한다</td>
+        <td><b>Redis Lua 원자 판정 + Kafka 비동기 DB 저장</b>. DB 는 <code>UNIQUE(drop_id, user_id)</code> 로 최종 방어선</td>
+        <td>Redis 판정 + DB 동기 저장, DB 락 판정</td>
+        <td>(+) DB 락 경합 없음, 응답 지연에 DB 쓰기 미포함<br/>(−) Redis 성공 ↔ DB 기록 사이 시간차·유실 가능성(D2·D6 로 보완), Redis 재시작 시 판정 상태 유실 위험(AOF 로 보완), 도메인 규칙이 Lua 에 위치</td></tr>
+    <tr><td><b>D2</b> Kafka 발행 실패 시</td>
+        <td>"성공" 응답한 응모가 DB 에 남지 않거나, 실패 응답한 응모가 DB 에 남으면 안 된다</td>
+        <td><b>동기 발행 확인</b>(producer 내부 멱등 재시도, 3초 제한) → 실패 시 <b>요청 ID 기준 Redis 보상</b> 후 503. 저장 전 <b>claim Lua 로 저장 확정</b>. 보상과 claim 이 Redis 에서 원자적으로 경합</td>
+        <td>보정 배치(Reconciliation), 애플리케이션 재시도, 추첨 전 집합 대조</td>
+        <td>(+) 불변식 "성공 응답 = Kafka 기록" 유지, 유령 이벤트 두 순서 모두 정합<br/>(−) 응답 경로에 Kafka ack 대기(최대 3.5초), Redis 키 2개(<code>requests</code>, <code>persisted</code>) 추가, 보상 실패 시 정원 한 자리가 새는 언더 응모</td></tr>
+    <tr><td><b>D3</b> 입장 토큰 검증</td>
+        <td>응모 시점에 대기열 통과 여부를 피크 부하에서도 확인해야 한다</td>
+        <td><b>entry 가 공유 Redis 를 응모 Lua 안에서 직접 조회</b> (<code>EXISTS token</code>)</td>
+        <td>queue REST 호출, 서명 토큰(JWT)</td>
+        <td>(+) 서비스 간 동기 호출 없음, 토큰 확인이 판정과 원자적으로 묶임<br/>(−) 저장소 공유 → 키 네임스페이스별 쓰기 소유자를 문서로 고정해 완화</td></tr>
+    <tr><td><b>D4</b> 드로우 정보 전파</td>
+        <td>entry·queue·ranking 이 드로우 정보(정원, 시각, 제목)를 알아야 한다</td>
+        <td><b>Kafka <code>drop.created</code> 로 복제</b>. 발행 어댑터가 <code>afterCommit</code> 에 발행 등록 + 관리자 재발행 API</td>
+        <td>필요 시 REST 조회, Outbox</td>
+        <td>(+) 런타임 서비스 간 호출 없음, 롤백 시 미발행<br/>(−) 커밋 후 발행 실패(이중 쓰기) 시 드로우는 있는데 응모 불가 → 저빈도 관리자 작업이라 재발행 API 로 감당. 드로우 수정은 범위에서 제외</td></tr>
+    <tr><td><b>D5</b> 추첨 위치</td>
+        <td>추첨은 응모 데이터 전체가 필요하다</td>
+        <td><b>entry-service 내부</b></td>
+        <td>별도 draw-service</td>
+        <td>(+) 응모 데이터를 로컬에서 조회, 서비스 간 데이터 이동 없음<br/>(−) entry 책임 증가</td></tr>
+    <tr><td><b>D6</b> 추첨 명단 기준</td>
+        <td>비동기 저장이라 마감 시각에 DB 가 Redis 를 아직 따라잡지 못했을 수 있다</td>
+        <td><b>DB 기준. 마감 후 Redis 응모 수 == DB 응모 수가 될 때까지 대기 후 추첨</b>. 장기 불일치는 관리자 수동 추첨</td>
+        <td>Redis 명단으로 즉시 추첨</td>
+        <td>(+) 결과가 영속 데이터와 일치<br/>(−) 추첨이 지연될 수 있음</td></tr>
+    <tr><td><b>D7</b> 추첨 공정성</td>
+        <td>추첨 결과를 재현·검증할 수 있어야 한다</td>
+        <td><b>시드 저장 셔플</b>: <code>entry_seq</code> 정렬 → <code>SecureRandom</code> 시드 → Fisher–Yates 셔플 → 앞 K명</td>
+        <td>단순 무작위</td>
+        <td>(+) 같은 응모자 목록 + 같은 시드 = 같은 결과(테스트·감사 용이), 사전 예측 불가<br/>(−) 응모자 전원을 메모리에 올려 셔플</td></tr>
+  </tbody>
+</table>
+
+<h2>4.2 D1 — Redis Lua 원자 판정</h2>
+<p>"중복 확인 → 잔여 수량 확인 → 차감 → 응모자 등록"을 하나의 Lua 스크립트로 실행한다. Redis 는 단일 스레드로 스크립트를 실행하므로 중간에 다른 요청이 끼어들 수 없다. 이로써 NFR-01(초과 없음)과 NFR-02(중복 없음)를 판정 단계에서 지킨다.
+시각은 Lua 안의 <code>TIME</code> 대신 애플리케이션이 <code>nowEpochMs</code> 인자로 넘긴다(복제 시 비결정성 회피). 도메인 규칙이 Lua(infrastructure)에 있다는 점은 감수한 트레이드오프이며, domain 에는 결과 타입(<code>ApplyOutcome</code>: OK / CLOSED / NO_TOKEN / DUPLICATE / SOLD_OUT)만 두고 Lua 는 Testcontainers 통합 테스트로 검증했다.
+응모 번호 <code>entrySeq</code> 는 잔여 정원에서 계산(<code>M - remaining</code>)하지 않고 되돌리지 않는 별도 카운터로 발급한다. 잔여 정원에서 계산하면 보상 후 같은 번호가 재발급돼 정상 응모가 <code>UNIQUE(drop_id, entry_seq)</code> 에서 누락될 수 있기 때문이다.</p>
+
+<h2>4.3 D2 — 발행 확인과 보상, 저장 확정</h2>
+<p><b>불변식</b>: "성공 응답을 받은 응모 = Kafka 에 반드시 기록된 응모".</p>
+<ol>
+  <li>요청마다 요청 ID(<code>eventId</code>)를 판정 전에 만든다. 판정 성공 시 <code>requests</code> Hash 에 <code>userId → eventId</code> 를 기록한다(어느 요청이 이 자리를 잡았는지).</li>
+  <li><code>send().get(3.5s)</code> 로 브로커 수신 확인까지 동기 대기한다. 재시도는 <b>producer 내부 멱등 재시도만</b> 쓴다. 애플리케이션이 같은 내용을 다시 send 하면 Kafka 가 별개 레코드로 받아 멱등 producer 도 중복을 막지 못하고 유령 이벤트가 늘기 때문이다. <code>delivery.timeout.ms=3000</code> 으로 send 결과를 3초 안에 확정한다.</li>
+  <li>실패 시 같은 <code>eventId</code> 로 보상 Lua 를 실행한다. 결과는 셋 중 하나다.</li>
+</ol>
+<table>
+  <thead><tr><th style="width:20%">보상 결과</th><th style="width:33%">조건</th><th>동작</th><th style="width:20%">응답</th></tr></thead>
+  <tbody>
+    <tr><td><code>ALREADY_PERSISTED</code></td><td><code>persisted</code> 에 userId 있음 (컨슈머가 이미 저장 확정)</td><td>되돌리지 않음</td><td><b>202 성공</b> (실제로 기록됨)</td></tr>
+    <tr><td><code>NOT_OURS</code></td><td><code>requests[userId] ≠ eventId</code> (다른 요청의 응모 / 판정 미실행)</td><td>되돌리지 않음</td><td>503</td></tr>
+    <tr><td><code>COMPENSATED</code></td><td>그 외</td><td><code>SREM applicants</code> + <code>HDEL requests</code> + <code>INCR remaining</code></td><td>503</td></tr>
+  </tbody>
+</table>
+<p><b>저장 컨슈머의 claim Lua</b> (DB 저장 전): <code>applicants</code> 에 없으면 0(보상된 응모의 유령 이벤트), <code>requests[userId] ≠ 메시지 eventId</code> 면 0(보상 후 재응모한 사용자의 이전 시도), 그 외에는 <code>SADD persisted</code> 후 1 → <code>INSERT ... ON CONFLICT DO NOTHING</code>. 재전달에도 1 을 돌려준다(멱등).</p>
+<div class="key">
+  <b>정합성 논증</b> — claim 과 보상은 같은 Redis 의 Lua 라 원자적으로 하나가 먼저 실행된다.
+  <ul>
+    <li>claim 이 먼저: <code>persisted</code> 에 들어가 보상은 <code>ALREADY_PERSISTED</code> 로 거절 → DB 저장 + Redis 응모자 유지 + 성공 응답</li>
+    <li>보상이 먼저: <code>applicants</code>·<code>requests</code> 에서 빠져 claim 은 0 → DB 미저장 + Redis 응모자 없음 + 실패 응답</li>
+    <li>어느 순서든 <b>"DB 저장 ⇔ Redis 응모자 유지"</b>가 성립하므로, 풀린 자리를 다른 사용자가 가져가도 DB 응모 수가 정원을 넘지 않는다.</li>
+  </ul>
+</div>
+<p><b>Redis 응답 실패(타임아웃 포함)</b>: 어댑터가 Redis 예외를 포트 예외 <code>GateUnavailableException</code> 으로 감싼다. 판정 Lua 에서 이 예외가 나면 실행 여부를 모르므로 같은 eventId 로 보상을 한 번 시도한다. 실행됐다면 COMPENSATED, 실행되지 않았다면 NOT_OURS 로 아무것도 바뀌지 않는다. 결과와 무관하게 503 이다.</p>
+<p><b>남는 리스크</b>: ① 보상까지 실패하면 그 사용자는 Redis 에만 응모돼 있다(언더 응모 방향, D6 건수 불일치로 드러남). ② claim 후 DB 저장이 실패한 경우는 3회 재시도 후 DLT 로 가고 DLT 재처리로 복구한다 — 설계상 남는 Redis·DB 불일치는 이 경우뿐이다.</p>
+<p class="small">이 처리(요청 ID·저장 확정·보상 3결과)는 4단계 구현 중 고도화 분석에서 발견한 버그(E-40 유령 이벤트가 보상보다 먼저 소비되면 오버 응모, E-41 Redis 타임아웃 시 발행·보상 누락)에 대한 사용자 결정으로 확정했고, 6단계에서 쿠폰에도 같은 방식으로 적용했다.</p>
+
+<h2>4.4 D3~D7 세부</h2>
+<h3>D3 입장 토큰 검증</h3>
+<p>queue-service 가 <code>queue:{dropId}:token:{userId}</code> 를 TTL 과 함께 쓰고(쓰기 소유자 queue), entry-service 는 응모 Lua 안에서 <code>EXISTS</code> 로만 확인한다. 토큰은 응모 후 지우지 않는다. 재응모는 <code>applicants</code> Set 이 막고 토큰은 TTL 로 자연 만료된다. 반대로 <code>entry:{dropId}:*</code> 의 쓰기 소유자는 entry 하나이고 queue 는 <code>remaining</code> 만 읽는다.</p>
+<h3>D4 드로우 정보 전파</h3>
+<p>application 은 포트(<code>DropEventPublisher</code>)만 호출하고 발행 시점을 모른다. infrastructure 어댑터가 <code>TransactionSynchronizationManager</code> 로 <code>afterCommit</code> 에 발행을 등록하고, 활성 트랜잭션이 없으면 즉시 발행한다. 수신 측은 <code>SET NX</code>, <code>ON CONFLICT DO NOTHING</code> 으로 재수신에 멱등하다. 회원가입 <code>user.registered</code> 도 같은 방식이다.</p>
+<h3>D5 추첨 위치</h3>
+<p>추첨은 entry-service 안의 스케줄러(presentation)가 시작한다. 마감 잠금(<code>OPEN → CLOSING</code>)과 추첨 트랜잭션 첫 문장(<code>CLOSING → DRAWN</code>) 두 개의 조건부 UPDATE 로 다중 인스턴스 중복 추첨을 막아 분산 락이 필요 없다.</p>
+<h3>D6 추첨 명단 기준</h3>
+<p>마감 후 Redis 응모 수와 DB 응모 수가 같아질 때까지 기다린 뒤 DB 응모자로 추첨한다. 오래 일치하지 않으면 경고 후 관리자 수동 추첨(DB 기준)으로 확정한다. 이때 추첨 뒤 늦게 저장되는 응모(DLT 재처리·lag)는 <b>LOST 로 저장</b>한다. 저장 트랜잭션이 <code>drop_snapshots</code> 행을 <code>FOR SHARE</code> 로 잠가 추첨 트랜잭션의 첫 UPDATE 와 직렬화하므로, 응모는 "추첨 대상에 포함" 또는 "LOST 저장" 둘 중 하나가 되고 APPLIED 로 남지 않는다(E-48, 사용자 결정).</p>
+<h3>D7 추첨 공정성</h3>
+<p>응모자를 <code>entry_seq</code> 오름차순으로 정렬해 결정적 순서를 만들고, 시드를 <code>draw_results</code> 에 저장한다. 추첨 요약 API(<code>GET /api/entries/drops/{dropId}/result</code>)는 공개이며 시드 문자열을 포함하므로 결과를 검증할 수 있다. 시드 생성은 application 포트 <code>SeedGenerator</code> 로 분리해 테스트에서는 고정값을 쓴다.</p>
+
+<h3>정합성 장치 요약</h3>
+<table>
+  <thead><tr><th style="width:27%">위협</th><th>장치</th><th style="width:16%">관련 결정</th></tr></thead>
+  <tbody>
+    <tr><td>동시 요청으로 정원·수량 초과</td><td>Lua 원자 판정(잔여 확인과 차감이 한 스크립트)</td><td>D1</td></tr>
+    <tr><td>중복 응모·발급</td><td>Lua <code>applicants</code>/<code>issued</code> Set + DB UNIQUE</td><td>D1</td></tr>
+    <tr><td>발행 실패한 응모가 정원을 점유</td><td>동기 발행 확인 + 요청 ID 기준 보상</td><td>D2</td></tr>
+    <tr><td>유령 이벤트(타임아웃이지만 실제로 기록됨)</td><td>claim Lua 저장 확정 + 보상 3결과</td><td>D2</td></tr>
+    <tr><td>Kafka 재전달</td><td>claim 멱등, <code>ON CONFLICT DO NOTHING</code>, 랭킹 dedupe Set</td><td>D2, 랭킹</td></tr>
+    <tr><td>Redis 재시작</td><td>AOF <code>appendonly yes</code>, <code>appendfsync everysec</code></td><td>D1</td></tr>
+    <tr><td>비동기 저장 지연 중 추첨</td><td>건수 일치 대기, 수동 추첨 + 늦은 응모 LOST 저장</td><td>D6</td></tr>
+    <tr><td>중복 추첨(다중 인스턴스)</td><td>조건부 UPDATE 2단계 전이</td><td>D5</td></tr>
+  </tbody>
+</table>
+
+<!-- ============ 5. 계층 구조 ============ -->
+<h1 class="chapter">5. 계층 구조와 규칙</h1>
+
+<h2>5.1 4계층과 의존 방향</h2>
+<figure class="fig-sm">
+<pre class="mermaid">
+flowchart TB
+    P[presentation<br/>Controller · Kafka Listener · Scheduler<br/>Request / Response]
+    A[application<br/>Service · Command / Result<br/>외부 연동 포트]
+    D[domain<br/>모델 · 도메인 규칙 · 도메인 서비스<br/>Repository 포트]
+    I[infrastructure<br/>JPA Entity · Mapper · Repository 구현<br/>Redis Lua · Kafka Producer · Config]
+
+    P --> A
+    A --> D
+    I -. implements .-> D
+    I -. implements .-> A
+</pre>
+<figcaption>그림 5-1. 계층과 의존 방향 (출처: layered-architecture.md 2장). 실선은 "사용한다", 점선은 "구현한다"</figcaption>
+</figure>
+<p>모든 화살표가 domain 쪽을 향한다. infrastructure 는 위에서 호출당하지 않고 application/domain 이 정의한 인터페이스를 구현하며, Spring DI 가 런타임에 연결한다(엄격한 DIP).
+패키지는 <code>com.queuedrop.{service}.{presentation|application|domain|infrastructure}</code> 이다.</p>
+<table>
+  <thead><tr><th style="width:15%">계층</th><th style="width:30%">책임</th><th style="width:28%">의존 허용</th><th>의존 금지</th></tr></thead>
+  <tbody>
+    <tr><td>presentation</td><td>입력 수신·검증, 형식 변환 (Request→Command, Result→Response, 이벤트 메시지→Command). Kafka Listener·Scheduler 포함</td><td>application, Spring Web, <code>common</code> 이벤트 메시지</td><td>domain, infrastructure</td></tr>
+    <tr><td>application</td><td>유스케이스 흐름 조율, 트랜잭션 경계, 도메인 모델 → Result 변환</td><td>domain, <code>common.error</code>, <code>spring-context</code>·<code>spring-tx</code> (어노테이션만)</td><td>presentation, infrastructure, JPA, Redis, Kafka, Spring Web, <code>common.event</code></td></tr>
+    <tr><td>domain</td><td>비즈니스 규칙, 상태 전이, 불변식. 시각은 <code>now</code> 인자로 받음</td><td>순수 Java 만 (Lombok compileOnly 어노테이션)</td><td>Spring, JPA, 다른 모든 계층</td></tr>
+    <tr><td>infrastructure</td><td>기술 구현(DB, Redis, Kafka), 포트 구현, 설정</td><td>domain, application(포트), 기술 라이브러리, <code>common</code></td><td>presentation</td></tr>
+  </tbody>
+</table>
+
+<h2>5.2 모델 비노출과 포트 위치</h2>
+<ul>
+  <li><b>도메인 모델 ↔ JPA 엔티티 분리</b>: <code>domain/model/Entry</code> 는 어노테이션 없는 순수 Java, <code>infrastructure/persistence/EntryJpaEntity</code> 가 <code>@Entity</code>, Mapper 가 양방향 변환한다. 변경 감지에 의존할 수 없으므로 변경 후 <code>save()</code> 를 명시 호출하고, 추첨처럼 대량 변경은 벌크 메서드로 표현한다.</li>
+  <li><b>모델 비노출</b>: application public 메서드의 입력은 <code>XxxCommand</code>, 출력은 <code>XxxResult</code> 다. 데이터는 <code>Request → Command → (domain) → Result → Response</code> 로 흐르고 도메인 모델은 application 밖으로 나가지 않는다.</li>
+  <li><b>포트 위치</b>: 영속 포트(도메인 개념, 예 <code>EntryRepository</code>)는 <code>domain/repository</code>, 외부 연동 포트(기술 개념, 예 <code>EntryGate</code>·<code>EntryEventPublisher</code>)는 <code>application/port</code> 에 둔다.</li>
+  <li><b>이벤트 계약</b>: <code>common</code> 의 이벤트 메시지는 서비스 간 계약이지 도메인 모델이 아니다. application 은 자체 DTO 로 포트를 호출하고, infrastructure 어댑터가 <code>common</code> 메시지로 변환한다.</li>
+  <li><b>에러 계약</b>: <code>common.error</code> 에 <code>ErrorCode</code>·<code>ApplicationException</code>·<code>ErrorResponse</code> 를 순수 Java 로 두고, 서비스별 에러 코드 enum 은 application 에 둔다. 응답 code 는 <code>{SERVICE}_{REASON}</code> (예: <code>ENTRY_SOLD_OUT</code>), 메시지는 코드별 고정 문구다.</li>
+</ul>
+
+<h2>5.3 ArchUnit 규칙 R1~R7</h2>
+<p>각 서비스 모듈의 <code>ArchitectureTest</code> 가 아래 규칙을 검사하고 위반 시 빌드(test)가 실패한다. 규칙 정의는 <code>common</code> 모듈의 test fixtures 에 두고 재사용한다. 0단계에서 규칙을 일부러 어긴 코드를 넣어 테스트가 실패하는 것도 확인했다.</p>
+<table>
+  <thead><tr><th class="c" style="width:6%">#</th><th>규칙</th><th style="width:28%">의미</th></tr></thead>
+  <tbody>
+    <tr><td class="c">R1</td><td><code>domain..</code> 은 <code>domain..</code>, <code>java..</code>, <code>lombok..</code> 외에 의존하지 않는다</td><td>domain 순수성</td></tr>
+    <tr><td class="c">R2</td><td><code>application..</code> 은 <code>presentation..</code>, <code>infrastructure..</code> 에 의존하지 않는다</td><td>상위·기술 계층 모름</td></tr>
+    <tr><td class="c">R3</td><td><code>application..</code> 은 <code>jakarta.persistence..</code>, <code>org.hibernate..</code>, <code>org.springframework.data..</code>, <code>org.springframework.kafka..</code>, <code>org.springframework.web..</code>, <code>org.apache.kafka..</code>, <code>io.lettuce..</code>, <code>redis.clients..</code>, <code>io.micrometer..</code>, <code>com.queuedrop.common.event..</code> 에 의존하지 않는다</td><td>기술 의존 금지, 메시지 계약 직접 의존 금지</td></tr>
+    <tr><td class="c">R4</td><td><code>presentation..</code> 은 <code>domain..</code>, <code>infrastructure..</code> 에 의존하지 않는다</td><td>모델 비노출</td></tr>
+    <tr><td class="c">R5</td><td><code>infrastructure..</code> 는 <code>presentation..</code> 에 의존하지 않는다</td><td>역방향 금지</td></tr>
+    <tr><td class="c">R6</td><td><code>application.service..</code> 의 public 메서드는 <code>domain.model..</code> 타입을 파라미터·반환으로 쓰지 않는다</td><td>모델 비노출 (시그니처 수준)</td></tr>
+    <tr><td class="c">R7</td><td><code>@Entity</code> 클래스는 <code>infrastructure.persistence..</code> 에만 존재한다</td><td>엔티티 분리</td></tr>
+  </tbody>
+</table>
+<p class="small">R1 의 <code>lombok..</code> 허용은 Lombok 생성 코드의 <code>@lombok.Generated</code> 가 바이트코드에 남는 것을 확인한 뒤 추가했다. R3 의 <code>io.micrometer..</code> 는 8단계에서 메트릭을 presentation·infrastructure 에서만 기록하도록 추가했다.</p>
+
+<!-- ============ 6. 개발 방식 ============ -->
+<h1 class="chapter">6. 개발 방식</h1>
+
+<h2>6.1 단계별 계획과 진행 현황</h2>
+<p>의존 순서대로 0~8단계를 진행했다. 각 단계 안에서는 서비스 → 계층(domain → application → infrastructure → presentation) 순서로 작업해, 바깥 계층이 생기기 전에 규칙을 단위 테스트로 먼저 고정했다. 단계마다 구현 상세 문서(<code>docs/plan/phases/phase-{n}-*.md</code>)에 파일 목록, 시그니처, Lua·SQL·설정, 테스트 ID, 커밋 계획을 먼저 적고 구현했다.</p>
+<figure class="fig-sm">
+<pre class="mermaid">
+flowchart LR
+    P0[0단계<br/>공통 기반] --> P1[1단계<br/>인증]
+    P1 --> P2[2단계<br/>드로우]
+    P2 --> P3[3단계<br/>대기열]
+    P3 --> P4[4단계<br/>응모 ★]
+    P4 --> P5[5단계<br/>추첨]
+    P4 --> P7[7단계<br/>랭킹]
+    P0 --> P6[6단계<br/>쿠폰]
+    P5 --> P8[8단계<br/>검증]
+    P6 --> P8
+    P7 --> P8
+</pre>
+<figcaption>그림 6-1. 단계 순서 (출처: implementation-plan.md 2장)</figcaption>
+</figure>
+<table>
+  <thead><tr><th style="width:15%">단계</th><th style="width:26%">브랜치</th><th>목표</th><th class="c" style="width:8%">PR</th><th class="c" style="width:13%">완료</th></tr></thead>
+  <tbody>
+    <tr><td>0. 공통 기반</td><td><code>chore/phase-0-foundation</code></td><td>4계층 골격, ArchUnit, Testcontainers, 이벤트 계약, Redis AOF·토픽 사전 생성</td><td class="c">#4</td><td class="c">2026-11-16</td></tr>
+    <tr><td>1. 인증</td><td><code>feat/phase-1-auth</code></td><td>회원가입·로그인, Gateway JWT 검증·헤더 주입</td><td class="c">#5</td><td class="c">2026-11-16</td></tr>
+    <tr><td>2. 드로우</td><td><code>feat/phase-2-drop</code></td><td>상품·드로우 등록, <code>drop.created</code> 발행, 조회</td><td class="c">#6</td><td class="c">2026-11-16</td></tr>
+    <tr><td>3. 대기열</td><td><code>feat/phase-3-queue</code></td><td>대기열 진입, 주기적 입장 토큰 발급</td><td class="c">#7</td><td class="c">2026-11-16</td></tr>
+    <tr><td>4. 응모 ★</td><td><code>feat/phase-4-entry-apply</code></td><td>선착순 응모, 초과·중복 없는 DB 저장</td><td class="c">#8</td><td class="c">2026-11-17</td></tr>
+    <tr><td>5. 추첨</td><td><code>feat/phase-5-draw</code></td><td>마감 자동 추첨, 결과 조회</td><td class="c">#9</td><td class="c">2026-11-17</td></tr>
+    <tr><td>6. 쿠폰</td><td><code>feat/phase-6-coupon</code></td><td>대기열 없는 선착순 1인 1매 발급</td><td class="c">#10</td><td class="c">2026-11-17</td></tr>
+    <tr><td>7. 랭킹</td><td><code>feat/phase-7-ranking</code></td><td>인기 드로우, 주간·누적 유저 랭킹</td><td class="c">#11</td><td class="c">2026-11-17</td></tr>
+    <tr><td>8. 검증</td><td><code>test/phase-8-load-test</code></td><td>부하 테스트로 초과 0·중복 0 증명, 병목 분석</td><td class="c">#12</td><td class="c">2026-11-17</td></tr>
+  </tbody>
+</table>
+<p>각 단계는 <code>dev</code> 에서 브랜치를 만들어 PR 로 <code>dev</code> 에 머지했다(PR #4~#12). 커밋은 Conventional Commits 에 한국어 본문을 쓴다. 설계와 다르게 구현해야 하면 설계 문서를 먼저 고치고(변경 이력 행 추가) 진행했으며, 설계 방향을 바꾸는 결정(추첨 건수 불일치 정책, 랭킹 범위·동점, 유령 이벤트 대응 등)은 선택지와 트레이드오프를 제시해 사용자가 결정했다.</p>
+
+<h2>6.2 TDD 역할 분담 (AI 에이전트 협업)</h2>
+<p>구현은 AI 에이전트(Claude Code) 여러 개가 역할을 나눠 TDD 사이클로 진행했다. <b>역할 이름은 호칭일 뿐이며 실제 인물을 흉내 내지 않는다.</b></p>
+<table>
+  <thead><tr><th style="width:13%">역할</th><th>담당</th></tr></thead>
+  <tbody>
+    <tr><td>카리나</td><td>메인 세션. 지휘(작업 분배·설계 판단·문서 수정·지적 사항 판정), 브랜치 생성, 커밋·PR·머지. 4단계부터 구현은 고윤정에게 맡기고 핵심 동시성 코드(Lua 등)는 커밋 전 직접 읽는다</td></tr>
+    <tr><td>고윤정</td><td>구현(Green)·리팩터링. 테스트를 통과시키는 최소 프로덕션 코드 작성. 테스트 코드 수정 금지, 커밋 금지</td></tr>
+    <tr><td>장원영</td><td>실패하는 테스트 작성(Red), Green 이후 전체 실행·경계 케이스 보강. 테스트 코드 소유자</td></tr>
+    <tr><td>신민아</td><td>시니어 코드 검증. 설계·계층·정합성 기준으로 지적만 한다(수정 권한 없음)</td></tr>
+    <tr><td>한지민</td><td>시니어 고도화 분석(조회 최적화, 인덱스, N+1, Redis/Kafka 효율). 고도화 백로그에만 기록</td></tr>
+  </tbody>
+</table>
+<p><b>사이클</b> (작업 단위 = 단계 문서 "커밋 계획"의 한 항목)</p>
+<ol>
+  <li>장원영(Red): 테스트 ID 의 실패하는 테스트를 작성하고 의도한 이유로 실패하는지 확인한다.</li>
+  <li>고윤정(Green): 테스트를 통과하는 최소 구현. 테스트를 통과시키려고 테스트 코드를 고치지 않는다. 테스트가 틀렸다고 보면 근거와 함께 장원영에게 넘긴다.</li>
+  <li>고윤정(Refactor): 테스트 통과를 유지하며 정리한다.</li>
+  <li>장원영(검증): 모듈 전체 테스트 + ArchitectureTest 실행, 빠진 경계 케이스 보강.</li>
+  <li>신민아(검증): BLOCKER / MAJOR 지적은 카리나가 판정해 수정을 맡긴 뒤 재검증한다. 왕복 2회를 넘기면 멈추고 사용자에게 판단을 요청한다. 1~3단계는 단계 끝에 한 번, 4단계부터는 사이클마다 수행했다.</li>
+  <li>카리나: 커밋.</li>
+</ol>
+<p>단계가 끝나면 한지민의 고도화 분석을 백로그(<code>docs/plan/enhancement-backlog.md</code>, E-01~E-76)에 추가하고, 명백한 버그(정합성·장애 경로)는 설계 문서에 변경 이력을 남기고 반영했다. 예를 들어 E-40·E-41(유령 이벤트·Redis 타임아웃)과 E-48(수동 추첨 뒤 늦은 응모)은 이 분석에서 발견해 설계를 바꾼 사례다.</p>
+
+<h2>6.3 테스트 현황</h2>
+<p>최신 <code>./gradlew build</code> 기준 테스트 수는 다음과 같다. 테스트는 domain 단위 테스트, application Fake 포트 단위 테스트, infrastructure Testcontainers 통합 테스트(PostgreSQL·Redis·Kafka, Lua 스크립트 포함), presentation <code>@WebMvcTest</code> 슬라이스 테스트, ArchUnit 아키텍처 테스트, <code>ExecutorService</code> + <code>CountDownLatch</code> 동시성 통합 테스트로 구성된다.</p>
+<table style="width:70%">
+  <thead><tr><th>모듈</th><th class="num">테스트 수</th></tr></thead>
+  <tbody>
+    <tr><td>common</td><td class="num">35</td></tr>
+    <tr><td>coupon-service</td><td class="num">230</td></tr>
+    <tr><td>entry-service</td><td class="num">422</td></tr>
+    <tr><td>gateway</td><td class="num">42</td></tr>
+    <tr><td>product-service</td><td class="num">200</td></tr>
+    <tr><td>queue-service</td><td class="num">154</td></tr>
+    <tr><td>ranking-service</td><td class="num">169</td></tr>
+    <tr><td>user-service</td><td class="num">71</td></tr>
+    <tr><th>합계</th><th class="num">1,323</th></tr>
+  </tbody>
+</table>
+<p>이 밖에 별도 e2e 스크립트(<code>scripts/e2e.sh</code>)와 부하 테스트용 k6 스크립트(<code>load-test/</code>), 정합성 검증 스크립트(<code>scripts/verify-drop.sh</code>, <code>scripts/verify-coupon.sh</code>)를 두었다.</p>
+
+<!-- ============ 7. 검증 결과 ============ -->
+<h1 class="chapter">7. 검증 결과 (부하 테스트)</h1>
+<div class="note">
+  <p>이 장은 <code>docs/report/load-test-report.md</code>(v1.0)를 요약한 것이다. 수치는 리포트를 그대로 인용했고, 시나리오별 상세 카운트·정합성 검증 출력·측정 방식은 리포트 원문과 <code>docs/plan/phases/phase-8-load-test.md</code> 3.6·3.9 를 참조한다.</p>
+</div>
+
+<div class="kpi">
+  <div><b>0</b><span>정원·수량 초과 (모든 실행)</span></div>
+  <div><b>0</b><span>사용자·응모 번호 중복 (모든 실행)</span></div>
+  <div><b>29.3ms</b><span>S1 응모 p99 (3,000명, 워밍업 후)</span></div>
+  <div><b>16,294명</b><span>확대 규모 드로우 최대 참여 (X4)</span></div>
+</div>
+
+<h2>7.1 측정 환경</h2>
+<table>
+  <thead><tr><th style="width:22%">항목</th><th>값</th></tr></thead>
+  <tbody>
+    <tr><td>머신</td><td>Apple M5 Pro, 15코어, 메모리 48GB, macOS 26.5</td></tr>
+    <tr><td>Docker 리소스</td><td>Docker Desktop 29.5.3 — VM CPU 15, 메모리 7.7GB</td></tr>
+    <tr><td>컨테이너 메모리 제한</td><td>서비스 6개 768m — <code>MaxRAMPercentage=75</code> → P4 이후 50%. gateway 1024m (<code>MaxRAMPercentage=50</code>, <code>MaxDirectMemorySize=256m</code>, P2 이후. 이전 768m/75%)</td></tr>
+    <tr><td>버전</td><td>Java 21, Spring Boot 4.1.2, Spring Cloud Gateway 5.0.4, PostgreSQL 17, Redis 7.4 (AOF everysec), Kafka 4.0.0, k6 v2.3.0 (호스트)</td></tr>
+    <tr><td>모니터링</td><td>Prometheus v3.15.1 (5초 scrape) + Grafana 13.2.6 — 측정 내내 켜 둠</td></tr>
+    <tr><td>기본 튜닝값</td><td>입장 배치 100명 / 1초, 입장 토큰 TTL 300초, 추첨 주기 5초, JWT 2시간, Hikari 풀 10, Tomcat 스레드 200</td></tr>
+    <tr><td>주의</td><td>k6 와 서비스가 같은 머신에서 CPU 를 나눠 쓴다. k6 는 호스트에서 실행해 요청이 Docker Desktop 포트 포워딩(localhost:8080)을 거친다. 같은 2,000 VU 쿠폰 버스트에서 p99 108ms(호스트) vs 74ms(Docker 네트워크 내부)</td></tr>
+  </tbody>
+</table>
+<p><b>측정 규칙</b>: 서비스·gateway 재시작 직후에는 JIT 가 덜 끝나 같은 요청이 크게 느리므로, 시나리오마다 작은 워밍업 실행 1회 후 측정했다("1차(개선 전)" 수치는 이 규칙 이전의 기동 직후 측정이다). 정합성은 k6 직후(마감 전) <code>verify-drop.sh &lt;id&gt; --expect &lt;entry_ok&gt;</code> / <code>verify-coupon.sh &lt;id&gt; --expect &lt;n&gt;</code>, 마감 후 <code>verify-drop.sh &lt;id&gt; --after-draw</code> 로 확인했다.</p>
+
+<h2>7.2 정합성 결과</h2>
+<p>기본 규모 S1~S6 과 확대 규모(드로우 최대 16,294명 참여 / 쿠폰 최대 15,000 동시) <b>모든 실행</b>에서 <code>verify-drop.sh</code>·<code>verify-coupon.sh</code> 가 PASS 했다. 정원·수량 초과 0, 중복 0 이다. 1차 측정에서 gateway 가 OOM 으로 재시작되고 요청 4,000건이 실패했을 때도 서버가 처리한 건은 Redis·DB 가 일치했다. 보상(<code>COMPENSATED</code>·<code>NOT_OURS</code>)은 측정 전 구간에서 0 이었다.</p>
+<p><code>verify-drop.sh</code> 가 검사하는 항목(S1 drop 9 출력 기준):</p>
+<pre class="code">PASS  NFR-01 DB 응모 수 ≤ 정원
+PASS  NFR-02 사용자 중복 0
+PASS  NFR-02 응모 번호 중복 0
+PASS  NFR-01 Redis 잔여 ≥ 0
+PASS  NFR-03 정원 - 잔여 == Redis 응모자 수
+PASS  NFR-01 Redis 응모자 수 ≤ 정원
+PASS  NFR-03 Redis 응모자 수 == DB 응모 수
+PASS  NFR-03 저장 확정(persisted) 수 == DB 응모 수
+PASS  REQ-RANK-03 인기 랭킹 점수 == DB 응모 수
+PASS  REQ-RANK-03 랭킹 집계 사용자 수(rank:dedupe) == DB 응모 수
+PASS  k6 entry_ok == DB 응모 수
+--after-draw:
+draw: won=100 lost=900 applied=0 drawResults=1 recordApplicants=1000 recordWinners=100
+PASS  추첨 상태 DRAWN / draw_results 1건 / 당첨 수 == min(K, 응모자 수) / 당첨 + 낙첨 == DB 응모 수</pre>
+
+<h2>7.3 기본 규모 S1~S6</h2>
+<table>
+  <thead><tr><th style="width:6%">ID</th><th style="width:20%">시나리오</th><th style="width:26%">정합성</th><th style="width:20%">성능 목표</th><th>결과</th></tr></thead>
+  <tbody>
+    <tr><td>S1</td><td>드로우 오픈 3,000명 / M 1,000 / K 100</td><td><span class="pass">PASS</span> (DB 1,000, 초과·중복 0, 추첨 100/900)</td><td>응모 p99 &lt; 500ms, 5xx &lt; 0.1%, lag 30초 내 해소</td><td><span class="pass">PASS</span> — 응모 p99 29ms, 5xx 0, lag 0</td></tr>
+    <tr><td>S2</td><td>정원 조기 소진 5,000명 / M 100</td><td><span class="pass">PASS</span> (정확히 100, 소진 후 입장 0)</td><td>성공 정확히 100</td><td><span class="pass">PASS</span> (개선 전: 로그인 647건 연결 리셋)</td></tr>
+    <tr><td>S3</td><td>쿠폰 스파이크 3,000명 / 수량 500</td><td><span class="pass">PASS</span> (DB 500)</td><td>발급 p99 &lt; 500ms</td><td><span class="pass">PASS</span> — 워밍업 후 p99 153~204ms (개선 전: gateway OOM, 전 요청 실패)</td></tr>
+    <tr><td>S4</td><td>중복 버스트 200명 × 5</td><td><span class="pass">PASS</span> (202 정확히 200, DUPLICATE 800, DB 200)</td><td>—</td><td><span class="pass">PASS</span></td></tr>
+    <tr><td>S5</td><td>입장 배치 50 / 100 / 500</td><td><span class="pass">PASS</span> (3회 모두)</td><td>결과 기록</td><td>아래 표</td></tr>
+    <tr><td>S6</td><td>Redis 재시작</td><td><span class="pass">PASS</span> (재시작 후 재검증 4건)</td><td>AOF 유지</td><td><span class="pass">PASS</span> — 약 1초 내 복구, 키 1,662개 유지</td></tr>
+    <tr><td>T8-13</td><td>보상 발생</td><td><code>COMPENSATED</code> 0, <code>NOT_OURS</code> 0</td><td>== 0</td><td><span class="pass">PASS</span></td></tr>
+  </tbody>
+</table>
+
+<h3>S1 드로우 오픈 스파이크 (3,000명 / M 1,000 / K 100)</h3>
+<table>
+  <thead><tr><th style="width:34%">지표</th><th>queue_enter</th><th>queue_status (서버 측)</th><th>entry_apply</th></tr></thead>
+  <tbody>
+    <tr><td>요청 수</td><td class="num">3,000</td><td class="num">약 6,700</td><td class="num">1,000</td></tr>
+    <tr><td>최대 처리량 (서버 측 req/s)</td><td class="num">—</td><td class="num">491</td><td class="num">72</td></tr>
+    <tr><td>p50 / p95 / p99 (ms) — 1차</td><td class="num">8.0 / 129.8 / 162.8</td><td class="num">p99 16</td><td class="num">18.4 / 111.2 / 136.5</td></tr>
+    <tr><td>p50 / p95 / p99 (ms) — 개선 후</td><td class="num">1.8 / 6.8 / 16.7</td><td class="num">—</td><td class="num">8.8 / 22.9 / 29.3</td></tr>
+    <tr><td>5xx 비율</td><td class="num">0</td><td class="num">0</td><td class="num">0</td></tr>
+  </tbody>
+</table>
+<p>entry_ok 1,000, 응모 거절 0, 503 0, <code>POLL_SOLD_OUT</code> 2,000, entry-service consumer lag 최대 0. 대기 시간 p95 약 9~10초는 의도된 결과다. 1,000명을 초당 100명씩 입장시키므로 마지막 입장자는 10초를 기다리고, 응모 API 에 도달하는 부하는 초당 100건 이하로 제한된다(대기열이 응모 부하를 막는다는 근거).</p>
+
+<h3>S2 정원 조기 소진 · S3/S4 쿠폰</h3>
+<table>
+  <thead><tr><th style="width:34%">S2 결과</th><th>1차 (drop 10)</th><th>개선 후 (drop 13)</th></tr></thead>
+  <tbody>
+    <tr><td>entry_ok / DB</td><td>100 / 100</td><td>100 / 100</td></tr>
+    <tr><td>unexpected (로그인 실패)</td><td class="warn">647</td><td>0</td></tr>
+    <tr><td>entry_apply p99 / queue_enter p99</td><td>31.8 / 11.6ms</td><td>7.9 / 29.7ms</td></tr>
+    <tr><td>소진 후 입장 (<code>queue.admitted</code> 증가)</td><td>—</td><td>1,300 → 1,400 (정확히 100 후 멈춤)</td></tr>
+    <tr><td>추첨</td><td>won 10 / lost 90 PASS</td><td>won 10 / lost 90 PASS</td></tr>
+  </tbody>
+</table>
+<table>
+  <thead><tr><th style="width:15%">S3·S4 실행</th><th>조건</th><th>coupon_issue p50 / p95 / p99 (ms)</th><th>정합성</th></tr></thead>
+  <tbody>
+    <tr><td>1차 (7·8)</td><td>개선 전</td><td>전 요청 EOF·reset, gateway OOM 재시작</td><td>DB 75 / 165 (Redis 일치) PASS</td></tr>
+    <tr><td>9·10</td><td>P1·P2, 풀 200, 기동 직후</td><td class="num">728 / 803 / 834</td><td>500 / 200 PASS</td></tr>
+    <tr><td>17·18</td><td>풀 1000 + 가상 스레드, 기동 직후</td><td class="num">733 / 829 / 851</td><td>PASS (가설 기각)</td></tr>
+    <tr><td>25·26</td><td><b>풀 200 (최종), 워밍업 후</b></td><td class="num">113 / 183 / 204</td><td><span class="pass">PASS</span></td></tr>
+    <tr><td>27·28</td><td><b>풀 200 (최종), 워밍업 후 (2회째)</b></td><td class="num">19 / 133 / 160</td><td><span class="pass">PASS</span></td></tr>
+  </tbody>
+</table>
+<p class="small">발췌. 전체 9개 실행은 리포트 2장 S3·S4 표 참조. 모든 개선 후 실행에서 spike 202 = 500, <code>COUPON_SOLD_OUT</code> 2,500 / dup_burst 202 = 200, <code>COUPON_DUPLICATE</code> 800, unexpected 0.</p>
+
+<h3>S5 입장 배치 크기 비교 · S6 Redis 재시작</h3>
+<table>
+  <thead><tr><th style="width:18%">배치 (명/초)</th><th>queue_wait_ms p50 / p95 / p99</th><th>entry_apply p95 / p99 (ms)</th><th class="c" style="width:12%">정합성</th></tr></thead>
+  <tbody>
+    <tr><td>50</td><td class="num">10,517 / 19,073 / 20,022</td><td class="num">11.3 / 14.1</td><td class="c pass">PASS</td></tr>
+    <tr><td>100 (기본)</td><td class="num">6,009 / 9,012 / 9,016</td><td class="num">22.9 / 29.3</td><td class="c pass">PASS</td></tr>
+    <tr><td>500</td><td class="num">3,006 / 3,013 / 3,017</td><td class="num">15.1 / 18.2</td><td class="c pass">PASS</td></tr>
+  </tbody>
+</table>
+<p>정원 1,000 에서는 배치 500(초당 500건 응모)도 응모 p99 가 20ms 안쪽이라 응모 API 는 병목이 아니다. 배치를 키우면 대기 시간만 줄어든다.
+S6 에서는 응모 기간 중 <code>docker compose restart redis</code> 후 키 1,662개가 그대로였고 약 1초 내 응답했다. 서비스 4개는 Lettuce 가 자동 재연결했고 drop 12·13, coupon 27·28 재검증이 모두 PASS 했다. 단, 정상 종료(SIGTERM) 재시작이라 AOF everysec 의 "최대 1초 유실"은 드러나지 않았다.</p>
+
+<h2>7.4 병목 B1~B6</h2>
+<table>
+  <thead><tr><th style="width:5%">ID</th><th style="width:18%">현상</th><th style="width:33%">근거</th><th style="width:25%">원인</th><th>조치</th></tr></thead>
+  <tbody>
+    <tr><td>B1</td><td>gateway → 서비스 연결 폭주로 accept 큐 초과 (S2 로그인, S3 쿠폰)</td><td>5,000명 동시 로그인 중 <code>Connection reset</code> 647건. user-service <code>ListenOverflows</code> 7,745, <code>SyncookiesFailed</code> 647 (실패 수와 정확히 일치)</td><td>Spring Cloud Gateway 업스트림 풀 기본값 ELASTIC(상한 없음) → Tomcat <code>accept-count</code> 100 초과</td><td>P1</td></tr>
+    <tr><td>B2</td><td>gateway OOM kill (S3)</td><td>gateway 메모리 761.8/768MiB 정체 후 재기동, k6 전 요청 EOF·reset</td><td>힙 576MB 를 뺀 192MB 에 Netty 다이렉트 버퍼·메타스페이스·스레드 스택이 들어가지 못함</td><td>P2</td></tr>
+    <tr><td>B3</td><td>로그인이 BCrypt 동안 DB 커넥션 점유</td><td>3,000명 로그인 중 Hikari pending 최대 189, active 10(풀 전부)</td><td><code>@Transactional(readOnly=true)</code> 가 BCrypt 비교(약 50ms CPU) 동안 커넥션을 쥠</td><td>P3</td></tr>
+    <tr><td>B4</td><td>콜드 스타트(JIT) — 쿠폰 지연의 주원인</td><td>매진 쿠폰 발급(Kafka 없음) 재기동 직후 1~4회 p99 577 → 187 → 72 → 19ms. gateway health p99 11.6ms, 라우팅 경로 p99 50.0ms</td><td>트래픽이 0 에서 치솟는 첫 버스트가 콜드 JVM 에 떨어지면 지연 3~5배. 가상 스레드·로그 끄기·풀 크기 가설은 기각</td><td>워밍업 후 측정 규칙, 백로그 E-74</td></tr>
+    <tr><td>B5</td><td>서비스 컨테이너 OOM (쿠폰 14,000 동시)</td><td>coupon-service RSS 757/768MiB 정체 후 다음 버스트에서 재기동. 힙 사용 최대 176MB / 최대 576MB</td><td>G1 이 커밋한 힙을 바로 돌려주지 않아 RSS 가 한도 초과</td><td>P4</td></tr>
+    <tr><td>B6</td><td>단일 인스턴스 처리량 상한 (쿠폰 10,000 동시 이상)</td><td>클라이언트 p99 0.7~1.2s. 버스트 중 서버 평균 11~18ms, p99 33~78ms (평시 1~3ms). Kafka 를 거치지 않는 409 도 202 와 같은 수준으로 느려짐</td><td>Kafka 동기 대기는 주원인이 아님. 경로 공통 구간(Lettuce 공유 연결, 요청 스레드 200·CPU 경합, gateway 앞단 대기)이 후보이며 하나로 좁히지 못함</td><td>백로그 E-56</td></tr>
+  </tbody>
+</table>
+
+<h3>B6 상태별 분리 (Prometheus <code>http.server.requests</code>, 버스트 45초 구간)</h3>
+<table>
+  <thead><tr><th style="width:18%">실행</th><th>202 (Lua + Kafka ack) 평균 / p99</th><th>409 (Lua 만, Kafka 없음) 평균 / p99</th><th>건수 202 / 409</th></tr></thead>
+  <tbody>
+    <tr><td>X3</td><td class="num">18.3 / 77.2ms</td><td class="num">12.8 / 49.5ms</td><td class="num">2,475 / 9,900</td></tr>
+    <tr><td>X5</td><td class="num">11.3 / 33.1ms</td><td class="num">11.5 / 35.6ms</td><td class="num">3,600 / 13,275</td></tr>
+    <tr><td>X3 (P4 후)</td><td class="num">16.2 / 55.6ms</td><td class="num">18.4 / 53.4ms</td><td class="num">2,475 / 9,900</td></tr>
+  </tbody>
+</table>
+<p>처음 가설("Kafka 동기 대기가 스레드를 묶는다")은 이 분리 결과로 정정했다. 서비스 앞단(gateway 풀 200·Tomcat 스레드 200)에서의 대기는 서버 측 타이머에 잡히지 않으므로, 클라이언트 p99 와 서버 p99 의 차이(약 0.6~1.1s)가 앞단 대기다. 다음 확인 방법은 Lettuce 명령 지연(<code>lettuce.command.*</code>), Redis <code>INFO commandstats</code>·<code>SLOWLOG</code>, coupon-service 2개 비교다.</p>
+<p><b>관찰 — 로그인 처리량 상한</b>: BCrypt(strength 10) 로그인은 15코어 VM 에서 초당 약 235건이 상한이었다(user-service CPU 98%). 10,000명이 한꺼번에 로그인하면 약 42초가 걸리고 gateway 풀 대기 30초를 넘긴 2,670건이 <code>PoolAcquireTimeoutException</code> → 500 이 됐다(X1-1차). 확대 측정은 <code>LOGIN_SPREAD_SEC</code> 로 로그인을 분산했다.</p>
+
+<h2>7.5 개선 P1~P4 전후 비교</h2>
+<table>
+  <thead><tr><th style="width:27%">변경</th><th style="width:30%">지표</th><th class="num">전</th><th class="num">후</th><th>해석</th></tr></thead>
+  <tbody>
+    <tr><td>P1 gateway 풀 FIXED 200 + accept-count 1024</td><td>S2 로그인 실패 (5,000 동시)</td><td class="num">647 (12.9%)</td><td class="num">0</td><td>연결 리셋 제거</td></tr>
+    <tr><td>P1</td><td>user-service <code>ListenOverflows</code> / <code>SyncookiesFailed</code></td><td class="num">7,745 / 647</td><td class="num">0 / 0</td><td></td></tr>
+    <tr><td>P2 gateway 메모리 1024m, 힙 50%, 다이렉트 256m</td><td>S3 gateway 재시작 / 요청 실패</td><td class="num">1 / 4,000 (100%)</td><td class="num">0 / 0</td><td>이후 재시작 0, 최대 656MiB</td></tr>
+    <tr><td>P3 로그인 트랜잭션 제거</td><td>Hikari pending 최대 (3,000 로그인)</td><td class="num">189</td><td class="num">0</td><td>커넥션 고갈 제거. 처리량 상한은 CPU</td></tr>
+    <tr><td>P3</td><td>로그인 p99 (서버 측)</td><td class="num">3.35s</td><td class="num">2.92s</td><td></td></tr>
+    <tr><td>P4 서비스 힙 50%</td><td>쿠폰 14,000 동시 후 coupon-service 재시작 / RSS 최대</td><td class="num">1 / 757MiB</td><td class="num">0 / 644MiB</td><td>OOM 제거, GC 최대 정지 13ms</td></tr>
+    <tr><td>워밍업 규칙</td><td>S1 entry_apply p99</td><td class="num">136.5ms</td><td class="num">29.3ms</td><td>기동 직후 vs 워밍업 후</td></tr>
+    <tr><td>워밍업 규칙</td><td>S1 queue_enter p99</td><td class="num">162.8ms</td><td class="num">16.7ms</td><td></td></tr>
+    <tr><td>P1·P2 + 워밍업</td><td>S3 coupon_issue p99</td><td class="num">전부 실패</td><td class="num">153~204ms</td><td>목표 500ms 충족</td></tr>
+  </tbody>
+</table>
+
+<h2>7.6 확대 규모 (10,000 ~ 20,000명)</h2>
+<p>조건: P1~P3 반영, 워밍업 후, 로그인 분산(<code>LOGIN_SPREAD_SEC</code>, 측정 대상은 오픈·발급 이후 구간).</p>
+<h3>드로우 오픈</h3>
+<table>
+  <thead><tr><th style="width:9%">ID</th><th style="width:16%">USERS / M / K / 배치</th><th class="num">참여</th><th class="num">entry_ok / DB</th><th class="num">queue_enter p99</th><th class="num">entry_apply p50/p95/p99</th><th class="num">queue_wait p50 / p99</th><th style="width:24%">비고 / 추첨</th></tr></thead>
+  <tbody>
+    <tr><td class="nowrap">X1-1차</td><td>10,000 / 3,000 / 300 / 100, 분산 없음</td><td class="num">7,330</td><td class="num">3,000 / 3,000</td><td class="num">313</td><td class="num">6.3 / 18.5 / 25.4</td><td class="num">15.5s / 29.1s</td><td>로그인 2,670건 500. 추첨 PASS 300/2,700</td></tr>
+    <tr><td>X1</td><td>10,000 / 3,000 / 300 / 100</td><td class="num">10,000</td><td class="num">3,000 / 3,000</td><td class="num">43.3</td><td class="num">5.5 / 17.0 / 29.6</td><td class="num">15.5s / 30.1s</td><td>상태 폴링 최대 2,080 req/s. 추첨 PASS 300/2,700</td></tr>
+    <tr><td>X2</td><td>10,000 / 5,000 / 500 / 1,000</td><td class="num">10,000</td><td class="num">5,000 / 5,000</td><td class="num">443</td><td class="num">17.7 / 121 / 167</td><td class="num">5.0s / 5.1s</td><td><code class="nowrap">ENTRY_SOLD_OUT</code> 427. 추첨 PASS 500/4,500</td></tr>
+    <tr><td>X4</td><td>20,000 / 5,000 / 500 / 1,000</td><td class="num">16,294</td><td class="num">5,000 / 5,000</td><td class="num">506</td><td class="num">38 / 89 / 105</td><td class="num">5.0s / 5.2s</td><td>k6 측 연결 실패 3,706, <code class="nowrap">ENTRY_SOLD_OUT</code> 518. 추첨 PASS 500/4,500</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>정합성은 모든 확대 실행에서 PASS (초과·중복 0, Redis = DB = 랭킹, 추첨 결과 일치, lag 은 k6 종료 직후 0).</li>
+  <li>응모 API 는 초당 1,000건 입장에서도 서버 측 p99 7.6ms 였다. 클라이언트 측 p99 167ms 와의 차이는 gateway·포트 포워딩 구간이다.</li>
+  <li><code>ENTRY_SOLD_OUT</code> 427 / 518 은 입장 배치(1,000)가 남은 정원으로 잘리지 않아 생긴다. 응모 Lua 가 초과분을 거절하므로 정합성 문제는 없지만 사용자는 "입장했는데 매진"을 본다. 사용자 결정 E-34 의 관찰 결과다(배치 100 에서는 0건).</li>
+  <li>X4 의 3,706건은 macOS 임시 포트(약 16,000개) 고갈로 인한 부하 발생기 한계이며 서버에 도달하지 않았다.</li>
+</ul>
+
+<h3>쿠폰 스파이크</h3>
+<table>
+  <thead><tr><th style="width:13%">ID</th><th>USERS / 수량 (+ 중복 버스트 200×5)</th><th class="num">동시 요청</th><th class="num">coupon_issue p50/p95/p99</th><th class="num">burst p99</th><th>비고</th></tr></thead>
+  <tbody>
+    <tr><td>X3</td><td>10,000 / 2,000</td><td class="num">11,000</td><td class="num">548 / 679 / 693</td><td class="num">366</td><td><code>COUPON_SOLD_OUT</code> 8,000, DUPLICATE 800</td></tr>
+    <tr><td>X5</td><td>14,000 / 3,000</td><td class="num">15,000</td><td class="num">596 / 837 / 857</td><td class="num">230</td><td>직후 coupon-service RSS 757/768MiB → 다음 버스트에서 OOM kill (B5)</td></tr>
+    <tr><td>X3 (P4 후)</td><td>10,000 / 2,000</td><td class="num">11,000</td><td class="num">614 / 853 / 878</td><td class="num">405</td><td>재시작 0, coupon RSS 최대 644MiB</td></tr>
+    <tr><td>X5 (P4 후)</td><td>14,000 / 3,000</td><td class="num">15,000</td><td class="num">783 / 1,126 / 1,196</td><td class="num">523</td><td>gateway RSS 954/1024MiB</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>정합성은 전부 PASS (수량 초과 0, 사용자 중복 0, 중복 버스트 202 정확히 200, unexpected 0).</li>
+  <li><span class="warn">목표 p99 &lt; 500ms 는 10,000 동시 이상에서 미달</span>했다. 연결·스레드 200 개가 요청당 약 12ms 를 쓰면 인스턴스당 약 16,000 req/s 이고, 0.5초에 몰린 11,000~15,000건을 소화하는 데 0.7~0.9초가 걸린다는 계산이 클라이언트 p99 와 맞는다.</li>
+  <li>P4 전후의 p99 차이(693→878, 857→1,196)는 서버 측 지표로 설명되지 않아, 같은 조건 반복 간 편차로 보고 두 수치를 모두 적었다.</li>
+  <li>쿠폰은 대기열이 없어 동시 요청이 그대로 서비스에 닿는다. 대기열로 응모 부하를 초당 배치 수로 제한하는 드로우와 대조적이다.</li>
+</ul>
+
+<h2>7.7 결론</h2>
+<ul>
+  <li><b>정원·수량 초과 0, 중복 0</b> — 기본 규모 S1~S6 과 확대 규모 모든 실행에서 정합성 검증 PASS. 장애(gateway OOM) 중에도 Redis·DB 가 일치했고 보상은 0 이었다.</li>
+  <li><b>D1 Redis Lua 판정</b>: 정원·수량·중복을 원자적으로 지켰다. 응모 판정 서버 측 p99 는 초당 1,000건 입장에서도 8ms 안쪽이었다.</li>
+  <li><b>대기열</b>: 3,000~10,000명 동시 오픈에서 응모 API 부하를 초당 배치 수로 제한해 응모 p99 를 30ms 안쪽으로 유지했다. 배치 크기는 대기 시간과 맞바꾸는 손잡이이며, 이 환경에서는 배치 1,000 까지 응모 API 가 버텼다.</li>
+  <li><b>D2 "성공 = 발행 확정"</b>: 정합성을 지켰고 측정 범위에서 처리량 상한의 주원인은 아니었다(B6). 대기열이 없는 쿠폰 경로는 10,000 동시 이상에서 인스턴스 처리량 상한에 닿는다.</li>
+  <li><b>Redis AOF</b>: 재시작 후 응모·발급 상태를 유지했다(S6).</li>
+  <li><b>이번 단계에서 고친 것</b>: 업스트림 연결 폭주(P1), gateway OOM(P2), 로그인 커넥션 점유(P3), 서비스 OOM(P4).</li>
+</ul>
+
+<!-- ============ 8. 한계와 향후 과제 ============ -->
+<h1 class="chapter">8. 한계와 향후 과제</h1>
+
+<h2>8.1 측정의 한계</h2>
+<ul>
+  <li>단일 머신에서 k6·서비스·인프라가 함께 돌았다. Docker Desktop 포트 포워딩을 거치고, 호스트 임시 포트 상한(약 16,000 동시 연결)이 있다. VM 에 다른 프로젝트 컨테이너(약 1GB)가 함께 떠 있었다.</li>
+  <li>콜드 스타트 영향이 커서(B4) 수치가 "얼마나 데운 상태인가"에 민감하다. 같은 조건 반복 간 p99 편차가 수백 ms 까지 난다.</li>
+  <li>Redis 비정상 종료(<code>kill -9</code>) 중 쓰기 유실 실험과 DB 락 방식 비교(선택 과제)는 하지 않았다.</li>
+  <li>인프라는 단일 Kafka 브로커·단일 Redis 로컬 구성이다. 운영 수준 가용성(Kafka 3 브로커, Redis Sentinel/Cluster)은 범위 밖으로 두었다.</li>
+</ul>
+
+<h2>8.2 고도화 백로그 주요 항목</h2>
+<table>
+  <thead><tr><th style="width:7%">ID</th><th style="width:24%">항목</th><th style="width:30%">근거</th><th>선택지 / 권장</th><th style="width:9%">우선순위</th></tr></thead>
+  <tbody>
+    <tr><td>E-56</td><td>쿠폰 피크 발급 경로 처리량 상한 (B6)</td><td>11,000 동시 p99 693~878ms, 15,000 동시 857~1,196ms. 409 경로 비용이 202 와 같음</td><td>① coupon-service 수평 확장(설계 변경 없음) ② 가상 스레드 + gateway 풀 확대(미검증) ③ 발행 비동기화(D2 변경, 사용자 결정 대상) ④ 매진 이후 경로 단축(로컬 매진 플래그 TTL 200ms~1s). 4 가 1 과 함께 유력</td><td>중간</td></tr>
+    <tr><td>E-72</td><td>gateway 풀 대기 초과가 500 으로 나감 (의미상 503)</td><td>X1-1차 2,670건 500 (<code>PoolAcquireTimeoutException</code>)</td><td>해당 예외만 503 + <code>Retry-After</code> 로 변환(권장), 대기 시간·대기 수 상한, 경로별 rate limit</td><td>중간</td></tr>
+    <tr><td>E-73</td><td>gateway 메모리·동시 연결 상한, gateway 메트릭 미수집</td><td>15,000 동시에서 RSS 954/1024MiB. gateway 는 단일 장애점</td><td>관리 포트 분리 후 풀 메트릭 수집 → 동시 요청 상한 + 빠른 거절 순서</td><td>중간</td></tr>
+    <tr><td>E-74</td><td>콜드 스타트(JIT) — 첫 버스트 지연 3~5배</td><td>재기동 직후 p99 577 → 19ms, S3 834ms vs 153~204ms</td><td>오픈 전 사전 요청 운영 절차(권장), 기동 시 자체 워밍업, CDS/AOT 캐시(JIT 프로파일 저장은 JDK 24 이후)</td><td>중간</td></tr>
+    <tr><td>E-75</td><td>로그인 처리량 상한 (BCrypt 약 235건/초)</td><td>user-service CPU 98%, 10,000명 동시 로그인 약 42초</td><td>user-service 수평 확장, 로그인 빈도 줄이기. strength 낮추기는 권하지 않음. 현재 규모에서는 불필요</td><td>낮음</td></tr>
+    <tr><td>E-76</td><td>커스텀 카운터 — 발생 전에는 시리즈가 없음</td><td>T8-13 "보상 시리즈 자체가 생성되지 않음"이 "배선 안 됨"과 구분되지 않음</td><td>enum 별 카운터를 미리 등록(관측 명확성 목적), 또는 쿼리에 <code>or vector(0)</code></td><td>낮음</td></tr>
+  </tbody>
+</table>
+
+<h2>8.3 사용자 결정이 필요한 사항 — E-34 입장 배치와 잔여 정원</h2>
+<p>현재 정책은 "주기당 N명 유지, 잔여 정원과 무관"(사용자 결정)이다. 8단계에서 소진 직전 <code>ENTRY_SOLD_OUT</code> 수를 관찰했다.</p>
+<table>
+  <thead><tr><th style="width:12%">실행</th><th>사용자 / 정원 M / 배치</th><th class="num"><code>ENTRY_SOLD_OUT</code></th><th class="c">정합성</th></tr></thead>
+  <tbody>
+    <tr><td>S1</td><td>3,000 / 1,000 / 100</td><td class="num">0</td><td class="c pass">PASS</td></tr>
+    <tr><td>X1</td><td>10,000 / 3,000 / 100</td><td class="num">0</td><td class="c pass">PASS</td></tr>
+    <tr><td>X2</td><td>10,000 / 5,000 / 1,000</td><td class="num">427</td><td class="c pass">PASS</td></tr>
+    <tr><td>X4</td><td>20,000 / 5,000 / 1,000</td><td class="num">518</td><td class="c pass">PASS</td></tr>
+  </tbody>
+</table>
+<p>배치 1,000 에서는 마지막 배치 입장자의 약 43~52% 가 "입장했는데 매진"을 본다. 초과 응모는 0 이다. 정책 재검토 선택지는 다음과 같고 결정은 사용자 몫으로 남겼다.</p>
+<ol>
+  <li><b>현재 정책 유지</b>: 배치를 키우는 운영에서만 생기는 현상으로 보고 클라이언트 문구로 다룬다. 비용 0.</li>
+  <li><b><code>n = min(N, remaining)</code></b>: 427·518 이 대부분 사라질 것으로 본다(추정, 0 은 아님). 대가는 입장자가 응모하지 않으면 정원 채우는 속도가 느려지는 것과 설계 문서 "주기당 N명" 변경.</li>
+  <li><b><code>n = min(N, remaining × α)</code></b> (α 1.1~1.2): 채우는 속도와 매진 체감 사이에서 고른다. α 의 근거가 될 "입장 후 미응모 비율"을 아직 재지 않았다.</li>
+</ol>
+
+<h2>8.4 그 밖의 향후 과제</h2>
+<ul>
+  <li>B6 원인 확정: Lettuce 명령 지연, Redis <code>INFO commandstats</code>·<code>SLOWLOG</code>, coupon-service 2개 비교.</li>
+  <li>Redis 비정상 종료 실험으로 AOF everysec 의 실제 유실 범위 확인.</li>
+  <li>드로우 이벤트 전파를 더 확실히 하려면 커밋 후 발행 + 재발행 API 를 Outbox 로 전환하는 선택지가 남아 있다(D4).</li>
+</ul>
+
+<!-- ============ 부록 ============ -->
+<h1 style="margin-top:8mm">부록</h1>
+
+<h2>A. 실행 방법</h2>
+<h3>A.1 인프라만 띄우고 IDE 에서 서비스 실행</h3>
+<pre class="code"># PostgreSQL, Redis, Kafka, Kafka UI(:8090), kafka-init(토픽 사전 생성)
+docker compose up -d</pre>
+<h3>A.2 서비스 7개를 컨테이너로 띄우기</h3>
+<pre class="code"># JWT 서명 키 (user-service 서명, gateway 검증 — 32바이트 이상)
+export JWT_SECRET=$(openssl rand -base64 48)
+
+# 서비스 jar 빌드
+./gradlew clean bootJar
+
+# 인프라 + app 프로필 기동, healthy 대기, 내부 포트 비노출·헤더 위조 차단 점검(T8-01~03)
+scripts/loadtest-up.sh --build</pre>
+<p class="small">외부에는 gateway(:8080)만 노출된다. 관리자 계정이 필요하면 <code>ADMIN_EMAIL</code> / <code>ADMIN_PASSWORD</code> 를 설정한다(해당 이메일 계정이 없을 때만 ADMIN 으로 생성).</p>
+<h3>A.3 모니터링 · 시연 페이지</h3>
+<pre class="code"># Prometheus + Grafana → http://localhost:3000
+docker compose --profile monitoring up -d
+
+# 시연 페이지 → http://localhost:8000 (app 프로필 서비스가 떠 있어야 API 가 동작)
+# 대기 순번이 줄어드는 모습을 보이려면 입장 배치를 작게: QUEUE_ADMISSION_BATCH_SIZE=3 scripts/loadtest-up.sh
+docker compose --profile demo up -d demo</pre>
+<p>시연 페이지는 nginx 가 정적 파일(<code>demo/</code>)을 서빙하고 <code>/api</code> 를 gateway 로 프록시한다(백엔드 변경 없음). 오른쪽 API 로그 패널에 요청·응답 코드·지연이 시간순으로 남는다. 관리자 탭의 "가상 사용자 투입"은 테스트 계정 N명을 오픈 시각에 대기열로 보내 순번 감소와 매진을 재현한다.</p>
+<figure class="shot"><img src="images/demo-queue.png" alt="드로우 대기열 화면"><figcaption>그림 A-1. 드로우 #26 — 가상 사용자 40명 투입 후 대기 중(앞 28명), 오른쪽은 API 로그</figcaption></figure>
+<figure class="shot"><img src="images/demo-coupon.png" alt="쿠폰 발급 화면"><figcaption>그림 A-2. 쿠폰 #44 — 발급 202 후 재요청 409 COUPON_DUPLICATE("이미 발급"), 내 쿠폰 목록</figcaption></figure>
+<h3>A.4 정합성 검증</h3>
+<pre class="code">scripts/verify-drop.sh &lt;dropId&gt; --expect &lt;entry_ok&gt;   # 마감 전
+scripts/verify-drop.sh &lt;dropId&gt; --after-draw           # 추첨 후
+scripts/verify-coupon.sh &lt;eventId&gt; --expect &lt;n&gt;</pre>
+
+<h2>B. 문서 목록</h2>
+<table>
+  <thead><tr><th style="width:56%">경로</th><th>내용</th></tr></thead>
+  <tbody>
+    <tr><td><code>docs/design/README.md</code></td><td>설계 문서 인덱스, 전체 사용자 흐름</td></tr>
+    <tr><td><code>docs/design/01-requirements/requirements.md</code></td><td>요구사항 정의서</td></tr>
+    <tr><td><code>docs/design/02-architecture/architecture.md</code></td><td>서비스 책임, Kafka 토픽, Redis 키 소유권, 인증</td></tr>
+    <tr><td><code>docs/design/02-architecture/layered-architecture.md</code></td><td>4계층, 엄격한 DIP, 모델 비노출, ArchUnit R1~R7</td></tr>
+    <tr><td><code>docs/design/03-infrastructure/infrastructure.md</code></td><td>기술 스택, docker-compose 구성, 환경변수</td></tr>
+    <tr><td><code>docs/design/04-non-functional/concurrency-consistency.md</code></td><td>동시성·정합성 결정 D1~D7</td></tr>
+    <tr><td><code>docs/design/05-features/*.md</code></td><td>기능별 설계 (드로우 등록, 대기열, 응모, 추첨, 쿠폰, 랭킹)</td></tr>
+    <tr><td><code>docs/design/06-erd/erd.md</code></td><td>서비스별 ERD</td></tr>
+    <tr><td><code>docs/design/07-class-diagram/class-diagram.md</code></td><td>서비스별 4계층 클래스 구조</td></tr>
+    <tr><td><code>docs/design/08-sequence-diagram/sequence-diagram.md</code></td><td>인증, 드로우 전체 흐름, 쿠폰, 랭킹, 장애 시나리오</td></tr>
+    <tr><td><code>docs/plan/implementation-plan.md</code></td><td>전체 순서(0~8단계), 진행 현황, 미결정 사항 처리</td></tr>
+    <tr><td><code>docs/plan/phases/phase-{0..8}-*.md</code></td><td>단계별 구현 상세 (파일 목록, 시그니처, Lua·SQL·설정, 테스트 ID, 커밋 계획)</td></tr>
+    <tr><td><code>docs/plan/enhancement-backlog.md</code></td><td>고도화 백로그 E-01~E-76</td></tr>
+    <tr><td><code>docs/report/load-test-report.md</code></td><td>부하 테스트 리포트 (이 보고서 7장의 원문)</td></tr>
+    <tr><td><code>docs/report/final-report.html</code></td><td>이 보고서의 원본</td></tr>
+  </tbody>
+</table>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'neutral',
+    securityLevel: 'loose',
+    fontFamily: '"Apple SD Gothic Neo", "Noto Sans KR", sans-serif',
+    flowchart: { useMaxWidth: true, htmlLabels: true },
+    sequence: { useMaxWidth: true, mirrorActors: false }
+  });
+</script>
+</body>
+</html>
