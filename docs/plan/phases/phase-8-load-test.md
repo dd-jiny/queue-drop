@@ -11,6 +11,7 @@
 | v1.5 | 2026-11-17 | 판정 메트릭 기록 방식(컨트롤러에서 기록, 핸들러 아님), 보상 Lua 실패 시 미집계, ArchUnit R3 `io.micrometer..` |
 | v1.6 | 2026-11-17 | 3.4 구현 기준 메모(k6 2.4.0, iterationInTest 매핑, RESULTS_DIR, 입력 가드, 재시도 소진 분류 등), S2 queue_sold_out 합계 해석, 앱만 내리는 명령 |
 | v1.7 | 2026-11-17 | k6 정합성 실패 판정 임계값(count==0 / ==DUP_USERS / <=CAPACITY), login_late, queue_closed·POLL_SOLD_OUT 분리 |
+| v1.8 | 2026-11-17 | 3.5 검증 스크립트 구현 기준(종료 코드, --expect/--wait-sec, SKIP 규칙(drawn_at+TTL 경과 시만, 랭킹은 dedupe Set 대조), 추가 검사, 실행 순서) |
 
 ---
 
@@ -772,6 +773,14 @@ export function handleSummary(data) {
 
 ### 3.5 결과 검증 스크립트
 
+> **구현 기준 (v1.8)**: 실제 스크립트는 `scripts/verify-drop.sh`·`verify-coupon.sh`·`kafka-lag.sh` 가 기준이며 아래는 초안이다. 달라진 점:
+> - 종료 코드: 판정 실패·조회 불가(없는 id, DB/Redis 다운) 1, 인자 오류 2. 옵션 `--wait-sec N`(DB 건수·랭킹 점수·DRAWN 대기에 각각 적용), `--expect N`(drop: k6 `entry_ok` 와 DB 응모 수 대조, coupon: DB 발급 수 == N — S4 는 `--expect DUP_USERS`).
+> - `--key-ttl-sec N`(기본 86400, `entry.draw.key-ttl-after-draw` 와 일치). 추가 검사: `entry:{id}:persisted`·`coupon:{id}:persisted` 크기 == DB 건수 (claim 이 막은 유령 이벤트가 없는지). Redis 값은 키 그룹별 EVAL 한 번으로 읽어 시점을 맞춘다. 조회 실패는 ERR trap 으로 exit 1. `kafka-lag.sh` 는 LAG `-`(커밋 오프셋 없음) 파티션 수를 출력하고 0 이 아니면 WARN.
+> - `--after-draw` 는 DRAWN 이 될 때까지 대기한다. 추가 검사: 당첨+낙첨 == DB 응모 수, `draw_results.applicant_count` == DB 응모 수, `draw_results.winner_count` == WON 수, Redis 잔여 ≥ 0.
+> - 응모 Redis 키가 없을 때: `draw_results.drawn_at + key-ttl-after-draw(1d)` 가 지났을 때만 만료로 보고 **SKIP**, 그 전에 없으면(DRAWN 이어도) 유실로 **FAIL** — T8-11(Redis 재시작)이 추첨 후에 실행돼도 유실을 잡기 위함. 쿠폰 키는 만료가 없어 없으면 FAIL.
+> - 랭킹 점수: 마감 전에는 `rank:drop:popular` 점수가 DB 응모 수와 같아질 때까지 대기 후 대조. 마감 후(lazy 제거 가능)에는 `rank:dedupe:{dropId}` 크기로 대조하고, 둘 다 없을 때만 SKIP. 주간 사용자 랭킹은 드로우별로 대조할 수 없어 검사하지 않는다.
+> - **실행 순서 (확정)**: 인기 랭킹은 마감 후 조회 시 드로우를 지운다. REQ-RANK-03 까지 확인하려면 **k6 종료 직후, 마감 전·랭킹 조회 전에** `verify-drop.sh <id> --expect <entry_ok>` 를 먼저 실행하고, 추첨 후 `--after-draw` 를 다시 실행한다.
+
 #### `scripts/verify-drop.sh`
 ```bash
 #!/usr/bin/env bash
@@ -828,7 +837,7 @@ fi
 exit $FAIL
 ```
 > k6 요약의 `entry_ok` 카운트(성공 응답 수)도 DB 응모 수와 같아야 한다.
-> **실행 시점**: 추첨이 끝나면 응모 Redis 키(`entry:{dropId}:*`)가 1일 뒤 만료된다 (`entry.draw.key-ttl-after-draw: 1d`). S6(Redis 재시작)·`--after-draw` 검사는 추첨 후 1일 안에 실행한다 (만료 뒤에는 Redis 쪽 검사가 FAIL 로 나온다). 스크립트 출력과 k6 결과 JSON 을 리포트에서 함께 대조한다.
+> **실행 시점**: 추첨이 끝나면 응모 Redis 키(`entry:{dropId}:*`)가 1일 뒤 만료된다 (`entry.draw.key-ttl-after-draw: 1d`). S6(Redis 재시작)·`--after-draw` 검사는 추첨 후 1일 안에 실행한다 (만료 시각이 지난 뒤에는 Redis 쪽 검사가 SKIP, 그 전에 키가 없으면 FAIL). 스크립트 출력과 k6 결과 JSON 을 리포트에서 함께 대조한다.
 
 #### `scripts/verify-coupon.sh`
 ```bash
