@@ -45,6 +45,7 @@
 - **우선순위**: 중간 — 정상 상황에서는 영향이 없다. 장애 전파를 막는 기본값이므로 비용 대비 효과가 크다.
 - **영향 범위**: 4개 서비스 `application.yml`, `phase-0-foundation.md` 3.9, phase-3·6·7 문서
 - **처리 (coupon)**: 6단계 착수 전 `coupon-service` 에 `spring.data.redis.timeout: 1s` 반영 결정 (phase-6 v1.4). queue·ranking 은 남음.
+- **처리 (ranking)**: 7단계 착수 전 `ranking-service` 에 `spring.data.redis.timeout: 1s` 반영 결정 — Redis 예외는 `RankingStoreUnavailableException`, 조회는 503 `RANKING_TEMPORARILY_FAILED` (phase-7 v1.2). queue 는 남음.
 
 ### E-04 동기 발행 구간이 Tomcat 스레드를 잡아 Kafka 지연이 처리량 상한이 됨
 - **단계/위치**: phase-0 공통 producer 설정, phase-4/6 `send().get(3.5s)`
@@ -256,6 +257,7 @@
   4. ranking 이 닉네임이 없을 때 user-service 를 동기 조회한다. 서비스 간 동기 호출이 새로 생기고 랭킹 조회 지연이 user-service 상태에 묶이므로 권하지 않는다.
 - **우선순위**: 중간 — 7단계 랭킹 화면의 완성도와 8단계 리포트에 영향을 준다. 1은 7단계 시작 전(또는 2단계 재발행 API 와 같이) 넣으면 싸다.
 - **영향 범위**: user-service presentation/application(재발행 유스케이스), gateway 공개/관리자 경로, `phase-7-ranking.md` 리스크·복구 절, `infra/kafka/create-topics.sh`(2를 고르면), `phase-8-load-test.md` 준비 절차
+- **참고 (2026-11-17)**: 7단계 v1.2 에서 표시 fallback 을 설계(ranking.md)와 통일했다 — 닉네임이 없으면 `null` 이 아니라 `user-{id}`, 제목이 없으면 `drop-{id}`. 위 "현상"의 `null` 은 작성 당시 계획 기준이다. 유실 문제 자체는 그대로다.
 
 ### E-19 가입 경로의 쿼리 수와 users 인덱스
 - **단계/위치**: phase-1, `UserService.java:42, 56`, `UserRepositoryImpl.java:25`, `V1__create_users.sql:8`
