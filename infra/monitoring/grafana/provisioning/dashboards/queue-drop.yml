@@ -1,0 +1,8 @@
+apiVersion: 1
+providers:
+  - name: queue-drop
+    folder: queue-drop
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards

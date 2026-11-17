@@ -1,5 +1,7 @@
 server:
   port: 8085
+  tomcat:
+    accept-count: ${TOMCAT_ACCEPT_COUNT:1024}   # 기본 100 → 스파이크 시 listen backlog 초과로 연결 리셋 (phase-8 #8 P1)
 
 spring:
   application:
@@ -10,14 +12,66 @@ spring:
     password: ${DB_PASSWORD:queuedrop}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate        # 스키마는 Flyway 가 만든다. 엔티티와 불일치 시 기동 실패
     open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
   data:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+      timeout: 1s                # 명령 타임아웃 (Lettuce 기본 60초). 응모 응답 경로가 Redis 장애에 오래 묶이지 않게
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3)
+      acks: all
+      retries: 2147483647          # 횟수가 아니라 delivery.timeout.ms 로 전체 시간을 제한
+      properties:
+        enable.idempotence: true
+        request.timeout.ms: 1000
+        delivery.timeout.ms: 3000
+        max.block.ms: 1000         # send() 호출 자체의 블로킹 상한 (기본 60초)
+        linger.ms: 0               # Kafka 4.0 클라이언트 기본값 5ms. 응답 경로에 배치 대기를 넣지 않는다
     consumer:
-      group-id: entry-service
+      group-id: ${spring.application.name}
       auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.trusted.packages: com.queuedrop.common.event
+    listener:
+      ack-mode: record             # 레코드 단위로 처리 성공 후 커밋
+      concurrency: 3               # entry.created 파티션 6 → 인스턴스 2개 기준 3씩. drop.created(파티션 1)는 1개만 일함
+
+entry:
+  publish:
+    await-timeout: 3500ms          # delivery.timeout.ms(3000) + 여유
+  draw:
+    scheduler-enabled: true        # false 면 DrawScheduler 빈을 만들지 않는다 (테스트용)
+    interval-ms: 5000              # 추첨 스케줄러 주기
+    closing-warn-threshold: 5m     # CLOSING 장기화 경고 기준 (경고 후 관리자 수동 추첨, D5-1)
+    key-ttl-after-draw: 1d         # 추첨 커밋 후 응모 Redis 키 만료 (E-42)
+
+# Actuator · 메트릭 (phase-8 3.2)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99

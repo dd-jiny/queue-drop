@@ -1,0 +1,5 @@
+# e2e 프로필 (phase-5 3.6): 관리자 계정 시드. e2e-test DropFlowE2ETest 의 기본값과 같아야 한다
+queuedrop:
+  admin:
+    email: e2e-admin@queuedrop.dev
+    password: e2e-admin-password

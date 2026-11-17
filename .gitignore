@@ -22,3 +22,7 @@ out/
 
 ### env ###
 .env
+
+### load test ###
+# k6 handleSummary JSON 은 실행마다 새로 생기는 산출물이라 커밋하지 않는다 (리포트에는 수치만 옮긴다). 검증 스크립트 출력(.txt 등)은 커밋 가능
+docs/report/results/*.json

@@ -1,0 +1,4 @@
+# e2e 프로필 (phase-5 3.6): 마감 후 추첨을 빠르게 감지한다
+entry:
+  draw:
+    interval-ms: 1000

@@ -1,5 +1,7 @@
 server:
   port: 8083
+  tomcat:
+    accept-count: ${TOMCAT_ACCEPT_COUNT:1024}   # 기본 100 → 스파이크 시 listen backlog 초과로 연결 리셋 (phase-8 #8 P1)
 
 spring:
   application:
@@ -10,6 +12,47 @@ spring:
       port: ${REDIS_PORT:6379}
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3)
+      acks: all
+      retries: 2147483647          # 횟수가 아니라 delivery.timeout.ms 로 전체 시간을 제한
+      properties:
+        enable.idempotence: true
+        request.timeout.ms: 1000
+        delivery.timeout.ms: 3000
+        max.block.ms: 1000         # send() 호출 자체의 블로킹 상한 (기본 60초)
     consumer:
-      group-id: queue-service
+      group-id: ${spring.application.name}
       auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.trusted.packages: com.queuedrop.common.event
+
+queue:
+  admission:
+    interval-ms: 1000         # 입장 주기
+    batch-size: 100           # 주기당·드로우당 입장 인원 N (1~1000)
+    token-ttl-seconds: 300    # 입장 토큰 TTL
+    scheduler-enabled: true   # false 면 AdmissionScheduler 빈을 만들지 않는다 (테스트에서 admit() 직접 호출)
+
+# Actuator · 메트릭 (phase-8 3.2)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99
