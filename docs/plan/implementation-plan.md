@@ -13,6 +13,8 @@
 | v1.7 | 2026-11-16 | 4단계 착수: 사용자 결정 2건(E-34 주기당 N명 유지, E-39 해시 태그 미적용) 4장 표에 추가 |
 | v1.8 | 2026-11-17 | 4단계 사용자 결정 2건(E-40 요청 ID·저장 확정 기반 유령 이벤트 대응, E-41 Redis 타임아웃 시 보상 후 503) 4장 표에 추가 |
 | v1.9 | 2026-11-17 | 4단계 완료: 진행 현황·체크리스트 갱신 (entry-service 테스트 223건, 전체 빌드, 로컬 compose 에서 등록 → 진입 → 입장 → 응모 202 → 내 응모 조회 확인) |
+| v2.0 | 2026-11-17 | 5단계 착수: 추첨 건수 불일치 정책 확정(사용자 결정, 관리자 수동 추첨) |
+| v2.1 | 2026-11-17 | 5단계 완료: 진행 현황·완료 조건 갱신 |
 
 ---
 
@@ -89,7 +91,7 @@ flowchart LR
 | 2. 드로우 | `feat/phase-2-drop` | [phase-2-drop.md](phases/phase-2-drop.md) | ✅ 완료 (2026-11-16) |
 | 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ✅ 완료 (2026-11-16) |
 | 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ✅ 완료 (2026-11-17) |
-| 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ⬜ 대기 |
+| 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ✅ 완료 (2026-11-17) |
 | 6. 쿠폰 | `feat/phase-6-coupon` | [phase-6-coupon.md](phases/phase-6-coupon.md) | ⬜ 대기 |
 | 7. 랭킹 | `feat/phase-7-ranking` | [phase-7-ranking.md](phases/phase-7-ranking.md) | ⬜ 대기 |
 | 8. 검증 | `test/phase-8-load-test` | [phase-8-load-test.md](phases/phase-8-load-test.md) | ⬜ 대기 |
@@ -253,15 +255,15 @@ flowchart LR
   - [ ] `DrawCompletedListener` → `Drop.markDrawn()`
 
 **결정 필요**
-- [ ] 건수 불일치가 계속될 때: **경고 후 관리자 수동 확정** (기본안) vs 일정 시간 후 강제 추첨
+- [x] 건수 불일치가 계속될 때: **경고 후 관리자 수동 확정** (사용자 결정, 2026-11-17)
 
 **완료 조건**
-- [ ] 단위(`Drawer`): 같은 시드 → 같은 결과, K ≥ 응모자 수 → 전원 당첨, 응모자 0 → 당첨 0
-- [ ] 통합: 스케줄러 2개 동시 실행 → `draw_results` 1건 (중복 추첨 없음)
-- [ ] 통합: DB 응모 수가 부족한 상태 → 추첨 대기, 저장 완료 후 다음 주기에 추첨
-- [ ] 통합: 마감 후 응모 → `CLOSED`
-- [ ] 통합: 추첨 후 product 드로우 상태 `DRAWN`
-- [ ] **E2E: 드로우 등록 → 대기열 → 응모 → 마감 → 추첨 → 결과 조회** 시나리오 1회 통과
+- [x] 단위(`Drawer`): 같은 시드 → 같은 결과, K ≥ 응모자 수 → 전원 당첨, 응모자 0 → 당첨 0
+- [x] 통합: 스케줄러 2개 동시 실행 → `draw_results` 1건 (중복 추첨 없음)
+- [x] 통합: DB 응모 수가 부족한 상태 → 추첨 대기, 저장 완료 후 다음 주기에 추첨
+- [x] 통합: 마감 후 응모 → `CLOSED`
+- [x] 통합: 추첨 후 product 드로우 상태 `DRAWN`
+- [x] **E2E: 드로우 등록 → 대기열 → 응모 → 마감 → 추첨 → 결과 조회** 시나리오 1회 통과
 
 ---
 
@@ -350,6 +352,6 @@ flowchart LR
 | 판정 Lua 응답 타임아웃 (E-41) | 4단계 | Redis 예외 → `GateUnavailableException`, 같은 eventId 로 보상 시도 후 503 `ENTRY_TEMPORARILY_FAILED`. 보상까지 실패한 경우의 대조는 5단계에서 판단 | ✅ 확정(사용자 결정) (2026-11-17) |
 | 쿠폰 저장 전 Redis 발급 확인 | 6단계 | 확인 후 없으면 저장 스킵 (초과 발급 방지) | ✅ 확정 (2026-11-16) |
 | 에러 계약 (헤더 누락 상태 코드, 코드 명명, 상세 메시지 노출) | 0단계 | `COMMON_MISSING_USER_HEADER`(400), `{SERVICE}_{REASON}`, 응답 메시지 고정·상세는 로그만 | ✅ 확정 (2026-11-16) |
-| 추첨 건수 불일치 장기화 | 5단계 | 경고 후 관리자 수동 확정 | 미결정 |
+| 추첨 건수 불일치 장기화 | 5단계 | 경고 후 관리자 수동 추첨 API (`POST /api/entries/admin/drops/{dropId}/draw`, DB 응모 기준). Redis∖DB 대조(E-41 개선안 2)는 만들지 않음 | ✅ 확정(사용자 결정) (2026-11-17) |
 | 인기 드로우 랭킹 범위 | 7단계 | 진행 중 드로우만 | 미결정 |
 | 랭킹 동점 처리 | 7단계 | member 사전순 | 미결정 |

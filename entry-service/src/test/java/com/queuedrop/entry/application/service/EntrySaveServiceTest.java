@@ -4,17 +4,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.queuedrop.entry.application.dto.EntrySaveCommand;
 import com.queuedrop.entry.application.port.CompensationResult;
 import com.queuedrop.entry.application.service.fake.FakeEntryGate;
+import com.queuedrop.entry.application.service.fake.InMemoryDropSnapshotRepository;
 import com.queuedrop.entry.application.service.fake.InMemoryEntryRepository;
+import com.queuedrop.entry.domain.model.DropSnapshot;
 import com.queuedrop.entry.domain.model.Entry;
 import com.queuedrop.entry.domain.model.EntryStatus;
+import com.queuedrop.entry.domain.model.SnapshotStatus;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
+import java.util.Set;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.slf4j.LoggerFactory;
 
 class EntrySaveServiceTest {
 
@@ -25,15 +39,43 @@ class EntrySaveServiceTest {
     private static final Instant OPEN_AT = Instant.parse("2026-11-16T10:00:00Z");
     private static final Instant CLOSE_AT = Instant.parse("2026-11-16T12:00:00Z");
 
+    private static final String LATE_LOST_WARN = "late entry saved as LOST after draw";
+
+    private InMemoryDropSnapshotRepository snapshotRepository;
     private InMemoryEntryRepository entryRepository;
     private FakeEntryGate entryGate;
     private EntrySaveService service;
+    private Logger serviceLogger;
+    private ListAppender<ILoggingEvent> logs;
 
     @BeforeEach
     void setUp() {
-        entryRepository = new InMemoryEntryRepository();
+        snapshotRepository = new InMemoryDropSnapshotRepository();
+        entryRepository = new InMemoryEntryRepository(snapshotRepository);
         entryGate = new FakeEntryGate();
         service = new EntrySaveService(entryRepository, entryGate);
+        serviceLogger = (Logger) LoggerFactory.getLogger(EntrySaveService.class);
+        logs = new ListAppender<>();
+        logs.start();
+        serviceLogger.addAppender(logs);
+    }
+
+    @AfterEach
+    void tearDown() {
+        serviceLogger.detachAppender(logs);
+        logs.stop();
+    }
+
+    private List<String> warnMessages() {
+        return logs.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage)
+                .toList();
+    }
+
+    private void givenSnapshot(SnapshotStatus status) {
+        snapshotRepository.saveIfAbsent(DropSnapshot.register(DROP_ID, 100, 10, OPEN_AT, CLOSE_AT));
+        snapshotRepository.forceStatus(DROP_ID, status);
     }
 
     private static EntrySaveCommand command(String eventId, int seq) {
@@ -190,5 +232,68 @@ class EntrySaveServiceTest {
         assertThat(entryRepository.count()).isEqualTo(1);
         assertThat(entryRepository.findByDropIdAndUserId(DROP_ID, USER_ID).orElseThrow().getEntrySeq())
                 .isEqualTo(2);
+    }
+
+    // ---------------------------------------------------------------- T5-35 (E-48 추첨 후 늦게 저장되는 응모)
+
+    @Test
+    @DisplayName("[T5-35] 추첨이 끝난(DRAWN) 드로우의 늦은 응모는 LOST 로 저장되고 WARN 1줄(dropId·userId·eventId)을 남긴다")
+    void lateEntryAfterDrawSavedAsLostWithWarn() {
+        // Given
+        givenSnapshot(SnapshotStatus.DRAWN);
+        entryGate.givenApplicant(DROP_ID, USER_ID, EVENT_ID);
+
+        // When
+        service.save(command(EVENT_ID, 3));
+
+        // Then
+        assertThat(entryRepository.findByDropIdAndUserId(DROP_ID, USER_ID).orElseThrow().getStatus())
+                .isEqualTo(EntryStatus.LOST);
+        assertThat(warnMessages()).singleElement().satisfies(msg -> assertThat(msg)
+                .contains(LATE_LOST_WARN)
+                .contains("dropId=" + DROP_ID)
+                .contains("userId=" + USER_ID)
+                .contains("eventId=" + EVENT_ID));
+    }
+
+    @ParameterizedTest(name = "snapshot={0}")
+    @NullSource
+    @EnumSource(value = SnapshotStatus.class, names = {"OPEN", "CLOSING"})
+    @DisplayName("[T5-35] 추첨 전(OPEN·CLOSING)·스냅샷 없음(null)이면 APPLIED 로 저장되고 WARN 이 없다")
+    void entryBeforeDrawNoWarn(SnapshotStatus status) {
+        // Given
+        if (status != null) {
+            givenSnapshot(status);
+        }
+        entryGate.givenApplicant(DROP_ID, USER_ID, EVENT_ID);
+
+        // When
+        service.save(command(EVENT_ID, 1));
+
+        // Then
+        assertThat(entryRepository.findByDropIdAndUserId(DROP_ID, USER_ID).orElseThrow().getStatus())
+                .isEqualTo(EntryStatus.APPLIED);
+        assertThat(warnMessages()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[T5-35] DRAWN 드로우라도 이미 저장된 응모(ALREADY_EXISTS)의 재전달은 WARN 없이 기존 상태를 유지한다")
+    void redeliveryAfterDrawNoWarn() {
+        // Given: 추첨 전에 저장되어 추첨으로 WON 이 된 응모
+        givenSnapshot(SnapshotStatus.OPEN);
+        entryGate.givenApplicant(DROP_ID, USER_ID, EVENT_ID);
+        service.save(command(EVENT_ID, 1));
+        entryRepository.markResults(DROP_ID, Set.of(USER_ID));
+        snapshotRepository.forceStatus(DROP_ID, SnapshotStatus.DRAWN);
+        logs.list.clear();
+
+        // When: 같은 이벤트 재전달
+        service.save(command(EVENT_ID, 1));
+
+        // Then
+        assertThat(entryRepository.count()).isEqualTo(1);
+        assertThat(entryRepository.findByDropIdAndUserId(DROP_ID, USER_ID).orElseThrow().getStatus())
+                .isEqualTo(EntryStatus.WON);
+        assertThat(warnMessages()).isEmpty();
     }
 }

@@ -11,6 +11,7 @@ import com.queuedrop.common.test.container.KafkaContainerConfig;
 import com.queuedrop.common.test.container.PostgresContainerConfig;
 import com.queuedrop.user.application.port.UserEventPublisher;
 import com.queuedrop.user.application.port.UserRegisteredPayload;
+import com.queuedrop.user.support.KafkaTopicReadiness;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +31,7 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -50,12 +52,15 @@ class SignupIntegrationTest {
     @Autowired TransactionTemplate transactionTemplate;
     @Autowired UserEventPublisher eventPublisher;
     @Autowired KafkaContainer kafka;
+    @Autowired KafkaTemplate<String, Object> kafkaTemplate;
 
     private KafkaConsumer<String, String> consumer;
     private final List<ConsumerRecord<String, String>> received = new ArrayList<>();
 
     @BeforeEach
     void subscribe() {
+        // 발행 어댑터는 send() 실패를 로그로만 남기므로, 첫 발행 전에 공유 producer 의 토픽 메타데이터를 받아 둔다
+        KafkaTopicReadiness.awaitTopicMetadata(kafkaTemplate, Topics.USER_REGISTERED);
         consumer = new KafkaConsumer<>(Map.of(
                 ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers(),
                 ConsumerConfig.GROUP_ID_CONFIG, "signup-it-" + UUID.randomUUID(),

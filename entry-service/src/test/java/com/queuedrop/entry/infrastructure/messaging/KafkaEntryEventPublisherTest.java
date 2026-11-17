@@ -3,6 +3,7 @@ package com.queuedrop.entry.infrastructure.messaging;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.awaitility.Awaitility.await;
+import static com.queuedrop.entry.support.KafkaTopicReadiness.awaitTopicMetadata;
 
 import com.queuedrop.common.event.EntryCreated;
 import com.queuedrop.common.event.Topics;
@@ -74,6 +75,7 @@ class KafkaEntryEventPublisherTest {
     @Autowired KafkaContainer kafka;
     @Autowired ProducerFactory<String, Object> producerFactory;
     @Autowired ConsumerFactory<String, Object> consumerFactory;
+    @Autowired KafkaTemplate<String, Object> kafkaTemplate;
     @Value("${entry.publish.await-timeout}") Duration awaitTimeout;
 
     private KafkaConsumer<String, String> consumer;
@@ -81,6 +83,8 @@ class KafkaEntryEventPublisherTest {
 
     @BeforeEach
     void subscribe() {
+        // 어댑터가 쓰는 공유 producer 에 토픽 메타데이터를 먼저 적재 (첫 발행의 max.block.ms 1초 초과 방지)
+        awaitTopicMetadata(kafkaTemplate, Topics.ENTRY_CREATED);
         consumer = new KafkaConsumer<>(Map.of(
                 ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers(),
                 ConsumerConfig.GROUP_ID_CONFIG, "entry-created-it-" + UUID.randomUUID(),
@@ -197,8 +201,10 @@ class KafkaEntryEventPublisherTest {
             Map<String, Object> config = new HashMap<>(producerFactory.getConfigurationProperties());
             config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, dedicated.getBootstrapServers());
             DefaultKafkaProducerFactory<String, Object> factory = new DefaultKafkaProducerFactory<>(config);
-            KafkaEntryEventPublisher adapter =
-                    new KafkaEntryEventPublisher(new KafkaTemplate<>(factory), awaitTimeout);
+            KafkaTemplate<String, Object> dedicatedTemplate = new KafkaTemplate<>(factory);
+            KafkaEntryEventPublisher adapter = new KafkaEntryEventPublisher(dedicatedTemplate, awaitTimeout);
+            // 전용 브로커는 토픽 자동 생성에 기대므로 메타데이터가 보일 때까지 기다린다
+            awaitTopicMetadata(dedicatedTemplate, Topics.ENTRY_CREATED);
             try {
                 // Given: 정상 상태에서 1회 발행해 연결·메타데이터를 확보한 뒤 브로커 정지
                 adapter.publishCreated(new EntryCreatedPayload(

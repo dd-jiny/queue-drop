@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | D2 남는 리스크에 '보상 후 응모 번호 재사용' 과 해결 방식(별도 seq 카운터) 추가 | NFR-03 |
 | v1.2 | 2026-11-16 | D2 재시도를 producer 내부 멱등 재시도로 변경(애플리케이션 재시도 제거), 저장 전 Redis 확인 확정, D4 발행 방식 확정(어댑터 내 afterCommit), 저장 컨슈머 DLT 추가 | NFR-03, phase-4·6 구현 상세 6장 |
 | v1.3 | 2026-11-17 | D2 유령 이벤트·Redis 타임아웃 대응 변경 (사용자 결정, 백로그 E-40·E-41): 요청 ID(eventId) 기록(`requests`), 저장 확정 표시(`persisted`, claim Lua)가 `SISMEMBER` 확인을 대체, 보상 Lua 가 3결과(COMPENSATED / ALREADY_PERSISTED / NOT_OURS) 반환 — 이미 저장 확정이면 되돌리지 않고 성공 응답. Redis 예외는 `GateUnavailableException` → 같은 eventId 로 보상 시도 후 503. 정합성 논증·남는 리스크 갱신. D3 에 entry 키 쓰기 소유 추가 | NFR-03, E-40, E-41 |
+| v1.4 | 2026-11-17 | D6 에 관리자 수동 추첨(D5-1)과 추첨 후 늦은 응모 `LOST` 저장(스냅샷 행 FOR SHARE 직렬화) 추가 (사용자 결정) | E-48, phase-5 구현 상세 v1.14 |
 
 > 이 문서는 여러 기능에 걸친 **비기능 결정**의 합의 기록이다.
 > 기능 설계 문서(응모, 쿠폰, 추첨, 대기열)는 모두 이 결정을 전제로 한다.
@@ -147,6 +148,7 @@
 2. `SCARD entry:{dropId}:applicants` (Redis 응모 수) 와 `COUNT(entries)` (DB 응모 수) 비교
 3. 일치할 때까지 대기 → 다음 스케줄러 주기에 재확인. 일정 시간 초과 시 알림(로그) 후 계속 대기
 4. 일치하면 DB 응모자로 추첨
+5. 일치하지 않은 채 오래 걸리면 경고 후 관리자 수동 추첨 (DB 응모 기준, 사용자 결정 D5-1). 이 경우 추첨 뒤에 늦게 저장되는 응모(DLT 재처리·lag)는 **`LOST` 로 저장**한다 — 저장 트랜잭션이 `drop_snapshots` 행을 `FOR SHARE` 로 잠가 추첨 트랜잭션의 첫 UPDATE(`CLOSING → DRAWN`)와 직렬화하므로, 응모는 "추첨 대상에 포함" 또는 "LOST 저장" 둘 중 하나가 되고 `APPLIED` 로 남지 않는다 (E-48, 사용자 결정)
 
 ---
 

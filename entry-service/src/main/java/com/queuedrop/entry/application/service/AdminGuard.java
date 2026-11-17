@@ -1,0 +1,18 @@
+package com.queuedrop.entry.application.service;
+
+import com.queuedrop.common.error.ApplicationException;
+import com.queuedrop.common.error.CommonErrorCode;
+import com.queuedrop.entry.application.dto.Requester;
+
+/** 관리자 권한 검사 (product 의 AdminGuard 와 같은 형태). */
+final class AdminGuard {
+
+    private AdminGuard() {
+    }
+
+    static void requireAdmin(Requester requester) {
+        if (requester == null || !requester.isAdmin()) {
+            throw new ApplicationException(CommonErrorCode.FORBIDDEN);
+        }
+    }
+}

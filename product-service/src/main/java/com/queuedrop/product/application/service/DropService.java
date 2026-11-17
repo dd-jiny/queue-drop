@@ -3,6 +3,7 @@ package com.queuedrop.product.application.service;
 import com.queuedrop.common.error.ApplicationException;
 import com.queuedrop.product.application.dto.DropRegisterCommand;
 import com.queuedrop.product.application.dto.DropResult;
+import com.queuedrop.product.application.dto.MarkDrawnCommand;
 import com.queuedrop.product.application.dto.Requester;
 import com.queuedrop.product.application.exception.ProductErrorCode;
 import com.queuedrop.product.application.port.DropCreatedPayload;
@@ -18,7 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Clock;
 import java.time.Instant;
 
-/** 드로우 등록·재발행 유스케이스 */
+/** 드로우 등록·재발행·추첨 완료 반영 유스케이스 */
 @Service
 @RequiredArgsConstructor
 public class DropService {
@@ -56,6 +57,21 @@ public class DropService {
         Drop drop = dropRepository.findById(dropId)
                 .orElseThrow(() -> new ApplicationException(ProductErrorCode.DROP_NOT_FOUND));
         eventPublisher.publishCreated(toPayload(drop));
+    }
+
+    /**
+     * draw.completed 수신 시 추첨 완료 반영 (5단계 3.5). 재전달되면 이미 drawn 이라 무시한다 (멱등).
+     * 도메인 모델은 영속 엔티티가 아니라 변경 감지가 없다 → 명시 save (E-30).
+     */
+    @Transactional
+    public void markDrawn(MarkDrawnCommand command) {
+        Drop drop = dropRepository.findById(command.dropId())
+                .orElseThrow(() -> new ApplicationException(ProductErrorCode.DROP_NOT_FOUND));
+        if (drop.isDrawn()) {
+            return;
+        }
+        drop.markDrawn();
+        dropRepository.save(drop);
     }
 
     private DropCreatedPayload toPayload(Drop d) {

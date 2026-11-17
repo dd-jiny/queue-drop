@@ -22,9 +22,10 @@ create draw.completed  1
 create entry.created  6 --config retention.ms=2592000000
 create coupon.issued  6
 
-# DLT: 저장 컨슈머(entry, coupon)가 3회 재시도 후 보내는 토픽.
+# DLT: 저장 컨슈머(entry, product draw.completed, coupon)가 3회 재시도 후 보내는 토픽.
 # 컨슈머의 DLT 리졸버가 `{topic}.DLT` 의 원본과 같은 파티션 번호로 보내므로 파티션 수를 원본과 맞춘다 (Spring Kafka 4 기본 목적지는 `{topic}-dlt` 라 리졸버로 명시).
 create drop.created.DLT  1
+create draw.completed.DLT 1
 create entry.created.DLT 6
 create coupon.issued.DLT 6
 

@@ -6,6 +6,14 @@ import com.queuedrop.common.test.container.PostgresContainerConfig;
 import com.queuedrop.entry.domain.model.DropSnapshot;
 import com.queuedrop.entry.domain.model.SnapshotStatus;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -14,6 +22,8 @@ import org.springframework.boot.jdbc.test.autoconfigure.AutoConfigureTestDatabas
 import org.springframework.boot.jpa.test.autoconfigure.TestEntityManager;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
@@ -109,5 +119,191 @@ class DropSnapshotRepositoryImplTest {
         // Then
         assertThat(second).isFalse();
         assertThat(dropSnapshotRepository.findById(8L).orElseThrow().getStatus()).isEqualTo(SnapshotStatus.OPEN);
+    }
+
+    // ================================================================ 5단계 — 조건부 상태 전이
+
+    private static final Instant AFTER_CLOSE = CLOSE_AT.plusSeconds(1);
+
+    private void insert(long dropId, SnapshotStatus status, Instant closeAt) {
+        dropSnapshotRepository.saveIfAbsent(DropSnapshot.restore(dropId, 100, 10, OPEN_AT, closeAt, status));
+    }
+
+    private String statusOf(long dropId) {
+        return jdbcTemplate.queryForObject("select status from drop_snapshots where drop_id = ?", String.class, dropId);
+    }
+
+    // ---------------------------------------------------------------- T5-14
+
+    /**
+     * 두 스레드가 각자 트랜잭션을 커밋해야 하므로 테스트 트랜잭션을 끈다.
+     * 커밋된 행은 롤백되지 않으니 finally 에서 직접 지운다.
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    @DisplayName("[T5-14] OPEN 드로우에 스레드 2개가 동시에 markClosingIfOpen 하면 true 는 정확히 1개, 상태는 CLOSING")
+    void concurrentMarkClosingOnlyOneWins() throws Exception {
+        long dropId = 51_401L;
+        try {
+            // Given: 커밋된 OPEN 드로우 (마감 시각 지남)
+            insert(dropId, SnapshotStatus.OPEN, CLOSE_AT);
+            int threads = 2;
+            CountDownLatch ready = new CountDownLatch(threads);
+            CountDownLatch start = new CountDownLatch(1);
+            List<Future<Boolean>> results = new ArrayList<>();
+
+            // When
+            try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+                Callable<Boolean> task = () -> {
+                    ready.countDown();
+                    start.await();
+                    return dropSnapshotRepository.markClosingIfOpen(dropId, AFTER_CLOSE);
+                };
+                for (int i = 0; i < threads; i++) {
+                    results.add(pool.submit(task));
+                }
+                assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+                start.countDown();
+            }
+
+            // Then
+            List<Boolean> outcomes = new ArrayList<>();
+            for (Future<Boolean> f : results) {
+                outcomes.add(f.get(10, TimeUnit.SECONDS));
+            }
+            assertThat(outcomes).containsExactlyInAnyOrder(true, false);
+            assertThat(statusOf(dropId)).isEqualTo("CLOSING");
+        } finally {
+            jdbcTemplate.update("delete from drop_snapshots where drop_id = ?", dropId);
+        }
+    }
+
+    @Test
+    @DisplayName("[T5-14] markClosingIfOpen — closeAt == now 이면 전이한다 (마감 경계 포함)")
+    void markClosingAtExactCloseAt() {
+        // Given
+        insert(1L, SnapshotStatus.OPEN, CLOSE_AT);
+
+        // When
+        boolean changed = dropSnapshotRepository.markClosingIfOpen(1L, CLOSE_AT);
+
+        // Then
+        assertThat(changed).isTrue();
+        assertThat(statusOf(1L)).isEqualTo("CLOSING");
+    }
+
+    @Test
+    @DisplayName("[T5-14] markClosingIfOpen — 마감 전(now < closeAt)이면 false 이고 OPEN 유지")
+    void markClosingBeforeCloseAtIgnored() {
+        // Given
+        insert(1L, SnapshotStatus.OPEN, CLOSE_AT);
+
+        // When
+        boolean changed = dropSnapshotRepository.markClosingIfOpen(1L, CLOSE_AT.minusNanos(1_000));
+
+        // Then
+        assertThat(changed).isFalse();
+        assertThat(statusOf(1L)).isEqualTo("OPEN");
+    }
+
+    @Test
+    @DisplayName("[T5-14] markClosingIfOpen — 이미 CLOSING / DRAWN 이거나 없는 dropId 면 false, 상태 그대로")
+    void markClosingNonOpenIgnored() {
+        // Given
+        insert(1L, SnapshotStatus.CLOSING, CLOSE_AT);
+        insert(2L, SnapshotStatus.DRAWN, CLOSE_AT);
+
+        // When / Then
+        assertThat(dropSnapshotRepository.markClosingIfOpen(1L, AFTER_CLOSE)).isFalse();
+        assertThat(dropSnapshotRepository.markClosingIfOpen(2L, AFTER_CLOSE)).isFalse();
+        assertThat(dropSnapshotRepository.markClosingIfOpen(999_999L, AFTER_CLOSE)).isFalse();
+        assertThat(statusOf(1L)).isEqualTo("CLOSING");
+        assertThat(statusOf(2L)).isEqualTo("DRAWN");
+    }
+
+    @Test
+    @DisplayName("[T5-14] findDueOpenIds — OPEN 이고 closeAt <= now 인 id 만 (경계 포함, 마감 전·CLOSING·DRAWN 제외)")
+    void findDueOpenIds() {
+        // Given
+        insert(1L, SnapshotStatus.OPEN, CLOSE_AT);                       // 경계: closeAt == now
+        insert(2L, SnapshotStatus.OPEN, CLOSE_AT.minusSeconds(3600));    // 마감 지남
+        insert(3L, SnapshotStatus.OPEN, CLOSE_AT.plusSeconds(1));        // 마감 전
+        insert(4L, SnapshotStatus.CLOSING, CLOSE_AT.minusSeconds(60));
+        insert(5L, SnapshotStatus.DRAWN, CLOSE_AT.minusSeconds(60));
+
+        // When
+        List<Long> due = dropSnapshotRepository.findDueOpenIds(CLOSE_AT);
+
+        // Then
+        assertThat(due).containsExactlyInAnyOrder(1L, 2L);
+    }
+
+    @Test
+    @DisplayName("[T5-14] findClosing — CLOSING 스냅샷만 모든 필드가 복원되어 돌아온다")
+    void findClosing() {
+        // Given
+        insert(1L, SnapshotStatus.OPEN, CLOSE_AT);
+        dropSnapshotRepository.saveIfAbsent(DropSnapshot.restore(2L, 300, 30, OPEN_AT, CLOSE_AT, SnapshotStatus.CLOSING));
+        insert(3L, SnapshotStatus.DRAWN, CLOSE_AT);
+        entityManager.clear();
+
+        // When
+        List<DropSnapshot> closing = dropSnapshotRepository.findClosing();
+
+        // Then
+        assertThat(closing).hasSize(1);
+        DropSnapshot found = closing.getFirst();
+        assertThat(found.getDropId()).isEqualTo(2L);
+        assertThat(found.getEntryCapacity()).isEqualTo(300);
+        assertThat(found.getWinnerCount()).isEqualTo(30);
+        assertThat(found.getCloseAt()).isEqualTo(CLOSE_AT);
+        assertThat(found.getStatus()).isEqualTo(SnapshotStatus.CLOSING);
+    }
+
+    @Test
+    @DisplayName("[T5-14] markDrawnIfClosing — CLOSING 이면 true·DRAWN, 두 번째 호출은 false")
+    void markDrawnIfClosing() {
+        // Given
+        insert(1L, SnapshotStatus.CLOSING, CLOSE_AT);
+
+        // When
+        boolean first = dropSnapshotRepository.markDrawnIfClosing(1L);
+        boolean second = dropSnapshotRepository.markDrawnIfClosing(1L);
+
+        // Then
+        assertThat(first).isTrue();
+        assertThat(second).isFalse();
+        assertThat(statusOf(1L)).isEqualTo("DRAWN");
+        entityManager.clear();
+        assertThat(dropSnapshotRepository.findById(1L).orElseThrow().getStatus()).isEqualTo(SnapshotStatus.DRAWN);
+    }
+
+    @Test
+    @DisplayName("[T5-14] markDrawnIfClosing — OPEN 이거나 없는 dropId 면 false (OPEN 을 건너뛰어 DRAWN 으로 가지 않음)")
+    void markDrawnFromOpenIgnored() {
+        // Given
+        insert(1L, SnapshotStatus.OPEN, CLOSE_AT);
+
+        // When / Then
+        assertThat(dropSnapshotRepository.markDrawnIfClosing(1L)).isFalse();
+        assertThat(dropSnapshotRepository.markDrawnIfClosing(999_999L)).isFalse();
+        assertThat(statusOf(1L)).isEqualTo("OPEN");
+    }
+
+    @Test
+    @DisplayName("[T5-14] 같은 트랜잭션에서 먼저 읽은 뒤 markClosingIfOpen·markDrawnIfClosing 해도 findById 는 새 상태 (clearAutomatically, 수동 clear 없음)")
+    void conditionalUpdatesClearPersistenceContext() {
+        // Given: 먼저 읽어 영속성 컨텍스트에 OPEN 엔티티를 올려 둔다
+        insert(1L, SnapshotStatus.OPEN, CLOSE_AT);
+        assertThat(dropSnapshotRepository.findById(1L).orElseThrow().getStatus()).isEqualTo(SnapshotStatus.OPEN);
+
+        // When / Then: entityManager.clear() 없이 다시 읽는다
+        assertThat(dropSnapshotRepository.markClosingIfOpen(1L, AFTER_CLOSE)).isTrue();
+        assertThat(dropSnapshotRepository.findById(1L).orElseThrow().getStatus()).isEqualTo(SnapshotStatus.CLOSING);
+        assertThat(dropSnapshotRepository.findClosing()).extracting(DropSnapshot::getDropId).containsExactly(1L);
+
+        assertThat(dropSnapshotRepository.markDrawnIfClosing(1L)).isTrue();
+        assertThat(dropSnapshotRepository.findById(1L).orElseThrow().getStatus()).isEqualTo(SnapshotStatus.DRAWN);
+        assertThat(dropSnapshotRepository.findClosing()).isEmpty();
     }
 }
