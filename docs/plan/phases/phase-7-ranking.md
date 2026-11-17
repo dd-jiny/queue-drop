@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-17 | 4~6단계 계약에 맞춤 (착수 전 결정 반영): 사용자 결정 2건(인기 드로우 = 진행 중만, 동점 = member 사전순) 확정. `RankingErrorCode implements ErrorCode`(`RANKING_INVALID_SIZE`·`RANKING_INVALID_WEEK` 400, `RANKING_TEMPORARILY_FAILED` 503) + `ApplicationException`, `RankingException`·`RankingExceptionHandler` 삭제(기존 `GlobalExceptionHandler` 사용). `/users/me` 는 `X-User-Id` 필수(누락 400 `COMMON_MISSING_USER_HEADER`), `UNAUTHENTICATED` 삭제. Redis `timeout: 1s`(E-03), Redis 예외 → `RankingStoreUnavailableException`(domain/exception) → 조회 503, 리스너는 전파. Command 는 박싱 타입, 필드 오류는 `DomainException` → WARN 후 스킵(저장소 호출 없음). `KafkaConsumerConfig`(1초 3회 후 로그·스킵, 역직렬화 실패는 재시도 없음). 표시 fallback `user-{id}`·`drop-{id}`. 종료 드로우 lazy ZREM(기본안). `RedisScriptConfig`·`ClockConfig` 분리, rank.lua 쓰기를 끝으로, 스캔 조기 종료. 테스트 T7-25~30 추가, T7-19·20·21·22 수정, Kafka/Redis 테스트 격리 규칙. 커밋 #0 추가 |
 | v1.3 | 2026-11-17 | #2 검토 반영: 인기 드로우 탐색 중 이미 본 id 건너뜀(배치 사이 보드 변경 시 중복 표시 방지), 마감 시각 맵 getOrDefault 방어, `ClockConfig` 는 커밋 #2 에 포함 |
 | v1.4 | 2026-11-17 | T7-20 은 QueryService 결과로 검증(HTTP 는 #5), T7-25 장애 주입은 Redis WRONGTYPE (presentation 테스트의 domain import 금지) |
+| v1.5 | 2026-11-17 | build.gradle 테스트 의존성 추가 표시. `?week=`(빈 문자열)은 null 이 아니므로 파싱 → 400 `RANKING_INVALID_WEEK` (생략만 이번 주) |
 
 ---
 
@@ -33,7 +34,7 @@
 
 ```
 ranking-service/
-├── build.gradle                                                    (변경 없음)
+├── build.gradle                                                    [수정] 테스트 의존성 data-redis-test(#3), webmvc-test(#5)
 └── src/
     ├── main/
     │   ├── java/com/queuedrop/ranking/
