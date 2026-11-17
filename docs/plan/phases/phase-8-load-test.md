@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 튜닝 프로퍼티 이름을 1·3·4·5·6단계 문서와 일치(발행 재시도 항목 제거 — 애플리케이션 재시도 없음 확정), 관리자 계정 생성 확정 반영, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-17 | 계획 검토 반영: 응답 code 를 `{SERVICE}_{REASON}` 실제 이름으로 수정, outcome·보상 메트릭 태그 확정(`coupon.issue.compensated` 추가, T8-13 판정 COMPENSATED==0), coupon-spike 사용자 매핑 `iterationInTest` 기반·S4 별도 이벤트, 진입 404·쿠폰 NOT_STARTED 재시도, 루트 build.gradle 필터 유지, compose 의존성(kafka healthy·kafka-init 완료)·앵커 위치, 튜닝 표 정리, gateway actuator health 만 노출, 검증 스크립트 주석·lag 대상 그룹 보강, `JSON`→`HEADERS`, 준비 절차(e2e.sh 방식), Boot 4 확인 리스크 추가, 6장 결정 필요 확정 |
+| v1.3 | 2026-11-17 | compose: JWT_SECRET 필수 표기 제거(인프라 단독 기동 회귀 방지), healthcheck 앵커 병합, 실행 순서에 kafka-init 생성 단계 추가, `scripts/loadtest-up.sh`, coupon 리스너 concurrency 환경변수 |
 
 ---
 
@@ -47,6 +48,7 @@ queue-drop/
 │   ├── drop-open-spike.js                         [신규] 시나리오 S1·S2
 │   └── coupon-spike.js                            [신규] 시나리오 S3·S4
 ├── scripts/
+│   ├── loadtest-up.sh                             [신규] 환경 기동 + T8-01~03 점검
 │   ├── verify-drop.sh                             [신규] 응모·추첨 정합성 검증
 │   ├── verify-coupon.sh                           [신규] 쿠폰 정합성 검증
 │   └── kafka-lag.sh                               [신규] 컨슈머 그룹 lag 조회
@@ -203,7 +205,7 @@ x-app-common: &app-common
     resources:
       limits:
         memory: 768m        # 측정 환경에 맞게 조정 (리포트에 기록)
-  healthcheck:
+  healthcheck: &app-healthcheck
     interval: 5s
     timeout: 3s
     retries: 30
@@ -237,7 +239,7 @@ services:
     ports:
       - "8080:8080"                         # 외부에 노출되는 유일한 애플리케이션 포트
     environment:
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 필요}
+      JWT_SECRET: ${JWT_SECRET:-}       # 비면 기동 시 WeakKeyException (아래 주석)
       USER_SERVICE_URL: http://user-service:8081
       PRODUCT_SERVICE_URL: http://product-service:8082
       QUEUE_SERVICE_URL: http://queue-service:8083
@@ -245,6 +247,7 @@ services:
       ENTRY_SERVICE_URL: http://entry-service:8085
       RANKING_SERVICE_URL: http://ranking-service:8086
     healthcheck:
+      <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:8080/actuator/health"]
     depends_on:
       user-service: { condition: service_healthy }
@@ -261,11 +264,12 @@ services:
     # ports 없음: 내부 네트워크에서만 접근
     environment:
       <<: [*db-env, *kafka-env]
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 필요}
+      JWT_SECRET: ${JWT_SECRET:-}       # 비면 기동 시 WeakKeyException (아래 주석)
       QUEUEDROP_JWT_ACCESS_TOKEN_TTL: ${QUEUEDROP_JWT_ACCESS_TOKEN_TTL:-2h}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@queuedrop.test}         # 1단계 관리자 계정 초기화 (확정)
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin!2345}
     healthcheck:
+      <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:8081/actuator/health"]
     depends_on: *infra-deps
 
@@ -276,6 +280,7 @@ services:
     environment:
       <<: [*db-env, *kafka-env]
     healthcheck:
+      <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:8082/actuator/health"]
     depends_on: *infra-deps
 
@@ -289,6 +294,7 @@ services:
       QUEUE_ADMISSION_INTERVAL_MS: ${QUEUE_ADMISSION_INTERVAL_MS:-1000}
       QUEUE_ADMISSION_TOKEN_TTL_SECONDS: ${QUEUE_ADMISSION_TOKEN_TTL_SECONDS:-300}
     healthcheck:
+      <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:8083/actuator/health"]
     depends_on: *infra-deps
 
@@ -299,7 +305,9 @@ services:
     environment:
       <<: [*db-env, *redis-env, *kafka-env]
       COUPON_PUBLISH_AWAIT_TIMEOUT: ${COUPON_PUBLISH_AWAIT_TIMEOUT:-3500ms}
+      SPRING_KAFKA_LISTENER_CONCURRENCY: ${COUPON_LISTENER_CONCURRENCY:-3}
     healthcheck:
+      <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:8084/actuator/health"]
     depends_on: *infra-deps
 
@@ -313,6 +321,7 @@ services:
       ENTRY_DRAW_INTERVAL_MS: ${ENTRY_DRAW_INTERVAL_MS:-5000}
       SPRING_KAFKA_LISTENER_CONCURRENCY: ${ENTRY_LISTENER_CONCURRENCY:-3}
     healthcheck:
+      <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:8085/actuator/health"]
     depends_on: *infra-deps
 
@@ -323,6 +332,7 @@ services:
     environment:
       <<: [*redis-env, *kafka-env]
     healthcheck:
+      <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:8086/actuator/health"]
     depends_on:
       redis: { condition: service_healthy }
@@ -355,7 +365,9 @@ services:
       - "3000:3000"
     depends_on: [prometheus]
 ```
-- `build:` 를 서비스마다 다시 쓰는 이유: YAML 병합(`<<`)은 얕은 병합이라 `args` 만 덮어쓸 수 없다.
+- `build:` 를 서비스마다 다시 쓰는 이유: YAML 병합(`<<`)은 얕은 병합이라 `args` 만 덮어쓸 수 없다. `healthcheck` 도 같은 이유로 서비스마다 `<<: *app-healthcheck` + `test` 로 병합한다 (안 하면 Docker 기본값 30s/30s/3 이 적용됨).
+- `JWT_SECRET` 은 `:?` 필수 표기를 쓰지 않는다. compose 는 프로필과 무관하게 파일 전체를 보간하므로 인프라만 띄우는 `docker compose up -d` 까지 실패하기 때문이다. 비어 있으면 gateway·user-service 가 기동 시 실패(unhealthy)한다.
+- 이미지 빌드는 `docker compose --profile app build` (프로필 없으면 서비스가 빌드 대상에서 빠짐). 이전 `-plain.jar` 가 남아 있으면 `COPY *.jar` 가 실패하므로 `clean bootJar` 로 빌드한다.
 - 인프라 컨테이너(postgres 5432, redis 6379, kafka 9092)는 검증 스크립트와 로컬 개발을 위해 호스트 포트를 유지한다. **애플리케이션 서비스는 gateway 만** 노출한다 ([architecture.md](../../design/02-architecture/architecture.md) 6장 "Gateway 우회 방지").
 - `deploy.resources.limits` 는 Compose v2 비-Swarm 모드에서도 적용된다 (구현 시 `docker stats` 로 확인).
 
@@ -377,10 +389,12 @@ scrape_configs:
 ```
 
 #### 실행 순서
+`scripts/loadtest-up.sh [--build] [--check-only]` 가 아래 절차와 T8-01~T8-03 점검을 수행한다 (JWT_SECRET 비면 즉시 종료).
 `scripts/e2e.sh` 의 인프라 준비 방식(`--wait` + `docker wait queuedrop-kafka-init`)을 재사용한다. 서비스는 **기본 프로필**로 띄운다 — e2e 프로필은 입장 주기(200ms)·추첨 주기(1초)·관리자 계정을 바꿔 측정값이 달라지므로 켜지 않는다.
 ```bash
 export JWT_SECRET=$(openssl rand -base64 48)
 ./gradlew clean bootJar
+docker compose up -d                                  # 인프라 + kafka-init 컨테이너 생성 (서비스 지정 시 kafka-init 이 안 만들어져 docker wait 실패)
 docker compose up -d --wait postgres redis kafka      # 인프라 healthy 대기
 [[ "$(docker wait queuedrop-kafka-init)" == "0" ]] || { docker logs queuedrop-kafka-init; exit 1; }   # 토픽 생성 확인
 docker compose --profile app up -d --build --wait     # 서비스 7개 healthy 대기
