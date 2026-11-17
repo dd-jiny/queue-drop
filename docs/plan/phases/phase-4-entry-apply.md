@@ -9,6 +9,7 @@
 | v1.3 | 2026-11-17 | 커밋 #3 검증 반영: `DropSnapshotRegisterService` 가 Redis 를 재수신 메시지 값이 아니라 DB 에 저장된 스냅샷 값으로 초기화 (DB·Redis 정원 불일치 방지). T4-09 에 인프라 예외 전파 케이스 추가 |
 | v1.4 | 2026-11-17 | 커밋 #8 구현 확인: 역직렬화 실패 레코드를 원본 바이트로 DLT 에 보내도록 `byte[]` 전용 템플릿 추가(JSON 템플릿은 Base64 문자열로 감쌈). Spring Kafka 4 의 `DeadLetterPublishingRecoverer` 기본 목적지가 `{topic}-dlt` 라서 리졸버로 `{topic}.DLT`·같은 파티션을 명시 (토픽 이름·설계 문서는 그대로). 6단계 coupon 도 같은 리졸버 사용 |
 | v1.5 | 2026-11-17 | 백로그 E-40·E-41 반영 (사용자 결정 2026-11-17, 6.1 ⑥⑦): 요청 ID = eventId 를 판정 전에 만들어 Gate 에 넘김. 새 키 `requests`(Hash)·`persisted`(Set), `entry-apply.lua` 에 `HSET requests`, 새 `entry-claim.lua`(저장 컨슈머가 `isApplicant` 대신 호출), `entry-compensate.lua` 3결과(`CompensationResult`). 발행 실패여도 ALREADY_PERSISTED 면 202. `RedisEntryGate` 가 Redis 예외를 `GateUnavailableException` 으로 감싸고 서비스는 같은 eventId 로 보상 후 503. 3.0·3.2·3.3 코드·Lua 전문, 4.1 Fake, 4.2 테스트 T4-36~42 추가·기존 테스트 기대값 변경 표시, 4.4 순서 B, 5장 커밋 #10a~c, 6장 결정·리스크 갱신 |
+| v1.6 | 2026-11-17 | 6.3 리스크에 스크립트 캐시 미적재 시 판정 타임아웃 행 추가 (#10b Red 중 확인, 동작 변경 없음). 5장: T4-31 기대값 변경을 10c → 10b 로 이동 |
 
 > 표기
 > - **(구현 결정)**: 설계 문서에 없던 내용을 이 문서에서 정한 것
@@ -1782,8 +1783,8 @@ class ConsumedThenFailPublisher implements EntryEventPublisher {
 | 8 | presentation 리스너 | `feat(entry): drop.created·entry.created 리스너와 DLT 에러 핸들러 추가`<br>- DropCreatedListener, EntryCreatedListener (idIsGroup=false), KafkaConsumerConfig(3회 재시도 → DLT), application.yml: listener | T4-26, 32, 33, 34 |
 | 9 | 시나리오 | `test(entry): 응모 동시성·보상·유령 이벤트 시나리오 테스트 추가` | T4-27~31 |
 | 10a | E-40·E-41 application + 포트 (v1.5) | `fix(entry): 요청 ID 기반 보상 결과 분기와 Redis 장애 시 보상 추가`<br>- EntryGate: tryApply(eventId)·compensate → CompensationResult·claimForSave, CompensationResult, GateUnavailableException<br>- EntryApplyService: 판정 전 eventId 생성, ALREADY_PERSISTED → 202, GateUnavailable → 같은 eventId 로 보상 후 503<br>- EntrySaveCommand.eventId, EntrySaveService: isApplicant → claimForSave, EntryCreatedListener: eventId 전달<br>- FakeEntryGate 갱신 (RedisEntryGate 는 10b 전까지 컴파일만 맞춤 — 10a·10b 를 한 PR 안에서 연속 커밋) | T4-03, 05, 07, 08, 40, 41 |
-| 10b | E-40·E-41 Lua + Redis 어댑터 (v1.5) | `fix(entry): 응모 저장 확정 Lua 와 요청 ID 대조 보상 Lua 추가`<br>- entry-apply.lua: KEYS requests·ARGV eventId, HSET<br>- entry-claim.lua 신규, entry-compensate.lua 3결과<br>- EntryRedisKeys.requests/persisted, RedisScriptConfig.entryClaimScript, RedisEntryGate: DataAccessException → GateUnavailableException | T4-16, 17, 26, 34, 36~39 |
-| 10c | E-40 시나리오 (v1.5) | `test(entry): 유령 이벤트가 보상보다 먼저 소비되는 시나리오 추가`<br>- GhostEventScenarioTest: 순서 B(ConsumedThenFailPublisher), 순서 A 기대값 A seq=3 | T4-31, 42 (+ T4-27~30 전체 재실행) |
+| 10b | E-40·E-41 Lua + Redis 어댑터 (v1.5) | `fix(entry): 응모 저장 확정 Lua 와 요청 ID 대조 보상 Lua 추가`<br>- entry-apply.lua: KEYS requests·ARGV eventId, HSET<br>- entry-claim.lua 신규, entry-compensate.lua 3결과<br>- EntryRedisKeys.requests/persisted, RedisScriptConfig.entryClaimScript, RedisEntryGate: DataAccessException → GateUnavailableException<br>- GhostEventScenarioTest 순서 A 기대값 A seq=3 (v1.6: 커밋마다 전체 통과를 유지하려고 10c 에서 당김) | T4-16, 17, 26, 31, 34, 36~39 |
+| 10c | E-40 시나리오 (v1.5) | `test(entry): 유령 이벤트가 보상보다 먼저 소비되는 시나리오 추가`<br>- GhostEventScenarioTest: 순서 B(ConsumedThenFailPublisher) | T4-42 (+ T4-27~31 전체 재실행) |
 | 10d | 검증 반영 | `fix(entry): ...` (신민아·한지민 지적 중 명백한 버그가 그 밖에 있을 때만) | — |
 | 11 | 문서 | `docs: 4단계 완료 표시` (플랜 진행 현황, 체크리스트, 백로그 처리 결과) | — |
 
@@ -1834,6 +1835,7 @@ Co-Authored-By: ...
 | Kafka 지연이 응답 시간에 그대로 들어감 | 응모 p99 가 최대 3.5초까지 늘 수 있음 | 8단계 부하 테스트로 측정. `linger.ms`, 파티션 수 조정 |
 | `TimeoutException` 후 뒤늦은 기록 (유령 이벤트) | 보상된 응모가 Kafka 에 남음. 소비가 보상보다 먼저면 v1.4 까지는 DB 응모 수 = 정원 + 1 (E-40) | v1.5: claim Lua + 3결과 보상 + requests 대조 + seq 카운터. 어느 순서든 "DB 저장 ⇔ Redis 응모자 유지" (T4-31, T4-42) |
 | 보상 Lua 실패 (발행 실패 경로) | 정원 한 자리가 영구히 비어 있음 (언더 응모) | 로그 알림. 정원 초과는 아님 (D2) |
+| 스크립트 캐시가 없을 때 판정 타임아웃 (재시작 직후·`SCRIPT FLUSH` 뒤 첫 호출, v1.6) | EVALSHA 가 타임아웃되면 NOSCRIPT → EVAL 재시도가 일어나지 않아 Lua 가 실행되지 않음 | 안전: 보상이 NOT_OURS 로 끝나고 503, 재시도하면 정상 판정. T4-39 는 늦게 도착한 Lua 경로를 보려고 pause 전에 스크립트를 캐시에 올린다 |
 | 판정 Lua 응답 타임아웃 + 보상도 실패 (E-41) | Redis 에만 응모(Kafka 메시지 없음) → 언더 응모 + D6 건수 불일치로 추첨 대기. 사용자는 재시도 시 409 DUPLICATE, 단건 조회는 저장 대기(APPLIED) | log.error 알림 후 운영 대응. 5단계에서 Redis ∖ DB 대조 여부 판단 (백로그 E-41 개선안 2) |
 | claim 후 DB 저장 실패 (DLT) | Redis 응모자 있음, DB 없음 → D6 대기 | v1.5 이후 남는 유일한 Redis·DB 불일치. DLT 재처리로 복구 (claim 은 재처리에도 1) |
 | 새 키 `requests`·`persisted` 메모리 | 정원 크기만큼 Hash(UUID 36B 값)·Set 이 드로우마다 추가로 남음 | 지금 규모에서는 문제없음. TTL 은 E-42 와 함께 5단계에서 결정 |

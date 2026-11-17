@@ -44,6 +44,8 @@ import org.testcontainers.kafka.KafkaContainer;
 /**
  * entry.created 저장 리스너 통합 테스트 (단계 문서 4장 T4-26, T4-34).
  * presentation 테스트라 domain·infrastructure 타입을 쓰지 않는다 — DB 는 JdbcTemplate, Redis 는 키 문자열로 직접 본다.
+ * v1.5: 저장 컨슈머는 claim Lua 로 applicants + requests[userId] == eventId 를 확인하고 persisted 에 기록한다.
+ * 응모자 등록은 entry-apply.lua 의 OK 결과와 같은 상태(SADD applicants + HSET requests)를 키로 직접 만든다.
  */
 @SpringBootTest
 @Import({PostgresContainerConfig.class, RedisContainerConfig.class, KafkaContainerConfig.class,
@@ -70,8 +72,19 @@ class EntryCreatedListenerTest {
         jdbc.update("TRUNCATE TABLE entries, drop_snapshots");
     }
 
-    private void registerApplicant(long dropId, long userId) {
+    /** entry-apply.lua 가 OK 일 때 남기는 상태와 같다: applicants 에 userId, requests[userId] = eventId */
+    private void registerApplicant(long dropId, long userId, String eventId) {
         redis.opsForSet().add("entry:" + dropId + ":applicants", String.valueOf(userId));
+        redis.opsForHash().put("entry:" + dropId + ":requests", String.valueOf(userId), eventId);
+    }
+
+    private void registerApplicant(long dropId, EntryCreated event) {
+        registerApplicant(dropId, event.userId(), event.eventId());
+    }
+
+    private boolean isPersisted(long dropId, long userId) {
+        return Boolean.TRUE.equals(
+                redis.opsForSet().isMember("entry:" + dropId + ":persisted", String.valueOf(userId)));
     }
 
     private void publish(EntryCreated event) throws Exception {
@@ -95,16 +108,17 @@ class EntryCreatedListenerTest {
     @Test
     @DisplayName("[T4-26] 같은 EntryCreated 를 2번 받아도 DB 에는 1건만 남고 필드가 메시지와 같다 (컨슈머 멱등)")
     void duplicateDeliveryKeepsSingleRow() throws Exception {
-        // Given — 응모자 등록 (Redis applicants), 확인용 사용자도 등록
+        // Given — 응모자 등록 (applicants + requests 에 메시지와 같은 eventId), 확인용 사용자도 등록
         long dropId = 1L;
-        registerApplicant(dropId, 10L);
-        registerApplicant(dropId, 11L);
         EntryCreated message = event(dropId, 10L, 1);
+        EntryCreated probe = event(dropId, 11L, 2);
+        registerApplicant(dropId, message);
+        registerApplicant(dropId, probe);
 
         // When — 같은 이벤트(eventId 포함 동일) 2번, 이어서 확인용 이벤트 (파티션 1개라 순서대로 처리)
         publish(message);
         publish(message);
-        publish(event(dropId, 11L, 2));
+        publish(probe);
 
         // Then — 확인용 이벤트가 저장됐으면 앞선 두 건도 처리가 끝난 것
         await().atMost(WAIT).pollInterval(Duration.ofMillis(100))
@@ -116,6 +130,32 @@ class EntryCreatedListenerTest {
         assertThat(row.get("entry_seq")).isEqualTo(1);
         assertThat(row.get("status")).isEqualTo("APPLIED");
         assertThat(((Timestamp) row.get("applied_at")).toInstant()).isEqualTo(APPLIED_AT);
+        // v1.5: claim Lua 가 저장 전에 persisted 에 확정했다 (이후 보상은 ALREADY_PERSISTED)
+        assertThat(isPersisted(dropId, 10L)).isTrue();
+        assertThat(isPersisted(dropId, 11L)).isTrue();
+        assertThat(redis.opsForHash().get("entry:" + dropId + ":requests", "10")).isEqualTo(message.eventId());
+    }
+
+    @Test
+    @DisplayName("[T4-26] 응모자지만 requests 의 eventId 가 메시지와 다르면(재응모 전 시도의 유령 이벤트) 저장하지 않고 persisted 에도 넣지 않는다")
+    void ghostEventOfPreviousAttemptIsSkipped() throws Exception {
+        // Given — user 30 은 다른 요청(e-current)으로 응모자. 확인용 user 31 은 정상
+        long dropId = 4L;
+        registerApplicant(dropId, 30L, "e-current");
+        EntryCreated ghost = event(dropId, 30L, 1);                  // eventId 는 랜덤 UUID → 불일치
+        EntryCreated probe = event(dropId, 31L, 2);
+        registerApplicant(dropId, probe);
+
+        // When
+        publish(ghost);
+        publish(probe);
+
+        // Then — 확인용 이벤트가 저장됐으면 유령 이벤트도 처리가 끝난 것
+        await().atMost(WAIT).pollInterval(Duration.ofMillis(100))
+                .until(() -> countEntries(dropId, 31L) == 1);
+        assertThat(countEntries(dropId, 30L)).isZero();
+        assertThat(isPersisted(dropId, 30L)).isFalse();
+        assertThat(redis.opsForSet().isMember("entry:" + dropId + ":applicants", "30")).isTrue();
     }
 
     @Test
@@ -133,16 +173,18 @@ class EntryCreatedListenerTest {
     @DisplayName("[T4-34] entry_seq 충돌로 저장이 계속 실패하면 재시도 후 entry.created.DLT 로 같은 key 의 레코드가 가고, DB 는 1건 그대로다")
     void seqConflictGoesToDlt() throws Exception {
         // Given — (drop 2, user 1, seq 1) 이 이미 저장돼 있고, user 2 는 Redis 응모자
+        //         (v1.5: requests 에 메시지와 같은 eventId → claim 은 통과하고 INSERT 에서 실패)
         long dropId = 2L;
         jdbc.update("INSERT INTO entries (drop_id, user_id, entry_seq, status, applied_at) VALUES (?, ?, ?, ?, ?)",
                 dropId, 1L, 1, "APPLIED", Timestamp.from(APPLIED_AT));
-        registerApplicant(dropId, 1L);
-        registerApplicant(dropId, 2L);
+        registerApplicant(dropId, 1L, "e-user1");
+        EntryCreated conflicting = event(dropId, 2L, 1);
+        registerApplicant(dropId, conflicting);
         String key = dropId + ":2";
 
         try (var dlt = new ListenerTestSupport.DltReader(kafka.getBootstrapServers(), Topics.ENTRY_CREATED_DLT)) {
             // When — user 2 가 같은 seq 1 로 들어온다 (uk_entries_drop_seq 위반 → DataIntegrityViolationException)
-            publish(event(dropId, 2L, 1));
+            publish(conflicting);
 
             // Then — 재시도(3회) 후 DLT 수신
             await().atMost(DLT_WAIT).pollInterval(Duration.ofMillis(200))
@@ -155,6 +197,8 @@ class EntryCreatedListenerTest {
         }
         assertThat(countEntries(dropId)).isEqualTo(1);
         assertThat(countEntries(dropId, 2L)).isZero();
+        // v1.5: claim 은 INSERT 전에 성공했으므로 persisted 에 남는다 (문서 3.3 "남는 불일치": DLT 재처리 시 claim 은 다시 1)
+        assertThat(isPersisted(dropId, 2L)).isTrue();
     }
 
     @Test
@@ -164,7 +208,8 @@ class EntryCreatedListenerTest {
         long dropId = 3L;
         String key = "poison:" + UUID.randomUUID();
         byte[] poison = new byte[] {0x00, (byte) 0xFF, 0x7B, 0x6E, 0x6F, 0x74, 0x2D, 0x6A, 0x73, 0x6F, 0x6E};
-        registerApplicant(dropId, 20L);
+        EntryCreated normal = event(dropId, 20L, 1);
+        registerApplicant(dropId, normal);
 
         try (var dlt = new KafkaConsumer<String, byte[]>(Map.of(
                      ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers(),
@@ -182,7 +227,7 @@ class EntryCreatedListenerTest {
             // When — poison pill 발행, 이어서 정상 이벤트 (파티션 1개라 순서대로 처리)
             long sentAt = System.nanoTime();
             rawProducer.send(new ProducerRecord<>(Topics.ENTRY_CREATED, key, poison)).get(5, TimeUnit.SECONDS);
-            publish(event(dropId, 20L, 1));
+            publish(normal);
 
             // Then — DLT 에 같은 key 의 레코드 1건
             await().atMost(DLT_WAIT).pollInterval(Duration.ofMillis(100)).until(() -> {

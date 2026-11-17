@@ -18,8 +18,8 @@ import org.springframework.test.web.servlet.ResultActions;
 /**
  * 유령 이벤트 시나리오 (단계 문서 4.4, T4-31; sequence-diagram.md 5.2).
  * "브로커는 기록했는데 ack 를 못 받은" 상황을, 실제로 보낸 뒤 실패를 던지는 Publisher 로 재현한다.
- * 모든 케이스에서 A 의 실패 응모(발행 → 보상)는 저장 리스너를 멈춘 채 실행한다.
- * 컨슈머가 보상보다 먼저 유령 이벤트를 처리하는 순서(E-40)는 이 클래스의 대상이 아니다.
+ * 모든 케이스에서 A 의 실패 응모(발행 → 보상)는 저장 리스너를 멈춘 채 실행한다 (순서 A).
+ * v1.5: 유령 이벤트 (A, seq 1, e1) 는 claim 에서 requests[A] 와 eventId 가 달라(또는 응모자가 아니라) 저장되지 않는다.
  */
 class GhostEventScenarioTest extends ScenarioTestBase {
 
@@ -68,7 +68,7 @@ class GhostEventScenarioTest extends ScenarioTestBase {
     }
 
     @Test
-    @DisplayName("[T4-31] 저장 리스너 정지 중 A 유령 이벤트(seq 1) → B(seq 2) → A 재응모(seq 3) 후 재개하면 DB 에 A 1건(seq 1), B 1건(seq 2), SCARD 2 == DB 2")
+    @DisplayName("[T4-31] 저장 리스너 정지 중 A 유령 이벤트(seq 1) → B(seq 2) → A 재응모(seq 3) 후 재개하면 DB 에 A 1건(seq 3), B 1건(seq 2), SCARD 2 == DB 2")
     void ghostEventBeforeReapply() throws Exception {
         // Given — 드로우(정원 100), A·B 토큰
         long dropId = 601L;
@@ -82,9 +82,9 @@ class GhostEventScenarioTest extends ScenarioTestBase {
             assertThat(dbCount(dropId)).as("정지 중에는 저장되지 않는다").isZero();
         });
 
-        // Then — 유령 이벤트(seq 1)가 먼저 저장되고 A 의 seq 3 은 (drop, user) 충돌로 무시
+        // Then — 유령 이벤트(seq 1, e1)는 requests[A] = e3 와 달라 claim 0 → A 는 재응모 번호 seq 3 (v1.5)
         awaitAllEntryEventsConsumed();
-        assertThat(dbSeq(dropId, USER_A)).isEqualTo(1);
+        assertThat(dbSeq(dropId, USER_A)).isEqualTo(3);
         assertThat(dbSeq(dropId, USER_B)).isEqualTo(2);
         assertThat(dbCount(dropId)).isEqualTo(2);
         assertThat(applicantCount(dropId)).as("Redis 응모자 수 == DB 건수 (5단계 추첨 대기 없음)").isEqualTo(dbCount(dropId));
@@ -92,7 +92,7 @@ class GhostEventScenarioTest extends ScenarioTestBase {
     }
 
     @Test
-    @DisplayName("[T4-31] (변형) 보상 직후 리스너를 재개하면 유령 이벤트가 A 재응모 전·후 어느 쪽에 처리돼도 A·B 각 1건, 합계 2건, SCARD 2")
+    @DisplayName("[T4-31] (변형) 보상 직후 리스너를 재개하면 유령 이벤트가 A 재응모 전·후 어느 쪽에 처리돼도 A 는 seq 3, A·B 각 1건, 합계 2건, SCARD 2")
     void ghostEventResumedBeforeReapply() throws Exception {
         // Given
         long dropId = 602L;
@@ -103,9 +103,9 @@ class GhostEventScenarioTest extends ScenarioTestBase {
         apply(dropId, USER_B).andExpect(status().isAccepted()).andExpect(jsonPath("$.entrySeq").value(2));
         apply(dropId, USER_A).andExpect(status().isAccepted()).andExpect(jsonPath("$.entrySeq").value(3));
 
-        // Then — A 는 seq 1(유령이 재응모 뒤 처리) 또는 seq 3(유령이 먼저 처리돼 무시) 중 하나로 1건
+        // Then — 유령이 재응모 전에 처리되면 응모자 아님, 후에 처리되면 eventId 불일치로 claim 0 → 어느 쪽이든 seq 3 (v1.5)
         awaitAllEntryEventsConsumed();
-        assertThat(dbSeq(dropId, USER_A)).isIn(1, 3);
+        assertThat(dbSeq(dropId, USER_A)).isEqualTo(3);
         assertThat(dbSeq(dropId, USER_B)).isEqualTo(2);
         assertThat(dbCount(dropId)).isEqualTo(2);
         assertThat(applicantCount(dropId)).isEqualTo(2);

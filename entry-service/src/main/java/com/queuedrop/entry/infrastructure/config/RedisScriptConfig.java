@@ -25,4 +25,9 @@ public class RedisScriptConfig {
     RedisScript<Long> entryCompensateScript() {
         return RedisScript.of(new ClassPathResource("scripts/entry-compensate.lua"), Long.class);
     }
+
+    @Bean
+    RedisScript<Long> entryClaimScript() {
+        return RedisScript.of(new ClassPathResource("scripts/entry-claim.lua"), Long.class);
+    }
 }

@@ -4,8 +4,10 @@
 -- KEYS[3] = entry:{dropId}:applicants
 -- KEYS[4] = entry:{dropId}:seq
 -- KEYS[5] = queue:{dropId}:token:{userId}     (queue-service 소유, 읽기만)
+-- KEYS[6] = entry:{dropId}:requests           (userId → eventId, v1.5)
 -- ARGV[1] = userId
 -- ARGV[2] = now (epoch ms, 애플리케이션 시각)
+-- ARGV[3] = eventId (요청 ID, 애플리케이션이 판정 전에 생성, v1.5)
 -- return  : { 'OK', entrySeq } 또는 { 'CLOSED' | 'NO_TOKEN' | 'DUPLICATE' | 'SOLD_OUT' }
 
 -- 1. 마감 여부: state == OPEN 이고 openAt <= now < closeAt
@@ -34,9 +36,10 @@ if remaining <= 0 then
     return { 'SOLD_OUT' }
 end
 
--- 5. 차감 + 응모자 등록
+-- 5. 차감 + 응모자 등록 + 이 자리를 잡은 요청 기록 (보상·저장 확정이 eventId 로 대조)
 redis.call('DECR', KEYS[2])
 redis.call('SADD', KEYS[3], ARGV[1])
+redis.call('HSET', KEYS[6], ARGV[1], ARGV[3])
 
 -- 6. 응모 번호: 잔여 정원과 무관한 카운터 (증가만, 보상 시에도 되돌리지 않음)
 local seq = redis.call('INCR', KEYS[4])
