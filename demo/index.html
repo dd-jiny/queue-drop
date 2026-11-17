@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>queue-drop 시연</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">QD</span>
+    <div>
+      <div class="brand-name">queue-drop</div>
+      <div class="brand-sub">한정판 선착순 드로우 · 시연 페이지</div>
+    </div>
+  </div>
+
+  <!-- 로그인 영역: 로그아웃 상태 -->
+  <form id="login-form" class="auth" autocomplete="off">
+    <input id="login-email" type="email" placeholder="이메일" required>
+    <input id="login-password" type="password" placeholder="비밀번호" required>
+    <input id="signup-nickname" type="text" placeholder="닉네임(가입 시)" maxlength="20">
+    <button type="submit" class="btn primary">로그인</button>
+    <button type="button" id="btn-signup" class="btn">회원가입</button>
+    <button type="button" id="btn-admin-login" class="btn admin">관리자로 로그인</button>
+    <span class="quick">
+      <input id="quick-user-no" type="number" min="1" max="20000" value="1" title="테스트 사용자 번호">
+      <button type="button" id="btn-quick-login" class="btn">테스트 사용자</button>
+    </span>
+  </form>
+
+  <!-- 로그인 영역: 로그인 상태 -->
+  <div id="session" class="session hidden">
+    <span id="session-role" class="badge"></span>
+    <span id="session-user" class="session-user"></span>
+    <span class="session-exp">토큰 만료까지 <b id="session-exp">-</b></span>
+    <button type="button" id="btn-logout" class="btn">로그아웃</button>
+  </div>
+</header>
+
+<div class="layout">
+  <main>
+    <nav class="tabs">
+      <button class="tab active" data-tab="drop">드로우</button>
+      <button class="tab" data-tab="coupon">쿠폰</button>
+      <button class="tab" data-tab="ranking">랭킹</button>
+      <button class="tab" data-tab="admin">관리자</button>
+    </nav>
+
+    <!-- ===== 드로우 ===== -->
+    <section id="tab-drop" class="panel">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head">
+            <h2>드로우 목록</h2>
+            <button id="btn-drops-refresh" class="btn small">새로고침</button>
+          </div>
+          <ul id="drop-list" class="drop-list"><li class="muted">불러오는 중…</li></ul>
+        </div>
+
+        <div class="card" id="drop-detail">
+          <div class="empty muted">왼쪽 목록에서 드로우를 선택하세요.</div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>대기열</h2>
+          <div id="queue-box" class="status-box idle">
+            <div class="status-label" id="queue-state">대기열 미진입</div>
+            <div class="status-big" id="queue-ahead">-</div>
+            <div class="status-sub" id="queue-sub">드로우를 선택하고 오픈 후 대기열에 진입하세요.</div>
+          </div>
+          <div class="actions">
+            <button id="btn-queue-enter" class="btn primary big" disabled>대기열 진입</button>
+            <button id="btn-queue-stop" class="btn" disabled>폴링 중지</button>
+            <label class="check"><input type="checkbox" id="queue-auto-enter"> 오픈되면 자동 진입</label>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>응모 · 추첨</h2>
+          <div id="entry-box" class="status-box idle">
+            <div class="status-label" id="entry-state">응모 전</div>
+            <div class="status-big" id="entry-big">-</div>
+            <div class="status-sub" id="entry-sub">입장되면 응모할 수 있습니다.</div>
+          </div>
+          <div class="actions">
+            <button id="btn-entry-apply" class="btn primary big" disabled>응모하기</button>
+            <button id="btn-entry-me" class="btn" disabled>내 응모 조회</button>
+            <button id="btn-draw-result" class="btn" disabled>추첨 결과</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>내 응모 내역</h2>
+          <button id="btn-my-entries" class="btn small">불러오기</button>
+        </div>
+        <table class="table"><thead><tr><th>드로우</th><th>응모 순번</th><th>상태</th><th>응모 시각</th></tr></thead>
+          <tbody id="my-entries"><tr><td colspan="4" class="muted">로그인 후 불러오기를 누르세요.</td></tr></tbody></table>
+      </div>
+    </section>
+
+    <!-- ===== 쿠폰 ===== -->
+    <section id="tab-coupon" class="panel hidden">
+      <div class="grid-2">
+        <div class="card">
+          <h2>쿠폰 이벤트</h2>
+          <form id="coupon-form" class="row">
+            <input id="coupon-event-id" type="number" min="1" placeholder="이벤트 ID" required>
+            <button class="btn primary">조회</button>
+          </form>
+          <div id="coupon-info" class="info muted">이벤트 ID 를 입력하세요.</div>
+          <div id="coupon-countdown" class="countdown hidden"></div>
+        </div>
+        <div class="card">
+          <h2>선착순 발급</h2>
+          <div id="coupon-box" class="status-box idle">
+            <div class="status-label" id="coupon-state">발급 전</div>
+            <div class="status-big" id="coupon-big">-</div>
+            <div class="status-sub" id="coupon-sub">이벤트를 조회한 뒤 발급을 누르세요.</div>
+          </div>
+          <div class="actions">
+            <button id="btn-coupon-issue" class="btn primary big" disabled>쿠폰 발급</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <h2>내 쿠폰</h2>
+          <button id="btn-my-coupons" class="btn small">불러오기</button>
+        </div>
+        <table class="table"><thead><tr><th>이벤트</th><th>이름</th><th>발급 시각</th></tr></thead>
+          <tbody id="my-coupons"><tr><td colspan="3" class="muted">로그인 후 불러오기를 누르세요.</td></tr></tbody></table>
+        <p class="hint">발급(202) 직후에는 DB 저장이 비동기라 목록에 잠시 안 보일 수 있습니다.</p>
+      </div>
+    </section>
+
+    <!-- ===== 랭킹 ===== -->
+    <section id="tab-ranking" class="panel hidden">
+      <div class="card-head page-head">
+        <h2>랭킹</h2>
+        <label class="check"><input type="checkbox" id="ranking-auto"> 3초마다 자동 갱신</label>
+        <button id="btn-ranking-refresh" class="btn small">새로고침</button>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <h3>인기 드로우 (응모 수)</h3>
+          <table class="table"><thead><tr><th>순위</th><th>드로우</th><th class="num">응모 수</th></tr></thead>
+            <tbody id="rank-drops"></tbody></table>
+        </div>
+        <div class="card">
+          <h3>내 순위</h3>
+          <div id="rank-me" class="rank-me muted">로그인하면 표시됩니다.</div>
+        </div>
+        <div class="card">
+          <h3>사용자 랭킹 · 주간 <span id="rank-week" class="muted small"></span></h3>
+          <table class="table"><thead><tr><th>순위</th><th>닉네임</th><th class="num">점수</th></tr></thead>
+            <tbody id="rank-weekly"></tbody></table>
+        </div>
+        <div class="card">
+          <h3>사용자 랭킹 · 전체</h3>
+          <table class="table"><thead><tr><th>순위</th><th>닉네임</th><th class="num">점수</th></tr></thead>
+            <tbody id="rank-all"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== 관리자 ===== -->
+    <section id="tab-admin" class="panel hidden">
+      <p id="admin-warn" class="warn">관리자 기능입니다. 상단의 “관리자로 로그인”을 먼저 누르세요.</p>
+      <div class="grid-2">
+        <div class="card">
+          <h2>상품 + 드로우 등록</h2>
+          <form id="drop-form" class="form">
+            <label>상품명 <input id="f-product-name" required maxlength="100" value="한정판 스니커즈"></label>
+            <label>드로우 제목 <input id="f-drop-title" required maxlength="100" value="한정판 스니커즈 드로우"></label>
+            <div class="form-row">
+              <label>오픈까지(초) <input id="f-open-after" type="number" min="61" value="65" required></label>
+              <label>응모 기간(초) <input id="f-duration" type="number" min="10" value="120" required></label>
+            </div>
+            <div class="form-row">
+              <label>응모 정원 M <input id="f-capacity" type="number" min="1" value="10" required></label>
+              <label>당첨 K <input id="f-winners" type="number" min="1" value="3" required></label>
+            </div>
+            <p class="hint">오픈 시각은 등록 시각 + 1분 이후여야 합니다(드로우 정보가 대기열·응모 서비스로 전파되는 시간). 등록 버튼을 누른 시점 기준으로 계산합니다.</p>
+            <button class="btn primary">등록</button>
+          </form>
+          <div id="drop-form-result" class="result"></div>
+        </div>
+
+        <div class="card">
+          <h2>쿠폰 이벤트 등록</h2>
+          <form id="coupon-event-form" class="form">
+            <label>이벤트명 <input id="f-coupon-name" required value="오픈 기념 선착순 쿠폰"></label>
+            <div class="form-row">
+              <label>수량 <input id="f-coupon-qty" type="number" min="1" value="5" required></label>
+              <label>발급 시작까지(초) <input id="f-coupon-after" type="number" min="5" value="30" required></label>
+            </div>
+            <button class="btn primary">등록</button>
+          </form>
+          <div id="coupon-form-result" class="result"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>가상 사용자 투입 <span class="muted small">(대기열 순번·매진을 보여주기 위한 시뮬레이션)</span></h2>
+        <form id="bot-form" class="form">
+          <div class="form-row four">
+            <label>드로우 ID <input id="f-bot-drop" type="number" min="1" required></label>
+            <label>인원 <input id="f-bot-count" type="number" min="1" max="500" value="30" required></label>
+            <label>시작 번호 <input id="f-bot-start" type="number" min="1" max="20000" value="101" required></label>
+            <label class="check inline"><input type="checkbox" id="f-bot-apply" checked> 입장 후 자동 응모</label>
+          </div>
+          <p class="hint">loadtest-N@queuedrop.test 계정으로 로그인해 두었다가, 오픈 시각이 되면 한꺼번에 대기열에 진입합니다. 이 요청들은 API 로그에 요약 한 줄로만 남깁니다.</p>
+          <div class="actions">
+            <button class="btn primary">투입</button>
+            <button type="button" id="btn-bot-stop" class="btn" disabled>중지</button>
+          </div>
+        </form>
+        <div id="bot-status" class="bot-status muted">대기 중</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===== API 로그 ===== -->
+  <aside id="log-panel" class="log-panel">
+    <div class="log-head">
+      <h2>API 로그</h2>
+      <div>
+        <button id="btn-log-clear" class="btn small">지우기</button>
+        <button id="btn-log-toggle" class="btn small">접기</button>
+      </div>
+    </div>
+    <ol id="log-list" class="log-list"></ol>
+  </aside>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>

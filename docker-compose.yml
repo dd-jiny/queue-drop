@@ -243,6 +243,19 @@ services:
       - ./load-test:/scripts:ro
       - ./docs/report/results:/results         # handleSummary 결과 JSON
 
+  # 시연 페이지 (선택). 사용: docker compose --profile demo up -d demo → http://localhost:8000
+  # 정적 페이지(./demo)를 서빙하고 /api 는 gateway 로 프록시한다. app 프로필 서비스가 떠 있어야 API 가 동작한다
+  # depends_on 은 두지 않는다 (app 프로필과 독립 실행 — gateway 이름은 요청 시점에 해석)
+  demo:
+    image: nginx:1.27-alpine
+    container_name: queuedrop-demo
+    profiles: ["demo"]
+    ports:
+      - "8000:80"
+    volumes:
+      - ./demo:/usr/share/nginx/html:ro
+      - ./infra/demo/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
   # 모니터링 (phase-8 3.3, 선택). 사용: docker compose --profile monitoring up -d → Grafana http://localhost:3000 (익명 Viewer)
   # app 프로필 서비스를 scrape 한다 (gateway 제외). 측정에 쓰는 자원이 같은 호스트를 공유하므로 보고서 환경에 기록한다
   prometheus:
