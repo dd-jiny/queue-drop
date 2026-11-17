@@ -3,6 +3,7 @@
 // 실행 예:
 //   S1: docker compose --profile loadtest run --rm k6 run -e USERS=3000 -e CAPACITY=1000 -e WINNERS=100 /scripts/drop-open-spike.js
 //   S2: docker compose --profile loadtest run --rm k6 run -e USERS=5000 -e CAPACITY=100 -e WINNERS=10 /scripts/drop-open-spike.js
+//   확대: docker compose --profile loadtest run --rm k6 run -e USERS=10000 -e CAPACITY=3000 -e WINNERS=300 -e OPEN_DELAY_SEC=120 -e LOGIN_SPREAD_SEC=90 /scripts/drop-open-spike.js
 // 사전 조건: prepare-users.js 로 loadtest-1..USERS 생성
 import http from 'k6/http';
 import { check, sleep } from 'k6';
@@ -20,8 +21,12 @@ const JITTER_MS = int('JITTER_MS', 1000);
 const POLL_MS = int('POLL_MS', 1000);
 const MAX_WAIT_SEC = int('MAX_WAIT_SEC', 600);
 const ENTER_RETRY = int('ENTER_RETRY', 10);       // 첫 진입 재시도 상한 (1초 간격)
+const LOGIN_SPREAD_SEC = int('LOGIN_SPREAD_SEC', 0);  // 로그인을 0~N초에 균등 분산 (0 = 모든 VU 즉시 로그인). 실제 로그인은 오픈 전 시간에 퍼져 있다
 
 if (OPEN_DELAY_SEC < 61) throw new Error('OPEN_DELAY_SEC 는 61 이상이어야 한다 (드로우 오픈 1분 여유 규칙)');
+if (LOGIN_SPREAD_SEC < 0 || LOGIN_SPREAD_SEC >= OPEN_DELAY_SEC - 10) {
+  throw new Error('LOGIN_SPREAD_SEC 는 0 이상, OPEN_DELAY_SEC - 10 미만이어야 한다 (분산된 로그인이 오픈 전에 끝날 여유)');
+}
 if (WINNERS > CAPACITY) throw new Error('WINNERS 는 CAPACITY 이하여야 한다 (M ≥ K)');
 
 http.setResponseCallback(http.expectedStatuses({ min: 200, max: 299 }, 409));
@@ -88,6 +93,7 @@ export function setup() {
 
 export default function (data) {
   const i = exec.scenario.iterationInTest + 1;              // 1..USERS (per-vu-iterations·iterations 1 → VU 마다 고유)
+  if (LOGIN_SPREAD_SEC > 0) sleep(Math.random() * LOGIN_SPREAD_SEC);   // 로그인 분산 (측정 대상은 오픈 이후 구간)
   const token = login(userEmail(i), USER_PASSWORD);
   if (!token) { unexpected.add(1, { step: 'login' }); return; }
   if (Date.now() > data.openAtMs) loginLate.add(1);

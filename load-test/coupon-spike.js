@@ -1,6 +1,7 @@
 // 쿠폰 스파이크 — 시나리오 S3(spike)·S4(dup_burst, 같은 사용자 동시 BURST 회) (phase-8 3.4, T8-08·T8-09)
 //   S3·S4 는 쿠폰 이벤트를 따로 만든다: S3 는 수량 소진, S4 는 수량 여유(DUP_QUANTITY ≥ DUP_USERS)로 "중복 차단" 만으로 거절되게 한다
 // 실행: docker compose --profile loadtest run --rm k6 run -e USERS=3000 -e QUANTITY=500 /scripts/coupon-spike.js
+// 확대: docker compose --profile loadtest run --rm k6 run -e USERS=5000 -e QUANTITY=1000 -e START_DELAY_SEC=120 -e LOGIN_SPREAD_SEC=90 /scripts/coupon-spike.js
 // 사전 조건: prepare-users.js 로 loadtest-1..(DUP_USER_OFFSET + DUP_USERS) 생성 (기본 5,200)
 // 사용자별 202 개수는 k6 안에서 모을 수 없다 → S4 202 합계 ≤ DUP_USERS 임계값 + verify-coupon.sh <dupEventId> 로 판정
 import http from 'k6/http';
@@ -18,10 +19,14 @@ const DUP_QUANTITY = int('DUP_QUANTITY', 1000);     // S4 이벤트 수량 (DUP_
 const DUP_USER_OFFSET = int('DUP_USER_OFFSET', 5000);   // S4 사용자 번호 시작 (spike 사용자와 겹치지 않게)
 const START_DELAY_SEC = int('START_DELAY_SEC', 60);     // 이벤트 등록 → 발급 시작. 모든 VU 의 로그인이 이 안에 끝나야 한다
 const JITTER_MS = int('JITTER_MS', 500);
+const LOGIN_SPREAD_SEC = int('LOGIN_SPREAD_SEC', 0);    // 로그인을 0~N초에 균등 분산 (0 = 모든 VU 즉시 로그인). spike·dup_burst 공통
 
 if (DUP_USER_OFFSET < USERS) throw new Error('DUP_USER_OFFSET 은 USERS 이상이어야 한다');
 if (DUP_QUANTITY < DUP_USERS) throw new Error('DUP_QUANTITY 는 DUP_USERS 이상이어야 한다');
 if (START_DELAY_SEC < 5) throw new Error('START_DELAY_SEC 는 5 이상이어야 한다 (issueStartAt 은 미래여야 하고 로그인 시간이 필요)');
+if (LOGIN_SPREAD_SEC < 0 || LOGIN_SPREAD_SEC >= START_DELAY_SEC - 10) {
+  throw new Error('LOGIN_SPREAD_SEC 는 0 이상, START_DELAY_SEC - 10 미만이어야 한다 (분산된 로그인이 발급 시작 전에 끝날 여유)');
+}
 
 http.setResponseCallback(http.expectedStatuses({ min: 200, max: 299 }, 409));
 
@@ -93,6 +98,7 @@ function record(res) {
 
 export function spike(data) {
   const i = exec.scenario.iterationInTest + 1;                          // 1..USERS
+  if (LOGIN_SPREAD_SEC > 0) sleep(Math.random() * LOGIN_SPREAD_SEC);    // 로그인 분산 (측정 대상은 발급 시작 이후 구간)
   const token = login(userEmail(i), USER_PASSWORD);
   if (!token) { unexpected.add(1, { step: 'login' }); return; }
   if (Date.now() > data.startAtMs) loginLate.add(1);
@@ -103,6 +109,9 @@ export function spike(data) {
 export function dupBurst(data) {
   // BURST 개의 연속 반복이 같은 사용자 → 사용자당 동시 BURST 회
   const i = DUP_USER_OFFSET + Math.floor(exec.scenario.iterationInTest / BURST) + 1;
+  // 로그인 분산은 burst 동시성에 영향 없음: 같은 사용자의 BURST 개 VU 가 각자 다른 시각에 로그인해도
+  // 발급 요청은 아래 waitUntil(startAtMs, 0) 으로 같은 시각에 모인다
+  if (LOGIN_SPREAD_SEC > 0) sleep(Math.random() * LOGIN_SPREAD_SEC);
   const token = login(userEmail(i), USER_PASSWORD);
   if (!token) { unexpected.add(1, { step: 'login' }); return; }
   if (Date.now() > data.startAtMs) loginLate.add(1);
