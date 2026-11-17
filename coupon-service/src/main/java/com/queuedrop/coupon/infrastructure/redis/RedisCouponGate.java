@@ -5,6 +5,7 @@ import com.queuedrop.coupon.application.port.CouponGate;
 import com.queuedrop.coupon.application.port.GateResult;
 import com.queuedrop.coupon.application.port.GateUnavailableException;
 import com.queuedrop.coupon.domain.model.IssueOutcome;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Instant;
 import java.util.List;
 import java.util.function.Supplier;
@@ -19,11 +20,15 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class RedisCouponGate implements CouponGate {
 
+    private static final String COMPENSATED_METRIC = "coupon.issue.compensated";
+
     private final StringRedisTemplate redis;
     // 빈 이름 = 필드 이름 (infrastructure/config/RedisScriptConfig)
     private final RedisScript<String> couponIssueScript;
     private final RedisScript<Long> couponCompensateScript;
     private final RedisScript<Long> couponClaimScript;
+    /** coupon.issue.compensated{result} 기록용 (8단계 3.2, T8-13) */
+    private final MeterRegistry meterRegistry;
 
     @Override
     public void initialize(long couponEventId, int totalQuantity, Instant issueStartAt) {
@@ -50,12 +55,15 @@ public class RedisCouponGate implements CouponGate {
                 List.of(CouponKeys.remaining(couponEventId), CouponKeys.issued(couponEventId),
                         CouponKeys.requests(couponEventId), CouponKeys.persisted(couponEventId)),
                 String.valueOf(userId), requestId));
-        return switch (result.intValue()) {
+        CompensationResult compensation = switch (result.intValue()) {
             case 1 -> CompensationResult.COMPENSATED;
             case 0 -> CompensationResult.NOT_OURS;
             case 2 -> CompensationResult.ALREADY_PERSISTED;
             default -> throw new IllegalStateException("알 수 없는 보상 결과: " + result);
         };
+        // Lua 호출 자체가 실패하면 위에서 예외로 빠져 세지 않는다 (요청은 outcome=TEMPORARILY_FAILED 로 잡힌다)
+        meterRegistry.counter(COMPENSATED_METRIC, "result", compensation.name()).increment();
+        return compensation;
     }
 
     @Override

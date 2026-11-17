@@ -14,6 +14,7 @@ import com.queuedrop.common.error.ApplicationException;
 import com.queuedrop.entry.application.dto.DrawSummaryResult;
 import com.queuedrop.entry.application.exception.DrawErrorCode;
 import com.queuedrop.entry.application.service.DrawQueryService;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Instant;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -29,7 +30,7 @@ import org.springframework.test.web.servlet.ResultActions;
 
 /** 추첨 결과 조회 슬라이스 (단계 문서 5단계 3.4, T5-23). 공개 API 라 X-User-* 헤더 없이 호출한다. domain 타입 import 금지 */
 @WebMvcTest(DrawResultController.class)
-@Import(GlobalExceptionHandler.class)
+@Import({GlobalExceptionHandler.class, SimpleMeterRegistry.class})
 class DrawResultControllerTest {
 
     private static final String RESULT_PATH = "/api/entries/drops/{dropId}/result";

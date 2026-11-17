@@ -13,6 +13,7 @@ import com.queuedrop.queue.infrastructure.redis.RedisSchedulerGate;
 import com.queuedrop.queue.infrastructure.redis.RedisWaitingQueueRepository;
 import com.queuedrop.queue.infrastructure.redis.support.EntryRemainingFixture;
 import com.queuedrop.queue.infrastructure.redis.support.RedisTestSupport;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -38,7 +39,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
  * 같은 Redis 를 공유할 때, 한 주기에 전체에서 정확히 N 명만 입장한다.
  */
 @DataRedisTest
-@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisWaitingQueueRepository.class})
+@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisWaitingQueueRepository.class, SimpleMeterRegistry.class})
 class AdmissionConcurrencyIntegrationTest {
 
     private static final Long DROP_ID = 1L;

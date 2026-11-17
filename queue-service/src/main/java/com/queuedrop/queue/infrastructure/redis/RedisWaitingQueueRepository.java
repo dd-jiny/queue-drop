@@ -3,6 +3,7 @@ package com.queuedrop.queue.infrastructure.redis;
 import com.queuedrop.queue.domain.model.EnqueueResult;
 import com.queuedrop.queue.domain.model.QueueMeta;
 import com.queuedrop.queue.domain.repository.WaitingQueueRepository;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -24,12 +25,15 @@ public class RedisWaitingQueueRepository implements WaitingQueueRepository {
 
     private static final String OPEN_AT = "openAt";
     private static final String CLOSE_AT = "closeAt";
+    /** 입장 토큰 발급 수 (8단계 3.2) */
+    private static final String ADMITTED_METRIC = "queue.admitted";
 
     private final StringRedisTemplate redis;
     private final RedisScript<Long> enqueueScript;
     @SuppressWarnings("rawtypes")
     private final RedisScript<List> admitScript;
     private final RedisScript<Long> saveMetaScript;
+    private final MeterRegistry meterRegistry;
 
     /** HSET + PEXPIREAT + ZADD active-drops 를 save_meta.lua 하나로 (중간 실패로 meta 와 인덱스가 어긋나지 않게) */
     @Override
@@ -79,7 +83,12 @@ public class RedisWaitingQueueRepository implements WaitingQueueRepository {
                 List.of(QueueKeys.waiting(dropId), QueueKeys.entryRemaining(dropId)),
                 String.valueOf(n), String.valueOf(tokenTtl.toSeconds()),
                 QueueKeys.tokenPrefix(dropId), String.valueOf(now.toEpochMilli()));
-        return ids == null ? List.of() : ids.stream().map(id -> Long.valueOf(String.valueOf(id))).toList();
+        List<Long> admitted = ids == null ? List.of()
+                : ids.stream().map(id -> Long.valueOf(String.valueOf(id))).toList();
+        if (!admitted.isEmpty()) {
+            meterRegistry.counter(ADMITTED_METRIC).increment(admitted.size());   // 요청 n 이 아니라 실제 입장 인원
+        }
+        return admitted;
     }
 
     @Override

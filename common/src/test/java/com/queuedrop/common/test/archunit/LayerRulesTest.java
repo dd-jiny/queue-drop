@@ -160,7 +160,8 @@ class LayerRulesTest {
             return Stream.of(
                     arguments("bad.r3.event", "PublishingService"),     // common.event 메시지 record
                     arguments("bad.r3.topics", "TopicAwarePort"),       // common.event 토픽 상수 (port 패키지)
-                    arguments("bad.r3.jpa", "EntityManagerService"));   // jakarta.persistence
+                    arguments("bad.r3.jpa", "EntityManagerService"),    // jakarta.persistence
+                    arguments("bad.r3.metrics", "MeteredService"));     // io.micrometer (8단계 3.2: application 은 Micrometer 비의존)
         }
 
         @ParameterizedTest(name = "[T0-02a] R3 위반 샘플 {0} ({1}) 은 실패한다")

@@ -9,6 +9,9 @@ import com.queuedrop.queue.domain.model.QueueMeta;
 import com.queuedrop.queue.infrastructure.config.RedisScriptConfig;
 import com.queuedrop.queue.infrastructure.redis.support.EntryRemainingFixture;
 import com.queuedrop.queue.infrastructure.redis.support.RedisTestSupport;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -30,7 +33,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 
 @DataRedisTest
 @Import({RedisContainerConfig.class, RedisScriptConfig.class,
-        RedisWaitingQueueRepository.class, RedisRemainingCapacityReader.class})
+        RedisWaitingQueueRepository.class, RedisRemainingCapacityReader.class, SimpleMeterRegistry.class})
 class RedisWaitingQueueRepositoryTest {
 
     private static final Long DROP_ID = 1L;
@@ -42,6 +45,10 @@ class RedisWaitingQueueRepositoryTest {
 
     @Autowired
     private StringRedisTemplate redis;
+
+    /** 8단계: queue.admitted 카운터 확인용 */
+    @Autowired
+    private MeterRegistry meterRegistry;
 
     private EntryRemainingFixture entryRemaining;
 
@@ -461,6 +468,70 @@ class RedisWaitingQueueRepositoryTest {
             assertThat(repository.findMeta(DROP_ID)).contains(meta);
             assertThat(repository.rank(DROP_ID, 2L)).hasValue(1);
             assertThat(redis.opsForValue().get(seqKey(DROP_ID))).isEqualTo("2");
+        }
+    }
+
+    @Nested
+    @DisplayName("입장 메트릭 queue.admitted (8단계 3.2)")
+    class AdmittedMetric {
+
+        /** 태그 유무와 무관하게 이름 기준 합계 (단계 문서는 태그를 정하지 않았다) */
+        private double admitted() {
+            return meterRegistry.find("queue.admitted").counters().stream().mapToDouble(Counter::count).sum();
+        }
+
+        @Test
+        @DisplayName("[8단계 메트릭] 250명 대기, admit(n=100) 3회 → queue.admitted 는 실제 입장 인원 합 250 만큼 증가 (100·100·50)")
+        void countsAdmittedUsers() {
+            // Given
+            repository.saveMeta(openMeta(DROP_ID));
+            entryRemaining.initialize(DROP_ID, 1000);
+            enqueueAll(DROP_ID, LongStream.rangeClosed(1, 250).boxed().toList());
+            double before = admitted();
+
+            // When
+            repository.admit(DROP_ID, 100, TOKEN_TTL, base);
+            double afterFirst = admitted();
+            repository.admit(DROP_ID, 100, TOKEN_TTL, base);
+            repository.admit(DROP_ID, 100, TOKEN_TTL, base);
+
+            // Then
+            assertThat(afterFirst - before).isEqualTo(100.0);
+            assertThat(admitted() - before).as("요청 n 이 아니라 반환 인원만큼").isEqualTo(250.0);
+        }
+
+        @Test
+        @DisplayName("[8단계 메트릭] 잔여 정원 0 이면 입장 0명 → queue.admitted 증가 없음 (T8-07 소진 후 증가 멈춤)")
+        void soldOutDoesNotCount() {
+            // Given
+            repository.saveMeta(openMeta(DROP_ID));
+            entryRemaining.soldOut(DROP_ID);
+            enqueueAll(DROP_ID, List.of(1L, 2L, 3L));
+            double before = admitted();
+
+            // When
+            List<Long> result = repository.admit(DROP_ID, 100, TOKEN_TTL, base);
+
+            // Then
+            assertThat(result).isEmpty();
+            assertThat(admitted()).isEqualTo(before);
+        }
+
+        @Test
+        @DisplayName("[8단계 메트릭] 요청 n(10)이 대기 인원(5)보다 커도 반환된 입장 인원만큼만 증가")
+        void countsReturnedSizeNotRequestedN() {
+            // Given
+            repository.saveMeta(openMeta(DROP_ID));
+            entryRemaining.initialize(DROP_ID, 1000);
+            enqueueAll(DROP_ID, List.of(1L, 2L, 3L, 4L, 5L));
+            double before = admitted();
+
+            // When
+            List<Long> result = repository.admit(DROP_ID, 10, TOKEN_TTL, base);
+
+            // Then
+            assertThat(result).hasSize(5);
+            assertThat(admitted() - before).as("요청 n(10)이 아니라 반환 인원(5)").isEqualTo(5.0);
         }
     }
 }

@@ -16,4 +16,5 @@ dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testImplementation 'org.assertj:assertj-core'
     testImplementation 'jakarta.persistence:jakarta.persistence-api'
+    testImplementation 'io.micrometer:micrometer-core'   // R3 위반 샘플(bad.r3.metrics)용
 }

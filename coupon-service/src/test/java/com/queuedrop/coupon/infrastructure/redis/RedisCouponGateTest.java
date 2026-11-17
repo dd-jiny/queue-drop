@@ -16,6 +16,9 @@ import io.lettuce.core.codec.StringCodec;
 import io.lettuce.core.output.StatusOutput;
 import io.lettuce.core.protocol.CommandArgs;
 import io.lettuce.core.protocol.CommandType;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.time.Duration;
@@ -43,7 +46,7 @@ import org.springframework.data.redis.core.script.RedisScript;
  * 키 이름은 phase-6-coupon.md 3.3 / architecture.md 5장 문자열을 테스트가 독립적으로 고정한다 (CouponKeys 와 교차 검증).
  */
 @DataRedisTest
-@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisCouponGate.class})
+@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisCouponGate.class, SimpleMeterRegistry.class})
 class RedisCouponGateTest {
 
     private static final long EVENT_ID = 42L;
@@ -60,6 +63,10 @@ class RedisCouponGateTest {
 
     @Autowired
     private StringRedisTemplate redis;
+
+    /** 8단계: coupon.issue.compensated{result} 카운터 확인용. 직접 만드는 Gate 에도 넘긴다 */
+    @Autowired
+    private MeterRegistry meterRegistry;
 
     /** T6-28: CLIENT PAUSE 를 보낼 별도 연결의 접속 정보 */
     @Autowired
@@ -699,7 +706,7 @@ class RedisCouponGateTest {
             badFactory.start();
             try {
                 RedisCouponGate badGate = new RedisCouponGate(new StringRedisTemplate(badFactory),
-                        couponIssueScript, couponCompensateScript, couponClaimScript);
+                        couponIssueScript, couponCompensateScript, couponClaimScript, meterRegistry);
 
                 Map<String, Consumer<RedisCouponGate>> calls = Map.of(
                         "tryIssue", g -> g.tryIssue(EVENT_ID, USER_A, "r1", NOW),
@@ -717,6 +724,91 @@ class RedisCouponGateTest {
             } finally {
                 badFactory.destroy();
             }
+        }
+    }
+
+    @Nested
+    @DisplayName("보상 메트릭 coupon.issue.compensated (8단계 3.2, T8-13)")
+    class CompensationMetric {
+
+        private static final String METRIC = "coupon.issue.compensated";
+
+        private double count(String result) {
+            Counter counter = meterRegistry.find(METRIC).tag("result", result).counter();
+            return counter == null ? 0 : counter.count();
+        }
+
+        private double total() {
+            return meterRegistry.find(METRIC).counters().stream().mapToDouble(Counter::count).sum();
+        }
+
+        @Test
+        @DisplayName("[T8-13] 보상 성공 → coupon.issue.compensated{result=COMPENSATED} 1 증가 (정합성 이상 신호)")
+        void compensatedIsCounted() {
+            // Given
+            initialize(3);
+            issue(USER_A, "r1");
+            double before = count("COMPENSATED");
+            double totalBefore = total();
+
+            // When
+            CompensationResult result = gate.compensate(EVENT_ID, USER_A, "r1");
+
+            // Then
+            assertThat(result).isEqualTo(CompensationResult.COMPENSATED);
+            assertThat(count("COMPENSATED") - before).isEqualTo(1.0);
+            assertThat(total() - totalBefore).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("[T8-13] 판정 없이 보상(NOT_OURS, 무변화)도 result=NOT_OURS 로 센다 — COMPENSATED 로 세지 않는다")
+        void notOursIsCounted() {
+            // Given
+            initialize(3);
+            double before = count("NOT_OURS");
+            double compensatedBefore = count("COMPENSATED");
+
+            // When
+            CompensationResult result = gate.compensate(EVENT_ID, USER_A, "r1");
+
+            // Then
+            assertThat(result).isEqualTo(CompensationResult.NOT_OURS);
+            assertThat(count("NOT_OURS") - before).isEqualTo(1.0);
+            assertThat(count("COMPENSATED")).isEqualTo(compensatedBefore);
+        }
+
+        @Test
+        @DisplayName("[T8-13] 저장 확정 후 보상 → result=ALREADY_PERSISTED 1 증가")
+        void alreadyPersistedIsCounted() {
+            // Given
+            initialize(3);
+            issue(USER_A, "r1");
+            assertThat(gate.claimForSave(EVENT_ID, USER_A, "r1")).isTrue();
+            double before = count("ALREADY_PERSISTED");
+            double totalBefore = total();
+
+            // When
+            CompensationResult result = gate.compensate(EVENT_ID, USER_A, "r1");
+
+            // Then
+            assertThat(result).isEqualTo(CompensationResult.ALREADY_PERSISTED);
+            assertThat(count("ALREADY_PERSISTED") - before).isEqualTo(1.0);
+            assertThat(total() - totalBefore).isEqualTo(1.0);
+        }
+
+        @Test
+        @DisplayName("[T8-13] 판정(tryIssue)·저장 확정(claimForSave)은 보상 카운터를 올리지 않는다")
+        void otherOperationsAreNotCounted() {
+            // Given
+            initialize(3);
+            double totalBefore = total();
+
+            // When
+            issue(USER_A, "r1");
+            gate.claimForSave(EVENT_ID, USER_A, "r1");
+
+            // Then
+            assertThat(total()).isEqualTo(totalBefore);
         }
     }
 }

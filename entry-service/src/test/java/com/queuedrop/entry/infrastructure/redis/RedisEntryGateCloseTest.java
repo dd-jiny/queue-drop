@@ -12,6 +12,7 @@ import com.queuedrop.entry.infrastructure.config.RedisScriptConfig;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.api.StatefulRedisConnection;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -33,7 +34,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
  * 키 이름은 architecture.md 5장 문자열을 테스트가 독립적으로 고정한다 (EntryRedisKeys 와 교차 검증).
  */
 @DataRedisTest
-@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisEntryGate.class})
+@Import({RedisContainerConfig.class, RedisScriptConfig.class, RedisEntryGate.class, SimpleMeterRegistry.class})
 class RedisEntryGateCloseTest {
 
     private static final long DROP_ID = 52L;

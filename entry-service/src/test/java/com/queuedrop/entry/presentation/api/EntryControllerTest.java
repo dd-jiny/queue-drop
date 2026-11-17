@@ -20,6 +20,7 @@ import com.queuedrop.entry.application.dto.MyEntryResult;
 import com.queuedrop.entry.application.exception.EntryErrorCode;
 import com.queuedrop.entry.application.service.EntryApplyService;
 import com.queuedrop.entry.application.service.EntryQueryService;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Instant;
 import java.util.List;
 import java.util.stream.Stream;
@@ -42,7 +43,7 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
 
 /** presentation 슬라이스. domain 타입(ApplyOutcome, EntryStatus 등)은 import 하지 않는다 — status 는 문자열로만 다룬다. */
 @WebMvcTest(EntryController.class)
-@Import(GlobalExceptionHandler.class)
+@Import({GlobalExceptionHandler.class, SimpleMeterRegistry.class})
 class EntryControllerTest {
 
     private static final String APPLY_PATH = "/api/entries/drops/{dropId}";

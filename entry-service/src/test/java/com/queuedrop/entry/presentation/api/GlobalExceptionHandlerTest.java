@@ -1,5 +1,6 @@
 package com.queuedrop.entry.presentation.api;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import com.queuedrop.common.error.ApplicationException;
 import com.queuedrop.common.error.CommonErrorCode;
 import com.queuedrop.common.error.ErrorCode;
@@ -46,7 +47,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * 이후 @SpringBootTest(ApplicationContextTest) 컨텍스트에는 등록되지 않는다.
  */
 @WebMvcTest(controllers = GlobalExceptionHandlerTest.ExceptionTestController.class)
-@Import(GlobalExceptionHandlerTest.ExceptionTestController.class)
+@Import({GlobalExceptionHandlerTest.ExceptionTestController.class, SimpleMeterRegistry.class})
 @DisplayName("[T0-05] GlobalExceptionHandler 에러 응답 매핑")
 class GlobalExceptionHandlerTest {
 

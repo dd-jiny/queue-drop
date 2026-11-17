@@ -6,6 +6,7 @@ import com.queuedrop.common.test.container.RedisContainerConfig;
 import com.queuedrop.queue.infrastructure.config.RedisScriptConfig;
 import com.queuedrop.queue.infrastructure.redis.support.EntryRemainingFixture;
 import com.queuedrop.queue.infrastructure.redis.support.RedisTestSupport;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.OptionalLong;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -18,7 +19,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 /** Import 구성은 RedisWaitingQueueRepositoryTest 와 같게 두어 컨텍스트(컨테이너)를 재사용한다 */
 @DataRedisTest
 @Import({RedisContainerConfig.class, RedisScriptConfig.class,
-        RedisWaitingQueueRepository.class, RedisRemainingCapacityReader.class})
+        RedisWaitingQueueRepository.class, RedisRemainingCapacityReader.class, SimpleMeterRegistry.class})
 class RedisRemainingCapacityReaderTest {
 
     private static final Long DROP_ID = 1L;
