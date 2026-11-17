@@ -8,6 +8,15 @@ spring:
     gateway:
       server:
         webflux:
+          # 업스트림 커넥션 풀 (phase-8 #8 P1). 기본 ELASTIC 은 동시 요청 수만큼 새 연결을 열어 스파이크 때
+          # 서비스 Tomcat accept 큐(backlog)가 넘쳐 연결 리셋이 났다. FIXED 로 서비스(호스트)당 연결 수를 묶고
+          # 초과 요청은 게이트웨이에서 대기시킨다 (대기 큐 무제한, acquire-timeout 초과 시 오류)
+          httpclient:
+            pool:
+              type: FIXED
+              max-connections: ${GATEWAY_POOL_MAX_CONNECTIONS:200}     # 서비스 Tomcat 스레드 수(기본 200)와 맞춤
+              acquire-timeout: ${GATEWAY_POOL_ACQUIRE_TIMEOUT_MS:30000}
+              max-idle-time: 30s                                       # Tomcat keep-alive 타임아웃(60s)보다 짧게 → 닫힌 연결 재사용 방지
           routes:
             - id: user-service
               uri: ${USER_SERVICE_URL:http://localhost:8081}
