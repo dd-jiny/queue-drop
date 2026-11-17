@@ -1,6 +1,7 @@
 package com.queuedrop.entry.infrastructure.persistence;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -29,4 +30,21 @@ interface EntryJpaRepository extends JpaRepository<EntryJpaEntity, Long> {
     List<EntryJpaEntity> findAllByUserIdOrderByAppliedAtDesc(long userId);
 
     long countByDropId(long dropId);
+
+    @Query(value = "SELECT user_id FROM entries WHERE drop_id = :dropId ORDER BY entry_seq", nativeQuery = true)
+    List<Long> findUserIdsOrderBySeq(@Param("dropId") long dropId);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE entries SET status = 'WON', updated_at = now()
+             WHERE drop_id = :dropId AND status = 'APPLIED' AND user_id IN (:userIds)
+            """, nativeQuery = true)
+    int markWon(@Param("dropId") long dropId, @Param("userIds") Collection<Long> userIds);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE entries SET status = 'LOST', updated_at = now()
+             WHERE drop_id = :dropId AND status = 'APPLIED'
+            """, nativeQuery = true)
+    int markRemainingLost(@Param("dropId") long dropId);
 }

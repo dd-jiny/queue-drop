@@ -1,5 +1,8 @@
 package com.queuedrop.entry.infrastructure.persistence;
 
+import com.queuedrop.entry.domain.model.SnapshotStatus;
+import java.time.Instant;
+import java.util.List;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -19,4 +22,26 @@ interface DropSnapshotJpaRepository extends JpaRepository<DropSnapshotJpaEntity,
             ON CONFLICT (drop_id) DO NOTHING
             """, nativeQuery = true)
     int insertIfAbsent(@Param("e") DropSnapshotJpaEntity entity);
+
+    @Query("select s.dropId from DropSnapshotJpaEntity s"
+            + " where s.status = com.queuedrop.entry.domain.model.SnapshotStatus.OPEN and s.closeAt <= :now")
+    List<Long> findDueOpenIds(@Param("now") Instant now);
+
+    /** @return 1 = 이 호출이 전이시킴, 0 = 조건 불일치(이미 전이됨·마감 전·없음) */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE drop_snapshots SET status = 'CLOSING'
+             WHERE drop_id = :dropId AND status = 'OPEN' AND close_at <= :now
+            """, nativeQuery = true)
+    int markClosingIfOpen(@Param("dropId") long dropId, @Param("now") Instant now);
+
+    /** @return 1 = 이 호출이 전이시킴, 0 = CLOSING 아님 */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(value = """
+            UPDATE drop_snapshots SET status = 'DRAWN'
+             WHERE drop_id = :dropId AND status = 'CLOSING'
+            """, nativeQuery = true)
+    int markDrawnIfClosing(@Param("dropId") long dropId);
+
+    List<DropSnapshotJpaEntity> findByStatus(SnapshotStatus status);
 }

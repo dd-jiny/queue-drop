@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 설계 반영 완료 표시 |
 | v1.2 | 2026-11-17 | 착수 전 정리. D5-1 확정(사용자 결정: 경고 후 관리자 수동 추첨 API 포함, 3.2·3.4). E-42 확정(기본안: 추첨 완료 후 응모 키 6개 EXPIRE 1일, 3.2·3.3). E-41 개선안 2(Redis∖DB 대조)는 만들지 않음 — 수동 추첨이 DB 기준이라 Redis 에만 남은 응모는 빠진다(6장). E-30 반영(3.5 를 2단계 구현에 맞춤). 에러 코드를 0단계 계약(`ApplicationException` + `{SERVICE}_{REASON}`)에 맞춤 |
 | v1.3 | 2026-11-17 | 커밋 순서 변경 #2 영속성 → #3 Redis·Kafka 어댑터 → #4 유스케이스 — 포트 확장을 구현체·Fake 와 같은 커밋에 두어 커밋마다 컴파일·전체 테스트가 통과하게. 저장소 포트 id 인자를 원시 `long` 으로 통일(4단계 포트와 동일). T5-33 추가 |
+| v1.4 | 2026-11-17 | 마이그레이션 번호 V3 → V2 (entry 는 V1 만 있음). T5-34(DrawResult 영속) 추가. 벌크 UPDATE clearAutomatically |
 
 ---
 
@@ -94,7 +95,7 @@ entry-service/src/main/java/com/queuedrop/entry/
         └── response/DrawSummaryResponse.java        [신규]
 
 entry-service/src/main/resources/
-├── db/migration/V3__create_draw_results.sql         [신규]
+├── db/migration/V2__create_draw_results.sql         [신규]
 └── application.yml                                  [수정] entry.draw.* 설정
 
 product-service/src/main/java/com/queuedrop/product/
@@ -456,7 +457,7 @@ public class DrawQueryService {
 
 ### 3.3 entry-service — infrastructure
 
-#### Flyway `V3__create_draw_results.sql`
+#### Flyway `V2__create_draw_results.sql`
 ```sql
 CREATE TABLE draw_results (
     id              BIGSERIAL    PRIMARY KEY,
@@ -532,6 +533,8 @@ public void markResults(Long dropId, Set<Long> winnerUserIds) {
 }
 ```
 - `markClosingIfOpen` / `markDrawnIfClosing` 의 반환값(영향 행 수) `== 1` 을 `boolean` 으로 바꿔 domain 포트에 돌려준다.
+- 구현 메모 (v1.4): JPA 쿼리 인자도 원시 `long`. `findByStatus` 인자는 `SnapshotStatus`(enum 필드). JPQL 상태 비교는 enum 전체 이름. 당첨자 분할은 `subList` 1,000건(빈 집합이면 LOST 만). `DrawResultRepositoryImpl.save` 는 `saveAndFlush` — drop_id UK 위반을 save 호출에서 드러낸다. V2 id 는 V1 과 같은 `GENERATED ALWAYS AS IDENTITY`.
+- 벌크 UPDATE 는 `@Modifying(flushAutomatically = true, clearAutomatically = true)` 로 앞선 변경을 먼저 flush 하고 영속성 컨텍스트를 비운다 — 같은 트랜잭션에서 먼저 읽은 엔티티가 낡은 APPLIED 를 돌려주지 않게 (T5-15 보강).
 - `status = 'APPLIED'` 조건 덕분에 같은 트랜잭션이 재실행되어도 이미 확정된 행을 바꾸지 않는다.
 
 #### Redis 어댑터
@@ -788,6 +791,7 @@ public class DrawCompletedListener {
 | T5-31 | infra 통합 (Redis) | `RedisEntryGateCloseTest` | G: 응모 1건 있는 드로우(6개 키) / W: `expireAfterDraw(1d)` / T: 6개 키 TTL 이 0 초과 86400 이하. 응모 0건 드로우도 예외 없음 | E-42 |
 | T5-32 | presentation 슬라이스 | `AdminDrawControllerTest` | G: ADMIN 헤더 / 헤더 없음 / W: `POST /api/entries/admin/drops/1/draw` / T: 200 + seed 문자열 / 400 `COMMON_MISSING_USER_HEADER` (0단계 에러 계약) | D5-1 |
 | T5-33 | domain 단위 | `DrawResultTest` | G: applicantCount=-1 / winnerCount=-1 / winnerCount > applicantCount / 정상값 / W: `DrawResult.of`, `markPublished` / T: `DomainException` ×3 / 생성 성공·published=false, markPublished 는 published=true 인 새 인스턴스(원본 불변) | REQ-ENTRY-05 |
+| T5-34 | infra 통합 (PostgreSQL) | `DrawResultRepositoryImplTest` | G: DrawResult / W: save → findByDropId, findUnpublished, markPublished(2회), 같은 drop_id 재저장 / T: 필드 왕복(음수 seed, μs Instant), 미발행만 조회, 멱등, `DataIntegrityViolationException` | REQ-ENTRY-05 |
 
 ---
 
@@ -797,7 +801,7 @@ public class DrawCompletedListener {
 |---|------|-------------|
 | 0 | docs | `docs: 5단계 착수 전 결정 반영`<br>- D5-1(관리자 수동 추첨), D5-4(추첨 후 키 만료), E-30, 에러 코드 계약 정렬<br>- draw.md, class-diagram.md, 플랜·백로그 갱신 |
 | 1 | domain | `feat(entry): 추첨 도메인 모델과 Drawer 추가`<br>- Drawer: entry_seq 정렬 목록 + K + 시드 셔플 추첨<br>- DrawResult, DropSnapshot.isDue / isClosingTooLong / isClosing / isDrawn<br>- DrawResultRepository 포트(신규)<br>- T5-01 ~ T5-08, T5-33 |
-| 2 | infra (DB) | `feat(entry): 추첨 영속성 구현`<br>- DropSnapshotRepository·EntryRepository 포트 확장 + Impl + 테스트 Fake 갱신<br>- V3 draw_results 마이그레이션, DrawResult 영속(JpaEntity·Mapper·Impl, `DrawResult.restore`)<br>- 조건부 UPDATE(OPEN→CLOSING, CLOSING→DRAWN), 벌크 WON/LOST<br>- T5-14 ~ T5-16 |
+| 2 | infra (DB) | `feat(entry): 추첨 영속성 구현`<br>- DropSnapshotRepository·EntryRepository 포트 확장 + Impl + 테스트 Fake 갱신<br>- V2 draw_results 마이그레이션, DrawResult 영속(JpaEntity·Mapper·Impl, `DrawResult.restore`)<br>- 조건부 UPDATE(OPEN→CLOSING, CLOSING→DRAWN), 벌크 WON/LOST<br>- T5-14 ~ T5-16, T5-34 |
 | 3 | infra (Redis, Kafka) | `feat(entry): 마감 처리와 draw.completed 발행 구현`<br>- 포트 ApplicantCounter, DrawEventPublisher, SeedGenerator(+ DrawCompletedPayload), EntryGate.close·expireAfterDraw 와 어댑터를 함께<br>- RedisEntryGate.close·expireAfterDraw, RedisApplicantCounter<br>- KafkaDrawEventPublisher, SecureRandomSeedGenerator<br>- T5-19, T5-20, T5-31 |
 | 4 | application | `feat(entry): 마감·추첨 유스케이스 구현`<br>- DrawService(마감 잠금, 건수 비교, 재발행, 관리자 수동 추첨, 추첨 후 키 만료), DrawTransaction<br>- Fake 포트 갱신(장원영)<br>- T5-09 ~ T5-13, T5-28 ~ T5-30 (Fake 포트), T5-17 · T5-18 (DrawTransaction + PostgreSQL) |
 | 5 | presentation | `feat(entry): 추첨 스케줄러와 결과 조회·관리자 추첨 API 추가`<br>- DrawScheduler, DrawResultController, AdminDrawController<br>- T5-21 ~ T5-24, T5-32 |

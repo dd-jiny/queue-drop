@@ -38,6 +38,12 @@ public final class DrawResult {
         return new DrawResult(null, dropId, seed, applicantCount, winnerCount, drawnAt, false);
     }
 
+    /** 저장소 복원용. 저장 당시 검증을 통과한 값이므로 다시 검증하지 않는다. */
+    public static DrawResult restore(Long id, Long dropId, long seed, int applicantCount, int winnerCount,
+                                     Instant drawnAt, boolean published) {
+        return new DrawResult(id, dropId, seed, applicantCount, winnerCount, drawnAt, published);
+    }
+
     /** published=true 인 새 인스턴스. 원본은 바뀌지 않는다. */
     public DrawResult markPublished() {
         return new DrawResult(id, dropId, seed, applicantCount, winnerCount, drawnAt, true);

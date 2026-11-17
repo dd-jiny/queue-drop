@@ -3,6 +3,7 @@ package com.queuedrop.entry.domain.repository;
 import com.queuedrop.entry.domain.model.Entry;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /** 응모 영속성 포트. */
 public interface EntryRepository {
@@ -18,4 +19,12 @@ public interface EntryRepository {
     Optional<Entry> findByDropIdAndUserId(long dropId, long userId);
 
     List<Entry> findAllByUserId(long userId);
+
+    long countByDropId(long dropId);
+
+    /** entry_seq 오름차순 userId. 상태와 무관하게 전원 (추첨 입력의 결정적 순서). */
+    List<Long> findUserIdsOrderBySeq(long dropId);
+
+    /** winners → WON, 나머지 APPLIED → LOST (벌크). 이미 확정된 행은 바꾸지 않는다. */
+    void markResults(long dropId, Set<Long> winnerUserIds);
 }
