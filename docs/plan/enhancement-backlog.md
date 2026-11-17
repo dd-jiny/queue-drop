@@ -44,6 +44,7 @@
   2. 서비스별 단계에서 각자 넣는다(지금 계획). 빠뜨릴 위험이 있다.
 - **우선순위**: 중간 — 정상 상황에서는 영향이 없다. 장애 전파를 막는 기본값이므로 비용 대비 효과가 크다.
 - **영향 범위**: 4개 서비스 `application.yml`, `phase-0-foundation.md` 3.9, phase-3·6·7 문서
+- **처리 (coupon)**: 6단계 착수 전 `coupon-service` 에 `spring.data.redis.timeout: 1s` 반영 결정 (phase-6 v1.4). queue·ranking 은 남음.
 
 ### E-04 동기 발행 구간이 Tomcat 스레드를 잡아 Kafka 지연이 처리량 상한이 됨
 - **단계/위치**: phase-0 공통 producer 설정, phase-4/6 `send().get(3.5s)`
@@ -769,6 +770,8 @@
 - **우선순위**: 낮음~중간 — 유실은 없고 로그·지연뿐. 복제 전에 처리하면 한 번에 끝난다.
 - **영향 범위**: entry·product `KafkaConsumerConfig`, (6단계) coupon 동일, `architecture.md` 4장 실패 정책 표 비고
 
+- **처리 (coupon)**: 6단계에서 coupon `KafkaConsumerConfig` 는 DLT 재발행 전용 producer(`max.block.ms` 5s)로 시작 (phase-6 v1.4). entry·product 는 남음.
+
 ### E-51 추첨 쿼리 계획과 인덱스 — 현재 규모에서는 불필요, 응모자 수십만이면 커버링·부분 인덱스
 - **구분**: 고도화 (조회 최적화, 현재 규모에서는 불필요) (관련: E-26)
 - **단계/위치**: phase-5, `DropSnapshotJpaRepository.findDueOpenIds`·`findByStatus`, `EntryJpaRepository.countByDropId`·`findUserIdsOrderBySeq`·`markWon`·`markRemainingLost`, `V1__create_entry_tables.sql`, `V2__create_draw_results.sql`
@@ -841,3 +844,147 @@
   - 1 권장(비용 최소).
 - **우선순위**: 낮음 — 로컬 개발 환경 노이즈.
 - **영향 범위**: `gateway/build.gradle`
+
+---
+
+## phase-6 (쿠폰: coupon-service) 분석 — 2026-11-17
+
+분석 범위: `git diff dev...HEAD` (`feat/phase-6-coupon`, 커밋 7개). 기준 문서 `phase-6-coupon.md` v1.7 6장. **Gradle·EXPLAIN 실행 안 함**(동시 빌드 중). 쿼리 계획과 Redis 메모리는 스키마·인코딩 구조를 보고 추정했다.
+- 확인 완료: E-03(coupon `timeout: 1s`), E-50(DLT 전용 producer `max.block.ms` 5s, JSON·bytes 둘 다), E-40/E-41 방식(요청 ID·claim·보상 3결과, Redis 예외 → 보상 → 503)이 코드에 들어가 있다. DLT 적재 ERROR 로그(`loggingRecoverer`)도 있다. 발급 경로는 DB 를 쓰지 않는다(좋음).
+- 명백한 버그(정합성·장애 경로)는 찾지 못했다. 아래 E-58 은 정합성 위험이지만, 6장 리스크("Redis 유실 → 재초기화 시 초과 발급, AOF 전제")에 이미 적힌 수용 리스크라서 버그로 분류하지 않았다.
+
+### E-56 쿠폰 피크 발급 경로 — 매진 전과 후의 부하 구조가 다르고, Kafka·Redis 장애 때 부하가 커짐
+- **구분**: 고도화 (응답 경로·피크 병목) (관련: E-04, E-43, D6-2)
+- **단계/위치**: phase-6, `CouponIssueService.issue`, `KafkaCouponEventPublisher.publishIssued`(`get(3500ms)`), `coupon-issue.lua`, `application.yml`(가상 스레드 미사용, Redis `timeout: 1s`)
+- **현상**: 대기열이 없어서 오픈 순간 요청이 모두 Tomcat 으로 들어온다. 요청 1건은 Lua 1회(O(1): HGET·SISMEMBER·GET)를 실행하고, 판정이 `OK` 일 때만 acks=all 동기 대기를 한다. 매진·중복·시작 전 요청은 Redis 1왕복으로 끝난다.
+- **문제/기회**:
+  - **정상 시**: Kafka 대기는 성공 요청(수량 M 이하)에만 걸린다. 매진 뒤에는 Redis 만 거치므로 E-43 의 Tomcat 고갈 위험은 응모보다 작다. **현재 규모에서는 정상 경로 최적화가 필요 없다.**
+  - **Kafka 장애 시**: 성공 판정 → 3.5초 대기 → 보상(INCR) 순서라 자리가 계속 되돌아온다. 그래서 장애 중에는 **매진되지 않고**, 동시에 `min(잔여, 200 스레드)` 개 요청이 3.5초씩 붙잡힌다. 처리량은 인스턴스당 약 57건/초로 떨어진다(계산). 잔여가 스레드 수보다 적으면 나머지 요청은 일시적으로 `SOLD_OUT` 을 받는다. 그 뒤 보상으로 자리가 돌아오면 늦게 온 사람이 받게 되어, 사용자 눈에는 선착순이 뒤집힌 것처럼 보인다. 정합성(초과 발급)에는 영향이 없다.
+  - **Redis 포화 시**: 판정 타임아웃(1초)이 나면 `compensateQuietly` 가 Lua 를 한 번 더 실행해서 Redis 호출이 2배가 된다. 503 을 받은 클라이언트가 재시도하면 부하가 더 커진다. 같은 Redis 를 응모·대기열·랭킹이 함께 쓰므로 영향이 서비스 전체로 번진다(6장 리스크 1).
+- **근거**: 코드 분석과 계산(추정). Redis 단일 스레드의 EVALSHA 처리량은 수만~10만/초 수준(추정)이다. 정상 시 지연은 측정하지 않았다(T6-13 기록과 8단계에서 확인).
+- **개선안**:
+  1. **가상 스레드**(E-43 개선안 1): Kafka 장애 때 스레드 고갈을 없앤다. 장애 중 매진되지 않는 현상은 그대로 남는다.
+  2. **D6-2 (b) 로컬 매진 플래그**를 넣을 때는 **짧은 TTL(예: 200ms~1s)** 을 둔다. 보상으로 자리가 되돌아오므로 영구 플래그를 쓰면 언더 발급이 고정된다. 초과 발급 방향은 아니다. 대가: 인스턴스마다 매진 인지가 최대 TTL 만큼 늦다.
+  3. gateway `RequestRateLimiter`(사용자당 초당 N회)로 연타·재시도 증폭을 막는다. Redis 를 쓰는 rate limiter 는 오히려 Redis 부하를 늘리므로 로컬 토큰 버킷이 맞다.
+  4. 보상 호출에 짧은 백오프·서킷을 둔다(Redis 포화 시 2배 호출 방지). 대가: 보상이 늦어지는 동안 수량 한 자리가 일시적으로 묶인다.
+  - 1 을 권장한다(설정 1줄, E-43 과 함께). 2·3 은 8단계 쿠폰 스파이크 측정에서 Redis CPU 가 포화될 때만 넣는다.
+- **우선순위**: 중간 — 정상 경로는 문제없다. 장애와 피크가 겹칠 때 증폭이 일어나는데, 쿠폰 오픈이 그런 상황이다.
+- **영향 범위**: `application.yml`, `phase-6-coupon.md` D6-2, `phase-8-load-test.md` 쿠폰 스파이크 시나리오, (3) `gateway/application.yml`
+
+### E-57 쿠폰 Redis 키 메모리 — TTL 이 없어 이벤트가 끝나도 계속 쌓임 (현재 규모에서는 불필요)
+- **구분**: 고도화 (Redis 메모리, 현재 규모에서는 불필요) (관련: E-42, E-39)
+- **단계/위치**: phase-6, `CouponKeys`, `coupon-issue.lua`·`coupon-claim.lua`
+- **현상**: 이벤트당 `meta`·`remaining`·`issued`(Set)·`requests`(Hash userId→UUID)·`persisted`(Set) 5개 키를 쓴다. 발급 종료 시각이 없어서(6장 리스크) TTL 이 없고, 지우는 경로도 없다.
+- **문제/기회**: 원소 수는 수량 M 을 넘지 않는다. M 이 Set 128~512개, Hash 128개를 넘으면 hashtable 인코딩이 된다. 원소당 메모리는 `issued` 약 60B, `requests` 약 100B(UUID 36자 값), `persisted` 약 60B로, 합쳐 **자리당 약 220B** 다(추정). M=1만이면 이벤트당 약 2.2MB, 이런 이벤트 100개가 쌓이면 약 220MB 가 영구히 남는다. 현재 규모(이벤트 수 개~수십 개)에서는 수십 MB 이하라 **불필요**하다.
+- **근거**: Redis 인코딩 규칙을 보고 계산(추정). `MEMORY USAGE` 는 측정하지 않았다.
+- **개선안**:
+  1. 현행 유지. 이벤트가 늘면 관리 API "이벤트 종료"를 만들고 `requests`·`persisted` 만 EXPIRE 한다. **주의**: `requests` 를 일찍 지우면 DLT 재처리 때 claim 이 0 을 반환해 발급이 조용히 사라진다. 그래서 DLT·lag 이 0 인 것을 확인한 뒤에만 지워야 한다. `meta`·`remaining` 을 지우거나 만료시키면 재초기화(SET NX)가 수량을 처음부터 다시 채워 **초과 발급**이 된다(E-58). 따라서 이 두 키는 남기거나, E-58 의 DB 기반 가드를 먼저 넣어야 한다.
+  2. `requests` 값을 UUID 문자열 대신 16바이트 바이너리로 저장한다. 메모리는 약 30% 줄지만 디버깅(로그 대조)이 어려워진다. 권하지 않는다.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다.
+- **영향 범위**: `architecture.md` 5장 키 표(TTL 열), `CouponKeys`, (1) 관리 API·`coupon-issue.md`
+
+### E-58 재초기화 API 가 Redis 키가 사라진 상태에서는 수량을 처음부터 다시 채움 — DB 발급 건수를 보지 않음
+- **구분**: 고도화 (정합성 위험 — 운영 경로, 6장 수용 리스크의 보강) (관련: E-06)
+- **단계/위치**: phase-6, `CouponEventService.reinitialize`, `RedisCouponGate.initialize`(SET NX `remaining` + HSETNX `meta`, 별도 명령 2개)
+- **현상**: 재초기화는 키가 있으면 아무것도 바꾸지 않는다(SET NX). 키가 없으면 `remaining = totalQuantity` 로 채운다. `issued_coupons` 건수와 `issued` Set 은 확인하지 않는다.
+- **문제/기회**: 다음 경우에 재초기화를 호출하면 이미 발급된 N장 위에 M장을 다시 발급해 **최대 M+N 장(초과 발급)** 이 된다. DB UK 는 같은 사용자만 막는다.
+  - Redis 볼륨을 잃은 경우(`docker compose down -v`, 볼륨 재생성)
+  - E-06 의 OS/VM 장애로 AOF 마지막 1~2초가 사라진 경우. 쿠폰 오픈 직후 1~2초는 수량 대부분이 발급되는 구간일 수 있다.
+  - 운영자가 키를 지운 경우(E-57 개선안 1)
+
+  "Redis 장애 후 재초기화"는 6장 리스크가 안내하는 복구 수단이라 사람이 실제로 누를 가능성이 높다. AOF 1초 유실은 재초기화 없이도 생긴다. 이 경우 `remaining` 이 유실분만큼 커지는데, 이건 E-06 과 같은 성격이다.
+- **근거**: 코드 분석. 키가 없는 상태에서 SET NX 는 반드시 성공한다(추정 아님).
+- **개선안**:
+  1. **가드**: 재초기화 전에 `COUNT(*) FROM issued_coupons WHERE coupon_event_id = ?` 를 조회하고, 0 보다 크면 409(`COUPON_REINIT_REQUIRES_REBUILD`)로 거부한다. 키가 남아 있는 정상 재호출은 건수와 관계없이 지금처럼 동작하게 하려면 `EXISTS remaining` 을 먼저 본다. 코드는 몇 줄이다. 대가: 키를 잃은 이벤트는 복구할 수 없어 서비스 불가(언더 발급 방향)가 된다.
+  2. **DB 기반 재구성**: 컨슈머 lag·DLT 가 0 인 것을 확인한 뒤 `remaining = total − COUNT`, `issued`·`persisted` 에 DB 의 userId 를 넣는다. `requests` 는 비워 둔다(진행 중인 요청이 없다는 전제). E-06 개선안 1 의 쿠폰판이다. 대가: 관리 API 1개와 lag 확인 절차가 필요하다. 진행 중 메시지가 남아 있으면 그 발급은 claim 0 으로 사라진다(언더 발급).
+  - 1 을 지금 권장한다(초과 발급 경로를 비용 최소로 막음). 2 는 E-06 복구 절차를 정할 때 함께 만든다.
+- **우선순위**: 중간 — 빈도는 낮지만 일어나면 불변식("수량 이하 발급")이 깨진다. 가드 비용은 쿼리 1개다.
+- **영향 범위**: `CouponEventService.reinitialize`, `IssuedCouponRepository`(count 추가), `CouponErrorCode`, `coupon-issue.md` 재초기화 절, `phase-6-coupon.md` 6장 리스크
+
+### E-59 보상 실패(영구 DUPLICATE)·DLT 적재분을 복구할 도구와 절차가 없음
+- **구분**: 고도화 (운영·복구) (관련: E-12, 6장 리스크 "DLT 적재분 방치"·"보상까지 실패한 사용자")
+- **단계/위치**: phase-6, `CouponIssueService.compensateQuietly`(ERROR 로그에 couponEventId·userId·requestId), `KafkaConsumerConfig.loggingRecoverer`(ERROR 로그에 topic·partition·offset·key)
+- **현상**: 두 경우 모두 감지 수단은 ERROR 로그 1줄뿐이고, 복구 방법은 문서에 없다.
+  - (a) 보상 실패: `issued`·`requests` 에는 남고 `persisted` 에는 없으며, 메시지도 없다. 사용자는 영구히 `DUPLICATE`(409)를 받고 `/me` 에는 쿠폰이 보이지 않는다. 수량 한 자리가 샌다.
+  - (b) DLT: claim 은 됐을 수도, 안 됐을 수도 있다. 사용자는 202 를 받았는데 `/me` 에는 영원히 비어 있다.
+- **문제/기회**: 두 경우 모두 **안전한 복구 수단이 이미 코드에 있다**. 도구로 꺼내기만 하면 된다.
+  - (a) 로그의 requestId 로 `coupon-compensate.lua` 를 다시 실행하면 된다. Lua 가 `persisted`·requestId 를 대조하므로, 늦게 도착한 유령 메시지가 먼저 저장됐다면 `ALREADY_PERSISTED` 로 거절된다. 따라서 잘못 되돌릴 위험이 없다.
+  - (b) DLT 레코드를 key 와 함께 `coupon.issued` 에 다시 넣으면 된다. claim(재전달에도 1)과 `ON CONFLICT DO NOTHING` 덕분에 멱등이다. 다만 역직렬화 실패로 bytes 그대로 적재된 레코드는 다시 넣어도 또 실패한다. 이건 원인(스키마)부터 고쳐야 한다.
+- **근거**: Lua·서비스 코드 분석.
+- **개선안**:
+  1. **운영 절차 문서 + 스크립트**: (a) `redis-cli EVALSHA <compensate> 4 coupon:{id}:remaining coupon:{id}:issued coupon:{id}:requests coupon:{id}:persisted {userId} {requestId}` 를 실행하고 반환값을 해석한다. (b) `kafka-console-consumer --property print.key=true` → `kafka-console-producer --property parse.key=true` 로 DLT 를 원본 토픽에 다시 넣는 `infra/kafka/replay-dlt.sh` 를 둔다. 코드 변경은 없다. 대가: 사람이 로그를 보고 한 건씩 처리해야 한다.
+  2. **관리 API**: `POST /api/coupons/events/{id}/compensate {userId, requestId}`(ADMIN)로 기존 `gate.compensate` 를 그대로 호출한다. 정합성 검사는 Lua 가 하므로 새 로직이 없다. 대가: 엔드포인트와 테스트 1세트가 늘어난다.
+  3. **자동 대조**: `issued ∖ persisted` 중 오래된 항목을 찾아 보상한다. "오래됨"을 판단하려면 `requests` 값에 시각을 넣어야 하고, Lua 3개의 형식을 바꿔야 한다. 현재 규모에서는 과하다.
+  - 1 을 권장한다(8단계 장애 주입 시나리오의 복구 단계로 바로 쓸 수 있다). 2 는 운영 화면이 생길 때 검토한다.
+- **우선순위**: 중간 — 발생 빈도는 낮다. 다만 일어나면 사용자에게 보이는 상태가 영구히 틀리고, 지금은 복구 방법을 아는 사람이 없다. 비용은 문서와 스크립트 수준이다.
+- **영향 범위**: `phase-6-coupon.md` 6장(운영 절차), `coupon-issue.md` 장애 대응 절, `infra/kafka/`(스크립트), (2) `CouponEventController`·`CouponEventService`
+
+### E-60 쿠폰 관측 지표 없음, 매진 이후 요청마다 WARN 로그 1줄이 찍힘
+- **구분**: 고도화 (관측성·로그, 8단계 준비) (관련: E-10, E-47, E-12)
+- **단계/위치**: phase-6, `GlobalExceptionHandler.handleApplication`(4xx 는 `log.warn` 1줄), `CouponIssueService`, `CouponSaveService`(유령 무시 warn), `KafkaConsumerConfig.loggingRecoverer`
+- **현상**:
+  - `SOLD_OUT`·`DUPLICATE`·`NOT_STARTED`(409)도 요청마다 WARN 1줄을 남긴다. 503 은 스택이 포함된 ERROR 다(E-10).
+  - 판정 결과별 건수, 발행 지연, 보상 결과, 유령 무시, DLT 적재를 볼 지표가 없다.
+- **문제/기회**:
+  - 쿠폰은 대기열이 없어서 **매진 뒤 요청이 가장 많다**. 매진 후 초당 1만 건이면 WARN 1만 줄/초(약 1.5MB/s, 추정)가 동기 콘솔 appender 로 요청 스레드에서 찍힌다. 그러면 Redis 1왕복으로 끝나야 할 매진 경로가 로그 I/O 에 묶인다. 응모는 대기열이 유입을 조절해서 덜하지만, 쿠폰에서는 가장 큰 로그원이 된다.
+  - 정합성 상태도 볼 수 없다. 다음 대조식을 쓰면 별도 저장 없이 이상을 감지할 수 있다(정상 시 둘 다 진행 중 건수만큼만 차이 남).
+    - `SCARD issued − SCARD persisted` = 진행 중 + DLT 미처리 + 보상 실패 누수
+    - `SCARD persisted − COUNT(issued_coupons)` = claim 후 DB 저장 실패(DLT)
+- **근거**: 코드 확인. 로그량은 계산(추정)이다.
+- **개선안**:
+  1. **로그**: 비즈니스 거절 코드(`SOLD_OUT`·`DUPLICATE`·`NOT_STARTED`)는 debug 로 내리거나 로그에서 빼고, 카운터로 센다. 방법은 `ErrorCode` 에 로그 레벨 속성을 두는 것이다(E-10 개선안 1 과 같은 장치, E-11 의 6개 복제본 문제와 함께 처리). 503 은 warn 1줄.
+  2. **Micrometer**: `coupon.issue{outcome}` 카운터, `coupon.publish` Timer, `coupon.compensate{result=COMPENSATED|NOT_OURS|ALREADY_PERSISTED|FAILED}`, `coupon.save.ghost_skipped`, `coupon.dlt` 카운터. couponEventId 태그는 넣지 않는다.
+  3. **대조 점검**: 위 두 차이를 이벤트별로 관리 조회 API 또는 주기적 로그로 노출한다(SCARD 2회 + COUNT 1회). 8단계 결과 검증("발급 수 = 수량")에도 그대로 쓴다.
+  - 1 을 가장 먼저 권장한다(쿠폰 스파이크 측정을 왜곡하는 직접 원인). 2·3 은 8단계 전에 넣는다.
+- **우선순위**: 중간 — 1 은 8단계 쿠폰 스파이크 결과에 직접 영향을 준다.
+- **영향 범위**: `GlobalExceptionHandler`(6개 복제본, E-11), `common.error.ErrorCode`, `CouponIssueService`·`CouponSaveService`(또는 어댑터), `phase-8-load-test.md` 메트릭 표
+
+### E-61 쿠폰 이벤트 조회 — 매 요청 DB PK 조회 + Redis GET, 불변 데이터라 캐시해도 안전 (현재 규모에서는 불필요)
+- **구분**: 고도화 (조회 최적화, 현재 규모에서는 불필요) (관련: E-28)
+- **단계/위치**: phase-6, `CouponQueryService.event`, `CouponEventRepositoryImpl.findById`, `RedisCouponGate.remaining`
+- **현상**:
+  - 공개 API `GET /api/coupons/events/{id}` 는 요청마다 `coupon_events` PK 조회 1회(readOnly 트랜잭션, 커넥션 1개 점유)와 Redis GET 1회를 실행한다. 트랜잭션 밖에서 Redis 를 호출하는 구조는 좋다.
+  - `remaining` 키가 없으면(초기화 실패) 0 을 반환한다. 시작 전 이벤트가 "잔여 0"으로 보이고, 운영자 화면에서는 초기화 실패와 매진을 구분할 수 없다.
+- **문제/기회**:
+  - 오픈 직전·직후에는 사용자가 잔여 수량을 보려고 새로고침을 반복한다. PK 조회는 0.x ms 라 Hikari 기본 10개로도 초당 수천 건은 버틴다(추정). 따라서 **현재 규모에서는 불필요**하다.
+  - E-28(드로우 상태 캐시는 위험)과 달리 `CouponEvent` 는 수정·삭제 API 가 없는 **불변 데이터**다. 그래서 name·totalQuantity·issueStartAt 은 무효화 없이 캐시해도 정합성 문제가 없다. 잔여 수량은 계속 Redis 에서 읽는다.
+- **근거**: 코드 분석과 계산(추정).
+- **개선안**:
+  1. 현행 유지(권장).
+  2. 필요해지면 infrastructure 에 Caffeine 로컬 캐시를 둔다(크기 상한 수백, TTL 불필요, 없는 id 는 캐시하지 않음). DB 호출이 0 이 된다. 대가: 의존성 1개. 나중에 수정 API 가 생기면 무효화가 필요하다.
+  3. `remaining` 이 null 일 때 0 대신 "미초기화"를 구분해 돌려준다(응답 필드 추가 또는 로그). 운영 감지용이다.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다. 3 은 E-59 운영 절차와 함께 검토한다.
+- **영향 범위**: `CouponEventRepositoryImpl`(캐시 시), `CouponQueryService`, (3) `CouponEventResponse`·`coupon-issue.md` API 표
+
+### E-62 내 쿠폰 조회 — 이벤트명을 이벤트별 `findById` 로 조회(N+1 형태), 메모리 재정렬은 중복, 페이지네이션 없음 (현재 규모에서는 불필요)
+- **구분**: 고도화 (JPA·조회, 현재 규모에서는 불필요) (관련: E-44)
+- **단계/위치**: phase-6, `CouponQueryService.myCoupons`, `IssuedCouponJpaRepository.findByUserIdOrderByIssuedAtDescIdDesc`, `V2__create_issued_coupons.sql`(`idx_issued_coupons_user (user_id, issued_at DESC)`)
+- **현상**:
+  - 쿼리는 1(목록) + D(서로 다른 이벤트 수)회다. HashMap 으로 같은 이벤트는 한 번만 조회한다.
+  - DB 가 이미 `issued_at DESC, id DESC` 로 정렬해서 주는데, 서비스가 `issuedAt` 역순으로 한 번 더 정렬한다. 안정 정렬이라 결과는 같다.
+  - 인덱스에 `id` 가 없어 동률 타이브레이크는 Incremental Sort 또는 Sort 로 처리한다(추정). 전체 컬럼을 읽는다.
+  - 저장 INSERT 는 FK 확인을 위해 `coupon_events` 행에 `FOR KEY SHARE` 를 건다. 같은 이벤트에 컨슈머 6개가 동시에 INSERT 하면 MultiXact 가 생긴다.
+- **문제/기회**: 사용자당 쿠폰은 이벤트당 1장이라 D 는 수~수십이다. 쿼리 수십 회, 각 PK 조회라 **현재 규모에서는 불필요**하다. MultiXact 도 정원 수만에서는 무시할 수준이다(추정, E-48 남은 측정 항목과 같은 성격).
+- **근거**: 코드 분석. EXPLAIN 은 측정하지 않았다.
+- **개선안**:
+  1. 현행 유지 + 메모리 재정렬 제거(정렬 책임을 저장소 한 곳으로). 비용 0. 단, 포트 계약 "최신순 반환"을 주석이나 테스트로 고정해야 한다.
+  2. 목록이 커지면 이렇게 바꾼다.
+     - 이벤트명 조회: `eventRepository.findAllById(ids)` 1회(IN). 또는 JPQL 프로젝션 `SELECT ic.couponEventId, ce.name, ic.issuedAt FROM issued_coupons ic JOIN coupon_events ce ...` 1쿼리.
+     - 인덱스: `(user_id, issued_at DESC, id DESC)`.
+     - 페이징: keyset.
+
+     대가: 도메인 저장소 포트에 메서드가 추가되거나, 조회 전용 포트가 생긴다.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다. 1 은 비용이 거의 없다.
+- **영향 범위**: `CouponQueryService`, (2) `CouponEventRepository`, Flyway V3
+
+### E-63 쿠폰 저장 컨슈머 처리량 — 레코드당 claim Lua 1회 + INSERT 1트랜잭션 (현재 규모에서는 불필요)
+- **구분**: 고도화 (Kafka·DB 처리량, 현재 규모에서는 불필요) (관련: E-46, D6-3)
+- **단계/위치**: phase-6, `CouponIssuedListener`, `CouponSaveService.save`, `application.yml`(`concurrency: 3`, 파티션 6)
+- **현상**: 레코드 1건 = `coupon-claim.lua` 1회 + native INSERT 1회(건당 커밋)다. 파티션 키 `{couponEventId}:{userId}` 로 6개 파티션에 고르게 퍼져서 핫 파티션이 없다(좋음). 인스턴스 1개면 스레드 3개가 파티션 6개를 나눠 맡는다.
+- **문제/기회**: 건당 2~5ms 로 보면(추정, E-46 과 같은 가정) 스레드 6개 합계 초당 1,200~3,000건이다. M=1만이 매진되면 lag 은 약 3~8초다. 쿠폰은 응모와 달리 마감·추첨이 lag 을 기다리지 않는다. lag 은 "`/me` 가 잠깐 비어 보임"(D6-3)으로만 나타나므로 **현재 규모에서는 불필요**하다.
+- **근거**: 계산(추정). 8단계에서 consumer lag 을 측정해야 한다.
+- **개선안**:
+  1. 현행 유지(권장).
+  2. 정원 수십만이면 배치 리스너 + 배치 claim Lua(사용자·requestId 배열) + 다중 행 `INSERT ... ON CONFLICT DO NOTHING`. E-46 개선안 1 과 같고, claim Lua 도 배치 형태로 바꿔야 한다. 대가: DLT 대상 레코드를 식별하기 복잡하다(`BatchListenerFailedException`).
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다.
+- **영향 범위**: `CouponIssuedListener`, `CouponSaveService`, `coupon-claim.lua`, `KafkaConsumerConfig`

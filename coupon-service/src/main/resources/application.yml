@@ -20,6 +20,7 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+      timeout: 1s                # 명령 타임아웃 (Lettuce 기본 60초). 발급 응답 경로가 Redis 장애에 오래 묶이지 않게
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
@@ -32,11 +33,20 @@ spring:
         request.timeout.ms: 1000
         delivery.timeout.ms: 3000
         max.block.ms: 1000         # send() 호출 자체의 블로킹 상한 (기본 60초)
+        linger.ms: 0               # Kafka 4.0 클라이언트 기본값 5ms. 응답 경로에 배치 대기를 넣지 않는다
     consumer:
       group-id: ${spring.application.name}
       auto-offset-reset: earliest
+      enable-auto-commit: false    # 처리 성공 후 컨테이너가 커밋 (ack-mode record)
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       properties:
         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
         spring.json.trusted.packages: com.queuedrop.common.event
+    listener:
+      ack-mode: record             # 레코드 단위로 처리 성공 후 커밋
+      concurrency: 3               # coupon.issued 파티션 6 → 인스턴스 2개 기준 3씩 (entry 와 같음)
+
+coupon:
+  publish:
+    await-timeout: 3500ms          # delivery.timeout.ms(3000) + 여유
