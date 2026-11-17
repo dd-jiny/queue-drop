@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-17 | DLT recoverer 에 목적지 리졸버 명시 (Spring Kafka 4 기본 `{topic}-dlt`, 4단계 v1.4 에서 확인) |
 | v1.3 | 2026-11-17 | 결정 필요 D6-4·리스크에 메모 추가: 4단계 E-40/E-41(유령 이벤트가 보상보다 먼저 소비, 판정 Lua 타임아웃) 과 같은 방식 적용 필요. 설계 확정은 6단계 착수 시 |
 | v1.4 | 2026-11-17 | 착수 전 정리. D6-4 확정 — 4단계 E-40/E-41 사용자 결정을 그대로 적용 (요청 ID `requests`, 저장 확정 `persisted` + claim Lua, 보상 3결과, Redis 예외 → `GateUnavailableException` → 보상 후 503, ALREADY_PERSISTED 면 202). D6-1~3 확정(기본안). 4단계 계약 정렬: `ApplicationException(CouponErrorCode)`·코드명 `COUPON_*`, 포트 id 는 `long`, `isIssued` 제거 → `claimForSave`. Redis 명령 타임아웃 1s (E-03). DLT 재발행 전용 producer `max.block.ms` 5s (E-50, 쿠폰부터). 테스트 T6-16·T6-22 재작성, T6-24~T6-30 추가. 신민아 착수 전 검토 반영: Requester+AdminGuard, CouponErrorCode.from, 등록 시 remaining 재조회 제거, 발행 어댑터 RuntimeException 감싸기, DLT JSON·bytes 전용 템플릿, GlobalExceptionHandler 확인, 리스너 pause, CLIENT PAUSE 타임아웃, gateway 변경 없음 |
+| v1.5 | 2026-11-17 | Redis 장애 변환 위치 명시: `reinitialize`·`event` 는 서비스에서 `GateUnavailableException` → `ApplicationException(TEMPORARILY_FAILED)` (신민아 MAJOR — 그대로 올리면 500). `CouponQueryService.event` 는 트랜잭션 없이 |
 
 ---
 
@@ -280,7 +281,8 @@ public class CouponEventService {
         return toResult(saved, saved.getTotalQuantity());
     }
 
-    /** 관리자 재초기화: SET NX 라 진행 중인 잔여 수량을 덮어쓰지 않는다. Redis 장애면 GateUnavailableException → 503 */
+    /** 관리자 재초기화: SET NX 라 진행 중인 잔여 수량을 덮어쓰지 않는다.
+     *  Redis 장애(GateUnavailableException)는 서비스에서 ApplicationException(TEMPORARILY_FAILED) 로 감싸 503 (GlobalExceptionHandler 는 ApplicationException 만 처리) */
     public void reinitialize(CouponReinitializeCommand command) {
         AdminGuard.requireAdmin(command.requester());
         CouponEvent event = eventRepository.findById(command.couponEventId())
@@ -371,9 +373,9 @@ public class CouponSaveService {
 ```java
 @Service
 @RequiredArgsConstructor
-@Transactional(readOnly = true)
 public class CouponQueryService {
-    public CouponEventResult event(long couponEventId) { /* DB 이벤트 + gate.remaining (Redis 장애면 GateUnavailableException → 503 TEMPORARILY_FAILED) */ }
+    // event 는 트랜잭션을 열지 않는다: DB 커넥션을 쥔 채 Redis 를 호출하지 않기 위해 (readOnly 는 myCoupons 에만)
+    public CouponEventResult event(long couponEventId) { /* DB 이벤트(없으면 404) + gate.remaining (GateUnavailableException 은 서비스에서 TEMPORARILY_FAILED 로 감쌈 → 503) */ }
     public List<MyCouponResult> myCoupons(Long userId) { /* issuedRepository.findByUserId + 이벤트 이름 */ }
 }
 ```
