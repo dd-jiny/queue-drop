@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 리스너 실패 처리(로그·스킵) 확정 및 DLT 도입 시 토픽 이름 분리 주의 추가, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-17 | 4~6단계 계약에 맞춤 (착수 전 결정 반영): 사용자 결정 2건(인기 드로우 = 진행 중만, 동점 = member 사전순) 확정. `RankingErrorCode implements ErrorCode`(`RANKING_INVALID_SIZE`·`RANKING_INVALID_WEEK` 400, `RANKING_TEMPORARILY_FAILED` 503) + `ApplicationException`, `RankingException`·`RankingExceptionHandler` 삭제(기존 `GlobalExceptionHandler` 사용). `/users/me` 는 `X-User-Id` 필수(누락 400 `COMMON_MISSING_USER_HEADER`), `UNAUTHENTICATED` 삭제. Redis `timeout: 1s`(E-03), Redis 예외 → `RankingStoreUnavailableException`(domain/exception) → 조회 503, 리스너는 전파. Command 는 박싱 타입, 필드 오류는 `DomainException` → WARN 후 스킵(저장소 호출 없음). `KafkaConsumerConfig`(1초 3회 후 로그·스킵, 역직렬화 실패는 재시도 없음). 표시 fallback `user-{id}`·`drop-{id}`. 종료 드로우 lazy ZREM(기본안). `RedisScriptConfig`·`ClockConfig` 분리, rank.lua 쓰기를 끝으로, 스캔 조기 종료. 테스트 T7-25~30 추가, T7-19·20·21·22 수정, Kafka/Redis 테스트 격리 규칙. 커밋 #0 추가 |
 | v1.3 | 2026-11-17 | #2 검토 반영: 인기 드로우 탐색 중 이미 본 id 건너뜀(배치 사이 보드 변경 시 중복 표시 방지), 마감 시각 맵 getOrDefault 방어, `ClockConfig` 는 커밋 #2 에 포함 |
+| v1.4 | 2026-11-17 | T7-20 은 QueryService 결과로 검증(HTTP 는 #5), T7-25 장애 주입은 Redis WRONGTYPE (presentation 테스트의 domain import 금지) |
 
 ---
 
@@ -941,12 +942,12 @@ docker compose start ranking-service
 | T7-17 | infra 통합 (Redis) | `RedisRankingRepositoryTest` | 동점 2명 → `ZREVRANGE` 사전 역순, 순번 1·2 | (동점 정책) |
 | T7-18 | infra 통합 (Redis) | `RedisDisplayNameRepositoryTest` | 제목·닉네임 저장 후 일괄 조회, 없는 id 는 맵에서 제외, 같은 값 재저장 멱등 | REQ-RANK-01, 02 |
 | T7-19 | presentation 슬라이스 | `RankingControllerTest` | `/users/me` 헤더 없음 → 400 `COMMON_MISSING_USER_HEADER` · `?size=0` → 400 `RANKING_INVALID_SIZE` · `?week=2026-W99` → 400 `RANKING_INVALID_WEEK` · 정상 응답 JSON 필드 확인 | REQ-RANK-01, 02 |
-| T7-20 | 통합 (Kafka + Redis) | `RankingListenerIntegrationTest` | Given `user.registered`, `drop.created`, `entry.created` 발행 / When 소비 완료(await) / Then `/api/rankings/drops` 에 제목, `/users/all` 에 닉네임 포함 · 표시 정보가 없는 id 는 `drop-{id}`, `user-{id}` | REQ-RANK-01~03 |
+| T7-20 | 통합 (Kafka + Redis) | `RankingListenerIntegrationTest` | Given `user.registered`, `drop.created`, `entry.created` 발행 / When 소비 완료(await) / Then `RankingQueryService` 결과(인기·주간·누적)에 제목·닉네임 포함 (HTTP 계약은 #5 슬라이스 테스트가 검증) · 표시 정보가 없는 id 는 `drop-{id}`, `user-{id}` | REQ-RANK-01~03 |
 | T7-21 | 통합 (Kafka + Redis) | `RankingListenerIntegrationTest` | 같은 `entry.created` 메시지 3번 발행 → **3건 모두 커밋될 때까지 대기**(`KafkaConsumption.fullyConsumed`, group `ranking-service`, lag 0) 후 점수 1. 점수만 기다리면 1번째 처리 직후 통과해 중복 처리를 검증하지 못한다 | REQ-RANK-03 |
 | T7-22 | 통합 (Kafka + Redis) | `RankingListenerIntegrationTest` | `entry.created` 가 `drop.created` 보다 먼저 도착 → 집계 정상, 제목 `drop-{id}`, 이후 `drop.created` 도착 시 제목 채워짐 | REQ-RANK-03 |
 | T7-23 | 아키텍처 | `ArchitectureTest` | R1~R7 통과 (특히 presentation → domain 의존 없음, application 시그니처에 `WeekKey`/`RankEntry` 없음) | layered |
 | T7-24 | 운영 절차 (수동) | 3.6 절차 | 응모 50건 집계 → 집계 키 삭제·오프셋 리셋·재시작 → 점수 동일하게 복구 | NFR-03 |
-| T7-25 | 통합 (Kafka + Redis) | `RankingListenerRetryIntegrationTest` | Given `RankingRepository` 를 `@MockitoBean` 으로 바꿔 dropId A 는 항상 `RankingStoreUnavailableException` / When A, B 순서로 발행(파티션 1개) / Then A 는 1초 간격 총 4회 호출(첫 호출~마지막 ≥ 2.5초) 후 건너뜀, B 는 1회 처리 (DLT 없음) | REQ-RANK-03, architecture 4장 |
+| T7-25 | 통합 (Kafka + Redis) | `RankingListenerRetryIntegrationTest` | Given dropId A 의 `rank:dedupe:{A}` 를 String 으로 미리 만들어 rank.lua 가 WRONGTYPE 으로 실패 → 실제 경로로 `RankingStoreUnavailableException` 전파 (presentation 테스트는 domain 타입을 import 하지 않음, 호출 횟수는 `@MockitoSpyBean RankingAggregateService`) / When A, B 순서로 발행(파티션 1개) / Then A 는 1초 간격 총 4회 호출(첫 호출~마지막 ≥ 2.5초) 후 건너뜀, B 는 1회 처리 (DLT 없음) | REQ-RANK-03, architecture 4장 |
 | T7-26 | 통합 (Kafka + Redis) | `RankingListenerRetryIntegrationTest` | Given JSON 이 아닌 바이트를 `entry.created` 에 발행(별도 bytes 프로듀서) 후 정상 메시지 발행 / Then 깨진 메시지는 재시도 없이 recoverer 로 건너뛰고 정상 메시지가 집계됨 (파티션이 막히지 않음) | REQ-RANK-03 |
 | T7-27 | application 단위 (Fake) + presentation 슬라이스 | `RankingQueryServiceTest`, `RankingControllerTest` | Given Fake 저장소가 `RankingStoreUnavailableException` / When `topDrops`·`weeklyUsers`·`allUsers`·`myRank` / Then `ApplicationException(TEMPORARILY_FAILED)` · 컨트롤러는 503 `RANKING_TEMPORARILY_FAILED` | E-03 |
 | T7-28 | application 단위 (Fake) | `RankingAggregateServiceTest` | Given null 또는 0 이하 id, null `appliedAt`/`closeAt`, 빈 `title`/`nickname` / When `recordEntry`·`registerDrop`·`registerUser` / Then 예외 없이 반환(WARN), 저장소 호출 0회. `registerDrop` 에서 closeAt 만 null 이어도 제목도 저장하지 않음 | layered 4.5 |

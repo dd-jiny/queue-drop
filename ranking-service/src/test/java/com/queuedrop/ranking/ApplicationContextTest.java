@@ -42,8 +42,9 @@ import org.springframework.kafka.test.utils.KafkaTestUtils;
 
 /**
  * T0-04: Redis·Kafka 컨테이너로 기동 + 실제 적용된 Kafka 클라이언트 설정 + Redis 연결 + DropCreated 직렬화 왕복.
+ * 7단계부터 리스너가 있으므로 entry·coupon 과 같이 리스너만 끈다 (Kafka 컨테이너는 그대로).
  */
-@SpringBootTest
+@SpringBootTest(properties = "spring.kafka.listener.auto-startup=false")
 @Import({RedisContainerConfig.class, KafkaContainerConfig.class})
 class ApplicationContextTest {
 

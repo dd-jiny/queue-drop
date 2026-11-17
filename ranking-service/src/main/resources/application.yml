@@ -24,11 +24,14 @@ spring:
     consumer:
       group-id: ${spring.application.name}
       auto-offset-reset: earliest
+      enable-auto-commit: false  # 처리 성공 후 컨테이너가 커밋 (ack-mode record)
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       properties:
         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
         spring.json.trusted.packages: com.queuedrop.common.event
+    listener:
+      ack-mode: record           # 레코드 단위로 처리 성공 후 커밋 (coupon 과 같음, KafkaConsumption 이 커밋 오프셋을 본다)
 
 ranking:
   weekly-ttl: ${RANKING_WEEKLY_TTL:35d}
