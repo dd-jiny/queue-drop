@@ -38,3 +38,22 @@ queuedrop:
     email: ${ADMIN_EMAIL:}            # 비어 있으면 관리자 생성 건너뜀
     password: ${ADMIN_PASSWORD:}
     nickname: ${ADMIN_NICKNAME:admin}
+
+# Actuator · 메트릭 (phase-8 3.2)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99

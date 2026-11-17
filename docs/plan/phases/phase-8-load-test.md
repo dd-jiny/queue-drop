@@ -7,6 +7,7 @@
 | v1.1 | 2026-11-16 | 튜닝 프로퍼티 이름을 1·3·4·5·6단계 문서와 일치(발행 재시도 항목 제거 — 애플리케이션 재시도 없음 확정), 관리자 계정 생성 확정 반영, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-17 | 계획 검토 반영: 응답 code 를 `{SERVICE}_{REASON}` 실제 이름으로 수정, outcome·보상 메트릭 태그 확정(`coupon.issue.compensated` 추가, T8-13 판정 COMPENSATED==0), coupon-spike 사용자 매핑 `iterationInTest` 기반·S4 별도 이벤트, 진입 404·쿠폰 NOT_STARTED 재시도, 루트 build.gradle 필터 유지, compose 의존성(kafka healthy·kafka-init 완료)·앵커 위치, 튜닝 표 정리, gateway actuator health 만 노출, 검증 스크립트 주석·lag 대상 그룹 보강, `JSON`→`HEADERS`, 준비 절차(e2e.sh 방식), Boot 4 확인 리스크 추가, 6장 결정 필요 확정 |
 | v1.3 | 2026-11-17 | compose: JWT_SECRET 필수 표기 제거(인프라 단독 기동 회귀 방지), healthcheck 앵커 병합, 실행 순서에 kafka-init 생성 단계 추가, `scripts/loadtest-up.sh`, coupon 리스너 concurrency 환경변수 |
+| v1.4 | 2026-11-17 | 6장 Boot 4 확인 항목 결과 기록 |
 
 ---
 
@@ -999,6 +1000,7 @@ done
 
 ### 리스크
 - **Boot 4 확인 필요** (2번 커밋에서 확인): ① Prometheus 레지스트리 auto-config 가 어느 모듈에 있는지(Boot 4 모듈 분리로 `micrometer-registry-prometheus` 만으로 `/actuator/prometheus` 가 생기는지), ② `management.metrics.tags.*` 가 여전히 유효한지(아니면 `MeterRegistryCustomizer` 로 공통 태그), ③ Kafka consumer 메트릭(`kafka.consumer.*`)이 자동으로 Micrometer 에 연결되는지(아니면 `MicrometerConsumerListener` 등록).
+  - **확인 결과 (2026-11-17)**: ① 의존성 추가만으로 `/actuator/prometheus` 생성 ② `management.metrics.tags.application` 유효(Boot 4.1.2, deprecated 아님) ③ 컨테이너 환경에서 entry·coupon·ranking·queue·product 의 `kafka_consumer_fetch_manager_records_lag_max` 자동 노출 확인 (consumer 팩토리는 Boot 자동 구성 사용). gateway `/actuator/prometheus` 404.
 - **k6 와 서비스가 같은 머신**: 부하 발생기가 CPU 를 나눠 써서 서비스 처리량이 낮게 측정될 수 있다. 리포트에 명시하고, 가능하면 k6 를 다른 머신에서 실행한다.
 - **k6 VU 메모리**: VU 하나당 수 MB 가 들어 3,000~5,000 VU 는 수 GB 가 필요할 수 있다. 첫 실행에서 `docker stats` 로 확인하고 USERS 를 조정한다.
 - **로그인 BCrypt 부하**: 모든 VU 가 시작 시 로그인 → user-service CPU 급증. `OPEN_DELAY_SEC` 안에 로그인이 끝나는지 확인 (끝나지 않으면 지연 늘리기).

@@ -1,6 +1,14 @@
 package com.queuedrop.queue;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.distribution.ValueAtPercentile;
+import java.util.Arrays;
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.test.web.servlet.MockMvc;
 
 import com.queuedrop.common.event.DropCreated;
 import com.queuedrop.common.test.container.KafkaContainerConfig;
@@ -45,6 +53,7 @@ import org.springframework.kafka.test.utils.KafkaTestUtils;
  */
 @SpringBootTest
 @Import({RedisContainerConfig.class, KafkaContainerConfig.class})
+@AutoConfigureMockMvc
 class ApplicationContextTest {
 
     /** 운영 토픽(drop.created)을 쓰면 이후 단계의 리스너가 테스트 레코드를 소비할 수 있어 테스트 전용 토픽을 쓴다 */
@@ -145,5 +154,56 @@ class ApplicationContextTest {
                     .contains("\"openAt\":\"2026-12-01T10:00:00.123456Z\"")
                     .contains("\"closeAt\":\"2026-12-01T11:00:00Z\"");
         }
+    }
+
+    // ---- 8단계 커밋 #2: Actuator 메트릭 노출 (phase-8 3.2) ----
+
+    @Autowired
+    MockMvc mockMvc;
+
+    @Autowired
+    MeterRegistry meterRegistry;
+
+    @Test
+    @DisplayName("[8단계 Actuator] queue-service 는 /actuator/prometheus 를 노출하고 application 태그와 http.server.requests 히스토그램 버킷을 내보낸다")
+    void prometheusExposesApplicationTagAndHistogram() throws Exception {
+        // Given: http.server.requests 는 요청이 한 번 이상 있어야 생기므로 먼저 한 번 호출한다
+        mockMvc.perform(get("/actuator/health/liveness")).andExpect(status().isOk());
+
+        // When
+        String body = mockMvc.perform(get("/actuator/prometheus"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+
+        // Then: 공통 태그 application=서비스명, percentiles-histogram 으로 버킷 시계열이 생긴다
+        assertThat(body)
+                .contains("application=\"queue-service\"")
+                .contains("http_server_requests_seconds_bucket");
+    }
+
+    @Test
+    @DisplayName("[8단계 Actuator] queue-service 의 http.server.requests 타이머에 application 태그와 0.5·0.95·0.99 퍼센타일이 설정된다")
+    void httpServerRequestsHasApplicationTagAndPercentiles() throws Exception {
+        // Given: 타이머 생성을 위해 요청 한 번
+        mockMvc.perform(get("/actuator/health/liveness")).andExpect(status().isOk());
+
+        // When
+        var timers = meterRegistry.get("http.server.requests").timers();
+
+        // Then
+        assertThat(timers).isNotEmpty().allSatisfy(timer -> {
+            assertThat(timer.getId().getTag("application")).isEqualTo("queue-service");
+            assertThat(Arrays.stream(timer.takeSnapshot().percentileValues()).mapToDouble(ValueAtPercentile::percentile))
+                    .contains(0.5, 0.95, 0.99);
+        });
+    }
+
+    @Test
+    @DisplayName("[8단계 Actuator] queue-service 는 health 프로브(liveness·readiness)와 /actuator/metrics 를 노출한다")
+    void healthProbesAndMetricsExposed() throws Exception {
+        // When / Then: 프로브 그룹은 외부 의존 indicator 를 포함하지 않아 테스트 컨텍스트에서도 UP 이다
+        mockMvc.perform(get("/actuator/health/liveness")).andExpect(status().isOk());
+        mockMvc.perform(get("/actuator/health/readiness")).andExpect(status().isOk());
+        mockMvc.perform(get("/actuator/metrics")).andExpect(status().isOk());
     }
 }

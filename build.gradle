@@ -54,6 +54,7 @@ configure(subprojects.findAll { !(it.name in ['common', 'e2e-test']) }) {
 
     dependencies {
         implementation 'org.springframework.boot:spring-boot-starter-actuator'
+        runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
         testImplementation 'org.springframework.boot:spring-boot-starter-test'
     }
 
