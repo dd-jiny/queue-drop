@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-16 | Redis 키 `entry:{dropId}:seq` 추가 | NFR-03 |
 | v1.3 | 2026-11-16 | DLT 토픽·컨슈머 실패 정책, Redis 키(`queue:active-drops`, `queue:admission:gate`, `rank:drop:closeAt`) 추가, 인증 제외 경로 구체화·JWT 세부·관리자 시드 추가 | phase-1·3·4·7·8 구현 상세 6장, REQ-USER-04 |
 | v1.4 | 2026-11-16 | queue 키(`meta`·`seq`·`waiting`) 만료 시각 `closeAt + 1일` 명시 | phase-3 구현 상세 v1.2 |
+| v1.5 | 2026-11-17 | Redis 키 `entry:{dropId}:requests`(요청 ID), `entry:{dropId}:persisted`(저장 확정) 추가 — 유령 이벤트·Redis 타임아웃 대응 (사용자 결정, E-40·E-41). TTL 은 5단계(E-42) | concurrency-consistency.md D2 v1.3 |
 
 ---
 
@@ -100,6 +101,8 @@ flowchart LR
 | `entry:{dropId}:remaining` | String | entry | entry, **queue** | 잔여 응모 정원 |
 | `entry:{dropId}:applicants` | Set | entry | entry | 응모자 userId (중복 방지) |
 | `entry:{dropId}:seq` | String | entry | entry | 응모 번호 발급 카운터 (증가만, 보상 시에도 되돌리지 않음) |
+| `entry:{dropId}:requests` | Hash | entry | entry | field=userId, value=이 자리를 잡은 요청의 eventId. 응모 Lua 가 `HSET`, 보상 Lua 가 `HDEL`. 보상·저장 확정이 다른 요청의 응모를 건드리지 않게 한다 (TTL 은 5단계, E-42) |
+| `entry:{dropId}:persisted` | Set | entry | entry | 저장 컨슈머가 DB 저장 전에 확정한 userId (claim Lua 가 `SADD`). 여기 있으면 보상 Lua 가 되돌리지 않는다 (TTL 은 5단계, E-42) |
 | `coupon:{eventId}:meta` | Hash | coupon | coupon | issueStartAt |
 | `coupon:{eventId}:remaining` | String | coupon | coupon | 잔여 수량 |
 | `coupon:{eventId}:issued` | Set | coupon | coupon | 발급 userId (중복 방지) |

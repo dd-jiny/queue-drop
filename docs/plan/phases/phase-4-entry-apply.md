@@ -8,6 +8,7 @@
 | v1.2 | 2026-11-16 | 0~3단계 실제 코드에 정렬. 에러 계약: `EntryErrorCode implements ErrorCode`(코드 `ENTRY_*`, 상태는 enum 이 보유), `ApplicationException` 으로 던지고 0단계 `GlobalExceptionHandler` 가 매핑 — `BusinessException`·`EntryApplyException`·`EntryExceptionHandler`·`UserIdHeader` 제거, 헤더 누락은 `COMMON_MISSING_USER_HEADER`(400). `DomainException` 은 entry `domain/exception` 에 서비스별로 둔다(queue 와 같은 형태). 잘못된 `drop.created` 는 queue 처럼 application 이 `DomainException` 을 잡아 로그·스킵(재시도·DLT 없음) — `InvalidDropSnapshotException` 제거, 설계 문서 반영. `DropSnapshotRegisterCommand` 를 `Long`/null 검증으로. Kafka 설정은 0단계 `application.yml` 공통 블록(이미 있음) 기준으로 추가분만 표기, `DefaultErrorHandler` 빈 자동 적용(3단계 확인), `@KafkaListener(idIsGroup = false)`. `entry:{dropId}:remaining` 정수 문자열 계약·queue 의존 명시. 스크립트 빈 `EntryScripts` → `infrastructure/config/RedisScriptConfig`, 테스트 지원은 `*ContainerConfig` `@Import`, 테스트 슬라이스 의존성(`data-redis-test`·`data-jpa-test`). 테스트 T4-33~35 추가. 커밋 계획을 테스트 포함 기능 커밋 단위로 재편. 6.1 에 E-34·E-39 사용자 결정 기록 |
 | v1.3 | 2026-11-17 | 커밋 #3 검증 반영: `DropSnapshotRegisterService` 가 Redis 를 재수신 메시지 값이 아니라 DB 에 저장된 스냅샷 값으로 초기화 (DB·Redis 정원 불일치 방지). T4-09 에 인프라 예외 전파 케이스 추가 |
 | v1.4 | 2026-11-17 | 커밋 #8 구현 확인: 역직렬화 실패 레코드를 원본 바이트로 DLT 에 보내도록 `byte[]` 전용 템플릿 추가(JSON 템플릿은 Base64 문자열로 감쌈). Spring Kafka 4 의 `DeadLetterPublishingRecoverer` 기본 목적지가 `{topic}-dlt` 라서 리졸버로 `{topic}.DLT`·같은 파티션을 명시 (토픽 이름·설계 문서는 그대로). 6단계 coupon 도 같은 리졸버 사용 |
+| v1.5 | 2026-11-17 | 백로그 E-40·E-41 반영 (사용자 결정 2026-11-17, 6.1 ⑥⑦): 요청 ID = eventId 를 판정 전에 만들어 Gate 에 넘김. 새 키 `requests`(Hash)·`persisted`(Set), `entry-apply.lua` 에 `HSET requests`, 새 `entry-claim.lua`(저장 컨슈머가 `isApplicant` 대신 호출), `entry-compensate.lua` 3결과(`CompensationResult`). 발행 실패여도 ALREADY_PERSISTED 면 202. `RedisEntryGate` 가 Redis 예외를 `GateUnavailableException` 으로 감싸고 서비스는 같은 eventId 로 보상 후 503. 3.0·3.2·3.3 코드·Lua 전문, 4.1 Fake, 4.2 테스트 T4-36~42 추가·기존 테스트 기대값 변경 표시, 4.4 순서 B, 5장 커밋 #10a~c, 6장 결정·리스크 갱신 |
 
 > 표기
 > - **(구현 결정)**: 설계 문서에 없던 내용을 이 문서에서 정한 것
@@ -83,7 +84,9 @@ entry-service/
     │   │   │   │   ├── GateResult.java
     │   │   │   │   ├── EntryEventPublisher.java
     │   │   │   │   ├── EntryCreatedPayload.java
-    │   │   │   │   └── EventPublishException.java
+    │   │   │   │   ├── EventPublishException.java
+    │   │   │   │   ├── CompensationResult.java                # v1.5 (E-40)
+    │   │   │   │   └── GateUnavailableException.java          # v1.5 (E-41)
     │   │   │   └── exception
     │   │   │       └── EntryErrorCode.java             # common.error.ErrorCode 구현 (v1.2)
     │   │   ├── domain
@@ -122,7 +125,8 @@ entry-service/
     │       ├── scripts
     │       │   ├── entry-initialize.lua
     │       │   ├── entry-apply.lua
-    │       │   └── entry-compensate.lua
+    │       │   ├── entry-compensate.lua
+    │       │   └── entry-claim.lua                         # v1.5 (E-40)
     │       └── db/migration
     │           └── V1__create_entry_tables.sql         # .gitkeep 대체
     └── test/java/com/queuedrop/entry
@@ -182,6 +186,8 @@ entry-service/
 | `entry:{dropId}:remaining` | String | 쓰기 |
 | `entry:{dropId}:applicants` | Set | 쓰기 |
 | `entry:{dropId}:seq` | String | 쓰기 |
+| `entry:{dropId}:requests` | Hash (field=userId, value=eventId) | 쓰기 (v1.5) |
+| `entry:{dropId}:persisted` | Set (userId) | 쓰기 (v1.5) |
 | `queue:{dropId}:token:{userId}` | String(TTL) | **읽기 전용** (queue 소유) |
 
 ```java
@@ -197,6 +203,10 @@ public final class EntryRedisKeys {
     public static String remaining(Long dropId)  { return "entry:" + dropId + ":remaining"; }
     public static String applicants(Long dropId) { return "entry:" + dropId + ":applicants"; }
     public static String seq(Long dropId)        { return "entry:" + dropId + ":seq"; }
+    /** userId → 이 자리를 잡은 요청의 eventId (v1.5, E-40) */
+    public static String requests(Long dropId)   { return "entry:" + dropId + ":requests"; }
+    /** 저장 컨슈머가 DB 저장 전에 확정한 userId (v1.5, E-40) */
+    public static String persisted(Long dropId)  { return "entry:" + dropId + ":persisted"; }
 
     /** queue-service 소유 키 — 읽기 전용. QueueKeys.token(dropId, userId) 과 같은 문자열이어야 한다 */
     public static String queueToken(Long dropId, Long userId) {
@@ -204,6 +214,7 @@ public final class EntryRedisKeys {
     }
 }
 ```
+- `requests`·`persisted` 의 TTL 은 다른 응모 키와 함께 5단계에서 정한다 (E-42). 이 단계에서는 만료를 걸지 않는다.
 - 키 문자열의 `{dropId}` 는 설계 문서의 자리표시자다. 실제 키에는 중괄호 없이 `entry:42:meta` 처럼 들어간다. 해시 태그는 쓰지 않는다 (6.1 ⑤, E-39).
 - queue 토큰 키 형식은 이 클래스에 중복으로 정의한다 **(구현 결정)**. `common` 으로 옮기면 서비스 간 결합이 코드로 드러나는 장점이 있지만, 키 하나 때문에 common 에 Redis 개념이 들어가는 게 더 크다고 판단했다. queue 쪽도 같은 이유로 `QueueKeys.entryRemaining` 을 중복 정의했다 (3단계).
 
@@ -211,7 +222,7 @@ public final class EntryRedisKeys {
 | 키 | 쓰는 쪽 | 읽는 쪽 | 계약 |
 |----|---------|---------|------|
 | `queue:{dropId}:token:{userId}` | queue `admit.lua` (`SET ... EX 300`, 값 = 발급 시각 ms) | entry `entry-apply.lua` (`EXISTS`) | 키 이름만 의존. 값은 읽지 않는다 |
-| `entry:{dropId}:remaining` | entry `entry-initialize.lua`(`SET capacity`)·`entry-apply.lua`(`DECR`)·`entry-compensate.lua`(`INCR`) | queue `admit.lua`(`tonumber`)·`RedisRemainingCapacityReader`(`Long.parseLong`) | **10진 정수 문자열**. `SET`/`DECR`/`INCR` 만 쓰므로 항상 만족. 키가 없으면 queue 는 진입 허용·입장 보류 (3단계 결정) → `drop.created` 처리 전에는 아무도 입장하지 않는다 |
+| `entry:{dropId}:remaining` | entry `entry-initialize.lua`(`SET capacity`)·`entry-apply.lua`(`DECR`)·`entry-compensate.lua`(`INCR`, COMPENSATED 일 때만) | queue `admit.lua`(`tonumber`)·`RedisRemainingCapacityReader`(`Long.parseLong`) | **10진 정수 문자열**. `SET`/`DECR`/`INCR` 만 쓰므로 항상 만족. 키가 없으면 queue 는 진입 허용·입장 보류 (3단계 결정) → `drop.created` 처리 전에는 아무도 입장하지 않는다 |
 - 3단계 테스트는 이 키를 `EntryRemainingFixture` 로 직접 세팅했다. 이 단계에서 실제 쓰기 경로가 생기므로, 형식이 바뀌면 queue 의 `admit.lua`·`RedisRemainingCapacityReader` 가 깨진다. T4-11·18 에서 `GET remaining` 이 정수 문자열인지 함께 확인한다.
 
 #### 시각 주입 (`infrastructure/config/ClockConfig`)
@@ -638,10 +649,13 @@ public class DropCreatedListener {
 
 ```
 POST /api/entries/drops/{dropId}
-  → EntryController → EntryApplyService
-      ├─ EntryGate.tryApply        (Redis Lua: 마감·토큰·중복·잔여 검사 + DECR + SADD + INCR seq)
+  → EntryController → EntryApplyService           (eventId = UUID 를 판정 전에 생성, v1.5)
+      ├─ EntryGate.tryApply        (Redis Lua: 마감·토큰·중복·잔여 검사 + DECR + SADD + HSET requests + INCR seq)
+      │    └─ GateUnavailableException → EntryGate.compensate(같은 eventId) → 503
       ├─ EntryEventPublisher       (Kafka entry.created, ack 대기)
-      └─ 실패 시 EntryGate.compensate (Redis Lua: SREM + INCR remaining)
+      └─ 실패 시 EntryGate.compensate (Redis Lua: 3결과)
+           ├─ ALREADY_PERSISTED → 202 (컨슈머가 이미 저장 확정)
+           └─ COMPENSATED / NOT_OURS → 503
 ```
 
 #### domain
@@ -728,18 +742,42 @@ public record EntryApplyResult(int entrySeq) {}
 ```java
 package com.queuedrop.entry.application.port;
 
-/** Redis 기반 선착순 판정 게이트. 판정·보상·초기화를 원자적으로 수행한다. */
+/**
+ * Redis 기반 선착순 판정 게이트. 판정·보상·저장 확정·초기화를 원자적으로 수행한다.
+ * tryApply·compensate·claimForSave 는 Redis 장애(타임아웃 포함) 시 GateUnavailableException 을 던진다 (v1.5).
+ */
 public interface EntryGate {
 
-    GateResult tryApply(long dropId, long userId, Instant now);
+    /** OK 면 requests[userId] = eventId 를 함께 기록한다. eventId 는 호출자가 판정 전에 만든 요청 ID */
+    GateResult tryApply(long dropId, long userId, String eventId, Instant now);
 
-    /** 판정을 되돌린다. 응모자에 없으면 아무것도 하지 않는다 (두 번 호출해도 안전). seq 는 되돌리지 않는다. */
-    void compensate(long dropId, long userId);
+    /**
+     * eventId 요청의 판정을 되돌린다. seq 는 되돌리지 않는다. 두 번 호출해도 안전하다 (두 번째는 NOT_OURS).
+     * @return ALREADY_PERSISTED: 저장 컨슈머가 이미 확정 — 되돌리지 않음
+     *         NOT_OURS: requests[userId] ≠ eventId (다른 요청의 응모 또는 판정 미실행) — 되돌리지 않음
+     *         COMPENSATED: 응모자·요청 제거 + 정원 복구
+     */
+    CompensationResult compensate(long dropId, long userId, String eventId);
 
+    /**
+     * 저장 컨슈머가 DB 저장 전에 호출한다. true 를 반환한 뒤에는 보상이 거절된다 (persisted).
+     * @return false: 보상된 응모이거나 이전 시도의 유령 이벤트 — 저장하지 않는다. 재전달에도 true (멱등)
+     */
+    boolean claimForSave(long dropId, long userId, String eventId);
+
+    /** 단건 조회의 저장 대기 보완용 (EntryQueryService). 저장 경로에서는 쓰지 않는다 (v1.5) */
     boolean isApplicant(long dropId, long userId);
 
     /** 응모 메타·정원 초기화. 이미 초기화돼 있으면 아무것도 하지 않는다. */
     void initialize(long dropId, int capacity, Instant openAt, Instant closeAt);
+}
+
+/** 보상 Lua 결과 (v1.5, E-40) */
+public enum CompensationResult { COMPENSATED, ALREADY_PERSISTED, NOT_OURS }
+
+/** Redis 호출 실패 (연결 실패·명령 타임아웃). 타임아웃이면 Lua 가 실행됐는지 알 수 없다 (v1.5, E-41) */
+public class GateUnavailableException extends RuntimeException {
+    public GateUnavailableException(String message, Throwable cause) { super(message, cause); }
 }
 
 /** entrySeq 는 outcome == OK 일 때만 값이 있다. */
@@ -749,6 +787,8 @@ public record GateResult(ApplyOutcome outcome, Integer entrySeq) {
     public boolean isOk()                                     { return outcome == ApplyOutcome.OK; }
 }
 ```
+- `GateUnavailableException` 은 포트 예외다. application 이 Spring Data 의 `DataAccessException` 을 알지 않도록 어댑터가 감싼다 (`EventPublishException` 과 같은 방식).
+- `isApplicant`·`initialize` 는 감싸지 않는다(v1.5 범위 밖). 조회·드로우 수신 경로의 Redis 장애는 기존처럼 전파된다.
 - `GateResult` 가 domain enum `ApplyOutcome` 을 갖는 건 허용된다. R6 은 **application.service 의 public 시그니처**만 막는다. 포트는 application 안에서만 쓰여 presentation 에 닿지 않는다.
 
 **포트: `EntryEventPublisher`, `EntryCreatedPayload`, `EventPublishException`**
@@ -818,7 +858,7 @@ public enum EntryErrorCode implements ErrorCode {
 
 > **ApplyOutcome → 예외 변환 위치**: `EntryApplyService` 가 `EntryErrorCode.from(outcome)` 으로 변환해 `ApplicationException` 을 던진다. `ApplyOutcome` 은 application 밖으로 나가지 않는다.
 
-**`EntryApplyService`**: 판정 → 발행 → (실패 시) 보상.
+**`EntryApplyService`**: 요청 ID 생성 → 판정 → 발행 → (실패 시) 보상 (v1.5).
 ```java
 package com.queuedrop.entry.application.service;
 
@@ -833,36 +873,63 @@ public class EntryApplyService {
 
     public EntryApplyResult apply(EntryApplyCommand command) {
         Instant now = clock.instant();
+        String eventId = UUID.randomUUID().toString();      // 요청 ID = eventId. 판정 전에 만든다 (E-40)
 
-        GateResult gate = entryGate.tryApply(command.dropId(), command.userId(), now);
+        GateResult gate;
+        try {
+            gate = entryGate.tryApply(command.dropId(), command.userId(), eventId, now);
+        } catch (GateUnavailableException e) {
+            // Lua 실행 여부를 모름 (E-41): 실행됐다면 되돌리고(COMPENSATED), 아니면 NOT_OURS 로 무변화
+            compensateQuietly(command, eventId);
+            throw new ApplicationException(EntryErrorCode.TEMPORARILY_FAILED, e);
+        }
         if (!gate.isOk()) {
             throw new ApplicationException(EntryErrorCode.from(gate.outcome()));
         }
 
         EntryCreatedPayload payload = new EntryCreatedPayload(
-                UUID.randomUUID().toString(), command.dropId(), command.userId(),
-                gate.entrySeq(), now);
+                eventId, command.dropId(), command.userId(), gate.entrySeq(), now);
 
         try {
             eventPublisher.publishCreated(payload);
         } catch (EventPublishException e) {
-            compensateQuietly(command);
-            throw new ApplicationException(EntryErrorCode.TEMPORARILY_FAILED, e);   // 503 → GlobalExceptionHandler 가 error 로그 + 스택
+            Optional<CompensationResult> result = compensateQuietly(command, eventId);
+            if (result.filter(r -> r == CompensationResult.ALREADY_PERSISTED).isPresent()) {
+                // 컨슈머가 이미 저장 확정 = 실제로 기록됨. 불변식("성공 = 기록")과 맞으므로 성공 (E-40)
+                log.warn("발행 실패로 판단했으나 이미 저장됨 dropId={} userId={} eventId={}",
+                        command.dropId(), command.userId(), eventId);
+                return new EntryApplyResult(gate.entrySeq());
+            }
+            throw new ApplicationException(EntryErrorCode.TEMPORARILY_FAILED, e);   // 503
         }
 
         return new EntryApplyResult(gate.entrySeq());
     }
 
-    private void compensateQuietly(EntryApplyCommand command) {
+    /** @return 보상 결과. 보상 자체가 실패하면 empty (로그만 남기고 호출자는 503) */
+    private Optional<CompensationResult> compensateQuietly(EntryApplyCommand command, String eventId) {
         try {
-            entryGate.compensate(command.dropId(), command.userId());
+            return Optional.of(entryGate.compensate(command.dropId(), command.userId(), eventId));
         } catch (RuntimeException e) {
-            // 보상 실패: 정원 한 자리가 새는 쪽(언더 응모)이라 정합성 위반은 아니다 (D2). 알림 대상.
-            log.error("보상 실패 dropId={} userId={}", command.dropId(), command.userId(), e);
+            // 보상 실패: 정원 한 자리가 새는 쪽(언더 응모)이라 정원 초과는 아니다 (D2). 알림 대상.
+            // tryApply 타임아웃 경로에서는 Redis 에만 응모가 남아 D6 불일치가 된다 (6.3 리스크)
+            log.error("보상 실패 dropId={} userId={} eventId={}",
+                    command.dropId(), command.userId(), eventId, e);
+            return Optional.empty();
         }
     }
 }
 ```
+- 응답 분기 (v1.5)
+
+  | 상황 | 보상 결과 | 응답 |
+  |------|-----------|------|
+  | 발행 성공 | — | 202 |
+  | 발행 실패 | `ALREADY_PERSISTED` | **202** (판정 때 받은 entrySeq) |
+  | 발행 실패 | `COMPENSATED` / `NOT_OURS` / 보상 예외 | 503 `ENTRY_TEMPORARILY_FAILED` |
+  | `tryApply` 가 `GateUnavailableException` | 결과와 무관 (보상 예외 포함) | 503 `ENTRY_TEMPORARILY_FAILED` |
+- 발행 실패 경로의 `ALREADY_PERSISTED` 는 반드시 이 요청의 저장이다: `persisted` 에 들어간 사용자는 보상되지 않아 `applicants` 에 계속 남으므로, 그 뒤의 판정은 `DUPLICATE` 가 된다. 판정이 OK 였다면 그 전에는 `persisted` 에 없었다.
+- `tryApply` 타임아웃 경로에서 `ALREADY_PERSISTED` 가 나오는 경우는 이전 요청이 이미 저장된 사용자뿐이다(이번 판정은 DUPLICATE 였을 것). entrySeq 를 모르므로 503 으로 답하고, 재시도하면 409 `ENTRY_DUPLICATE` 를 받는다.
 - `@Transactional` 이 없다. 이 유스케이스는 DB 를 쓰지 않는다 (응답 경로에서 DB 제외, D1).
 - `appliedAt` 은 판정에 쓴 `now` 와 같은 값이다. 7단계 랭킹의 주차 계산이 이 값을 쓴다.
 
@@ -876,8 +943,10 @@ public class EntryApplyService {
 -- KEYS[3] = entry:{dropId}:applicants
 -- KEYS[4] = entry:{dropId}:seq
 -- KEYS[5] = queue:{dropId}:token:{userId}     (queue-service 소유, 읽기만)
+-- KEYS[6] = entry:{dropId}:requests           (userId → eventId, v1.5)
 -- ARGV[1] = userId
 -- ARGV[2] = now (epoch ms, 애플리케이션 시각)
+-- ARGV[3] = eventId (요청 ID, 애플리케이션이 판정 전에 생성, v1.5)
 -- return  : { 'OK', entrySeq } 또는 { 'CLOSED' | 'NO_TOKEN' | 'DUPLICATE' | 'SOLD_OUT' }
 
 -- 1. 마감 여부: state == OPEN 이고 openAt <= now < closeAt
@@ -906,9 +975,10 @@ if remaining <= 0 then
     return { 'SOLD_OUT' }
 end
 
--- 5. 차감 + 응모자 등록
+-- 5. 차감 + 응모자 등록 + 이 자리를 잡은 요청 기록 (보상·저장 확정이 eventId 로 대조)
 redis.call('DECR', KEYS[2])
 redis.call('SADD', KEYS[3], ARGV[1])
+redis.call('HSET', KEYS[6], ARGV[1], ARGV[3])
 
 -- 6. 응모 번호: 잔여 정원과 무관한 카운터 (증가만, 보상 시에도 되돌리지 않음)
 local seq = redis.call('INCR', KEYS[4])
@@ -916,36 +986,84 @@ return { 'OK', seq }
 ```
 | 구분 | 값 |
 |------|-----|
-| KEYS | `meta`, `remaining`, `applicants`, `seq`, `queueToken` |
-| ARGV | `userId`, `now(ms)` |
+| KEYS | `meta`, `remaining`, `applicants`, `seq`, `queueToken`, `requests` |
+| ARGV | `userId`, `now(ms)`, `eventId` |
 | 반환 | `['OK', seq]` / `['CLOSED']` / `['NO_TOKEN']` / `['DUPLICATE']` / `['SOLD_OUT']` |
 
 - 모든 명령이 O(1) 이다. 반복문을 넣지 않는다 (Lua 실행 중에는 Redis 전체가 멈춘다).
 - 초기화 전 드로우(`meta` 없음)를 `CLOSED` 로 처리하는 건 **(구현 결정)** 이다. 에러 코드를 늘리지 않고 "지금은 응모할 수 없음" 으로 묶었다. `drop.created` 전파가 늦은 경우가 여기에 해당한다.
 - `closeAt` 정각은 `CLOSED` 다 (`now >= closeAt`). 설계의 `openAt ≤ now < closeAt` 과 같다.
+- v1.5: 판정 순서는 그대로다. 거절 4종은 `requests` 를 건드리지 않는다. 불변식: `requests` 에 userId 가 있으면 `applicants` 에도 있다 (둘은 apply 에서 함께 추가, compensate 에서 함께 제거).
 
-**`entry-compensate.lua` (전문)**
+**`entry-compensate.lua` (전문, v1.5)**
 ```lua
--- 응모 판정 되돌리기 (Kafka 발행 최종 실패 시)
+-- 응모 판정 되돌리기 (Kafka 발행 최종 실패, 또는 판정 Lua 응답 타임아웃 시)
 -- KEYS[1] = entry:{dropId}:remaining
 -- KEYS[2] = entry:{dropId}:applicants
+-- KEYS[3] = entry:{dropId}:requests
+-- KEYS[4] = entry:{dropId}:persisted
 -- ARGV[1] = userId
--- return  : 1 = 되돌림, 0 = 응모자에 없음 (이미 보상됐거나 판정된 적 없음)
+-- ARGV[2] = eventId (되돌릴 요청)
+-- return  : 1 = COMPENSATED, 0 = NOT_OURS, 2 = ALREADY_PERSISTED
 
-if redis.call('SREM', KEYS[2], ARGV[1]) == 1 then
-    redis.call('INCR', KEYS[1])
-    return 1
+-- 1. 저장 컨슈머가 이미 확정했으면 되돌리지 않는다 (DB 저장 ⇔ Redis 응모자 유지)
+if redis.call('SISMEMBER', KEYS[4], ARGV[1]) == 1 then
+    return 2
 end
-return 0
+
+-- 2. 이 요청이 잡은 자리가 아니면 건드리지 않는다 (다른 요청의 응모, 판정 미실행, 이미 보상됨)
+if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then
+    return 0
+end
+
+-- 3. 되돌림 (seq 는 되돌리지 않는다)
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('HDEL', KEYS[3], ARGV[1])
+redis.call('INCR', KEYS[1])
+return 1
 ```
 | 구분 | 값 |
 |------|-----|
-| KEYS | `remaining`, `applicants` |
-| ARGV | `userId` |
-| 반환 | `1` 되돌림 / `0` 대상 없음 |
+| KEYS | `remaining`, `applicants`, `requests`, `persisted` |
+| ARGV | `userId`, `eventId` |
+| 반환 | `1` COMPENSATED / `0` NOT_OURS / `2` ALREADY_PERSISTED |
 
-- `SREM` 결과로 `INCR` 여부를 정하므로 **두 번 호출해도 정원이 두 번 늘지 않는다.**
+- `HGET` 은 필드가 없으면 Lua 에서 `false` 라 `~= eventId` 가 참 → `0`. 따라서 **두 번 호출해도 정원이 두 번 늘지 않는다** (두 번째는 `HDEL` 뒤라 NOT_OURS).
+- 판정 Lua 가 실행되지 않은 채 호출돼도(E-41 타임아웃 경로) `requests` 에 이 eventId 가 없어 아무것도 바뀌지 않는다.
 - `seq` 는 건드리지 않는다 (번호 재사용 방지, [sequence-diagram.md](../../design/08-sequence-diagram/sequence-diagram.md) 5.2).
+
+**`entry-claim.lua` (전문, v1.5 신규)**: 저장 컨슈머가 DB 저장 **전에** 호출한다. 보상 Lua 와 같은 Redis 에서 원자적으로 경합한다.
+```lua
+-- 저장 확정 (entry.created 저장 컨슈머, DB INSERT 전)
+-- KEYS[1] = entry:{dropId}:applicants
+-- KEYS[2] = entry:{dropId}:requests
+-- KEYS[3] = entry:{dropId}:persisted
+-- ARGV[1] = userId
+-- ARGV[2] = eventId (메시지의 eventId)
+-- return  : 1 = 저장 확정 (재전달에도 1), 0 = 저장하지 않음 (유령 이벤트)
+
+-- 1. 보상된 응모의 유령 이벤트
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
+    return 0
+end
+
+-- 2. 보상 후 재응모한 사용자의 이전 시도 유령 이벤트
+if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then
+    return 0
+end
+
+-- 3. 확정: 이후 보상은 ALREADY_PERSISTED 로 거절된다
+redis.call('SADD', KEYS[3], ARGV[1])
+return 1
+```
+| 구분 | 값 |
+|------|-----|
+| KEYS | `applicants`, `requests`, `persisted` |
+| ARGV | `userId`, `eventId` |
+| 반환 | `1` 저장 / `0` 스킵 |
+
+- **정합성 논증** ([D2](../../design/04-non-functional/concurrency-consistency.md) v1.3): claim 이 먼저면 보상은 `ALREADY_PERSISTED`(DB 저장 + Redis 응모자 유지 + 202), 보상이 먼저면 claim 은 `0`(DB 미저장 + Redis 응모자 없음 + 503). 어느 순서든 "DB 저장 ⇔ Redis 응모자 유지"라 풀린 자리를 다른 사용자가 가져가도 DB 응모 수가 정원을 넘지 않는다.
+- 남는 불일치는 claim 후 DB INSERT 가 실패해 DLT 로 간 경우(Redis 응모자 있음, DB 없음)뿐이다. DLT 재처리 시 claim 은 다시 1 을 반환한다.
 
 **`RedisScriptConfig`** (`infrastructure/config`, v1.2: queue 와 같은 위치·이름): 스크립트를 빈으로 한 번만 로드한다. `RedisTemplate.execute(script, ...)` 는 EVALSHA 를 먼저 시도하고, 스크립트 캐시가 없으면 EVAL 로 다시 보낸다.
 ```java
@@ -970,6 +1088,11 @@ public class RedisScriptConfig {
     RedisScript<Long> entryCompensateScript() {
         return RedisScript.of(new ClassPathResource("scripts/entry-compensate.lua"), Long.class);
     }
+
+    @Bean
+    RedisScript<Long> entryClaimScript() {                    // v1.5
+        return RedisScript.of(new ClassPathResource("scripts/entry-claim.lua"), Long.class);
+    }
 }
 ```
 
@@ -986,14 +1109,15 @@ public class RedisEntryGate implements EntryGate {
     @SuppressWarnings("rawtypes")
     private final RedisScript<List> entryApplyScript;
     private final RedisScript<Long> entryCompensateScript;
+    private final RedisScript<Long> entryClaimScript;
 
     @Override
-    public GateResult tryApply(long dropId, long userId, Instant now) {
-        List<?> result = redis.execute(entryApplyScript,
+    public GateResult tryApply(long dropId, long userId, String eventId, Instant now) {
+        List<?> result = call(() -> redis.execute(entryApplyScript,
                 List.of(EntryRedisKeys.meta(dropId), EntryRedisKeys.remaining(dropId),
                         EntryRedisKeys.applicants(dropId), EntryRedisKeys.seq(dropId),
-                        EntryRedisKeys.queueToken(dropId, userId)),
-                String.valueOf(userId), String.valueOf(now.toEpochMilli()));
+                        EntryRedisKeys.queueToken(dropId, userId), EntryRedisKeys.requests(dropId)),
+                String.valueOf(userId), String.valueOf(now.toEpochMilli()), eventId));
 
         ApplyOutcome outcome = ApplyOutcome.valueOf((String) result.get(0));
         if (outcome != ApplyOutcome.OK) {
@@ -1003,10 +1127,26 @@ public class RedisEntryGate implements EntryGate {
     }
 
     @Override
-    public void compensate(long dropId, long userId) {
-        redis.execute(entryCompensateScript,
-                List.of(EntryRedisKeys.remaining(dropId), EntryRedisKeys.applicants(dropId)),
-                String.valueOf(userId));
+    public CompensationResult compensate(long dropId, long userId, String eventId) {
+        Long result = call(() -> redis.execute(entryCompensateScript,
+                List.of(EntryRedisKeys.remaining(dropId), EntryRedisKeys.applicants(dropId),
+                        EntryRedisKeys.requests(dropId), EntryRedisKeys.persisted(dropId)),
+                String.valueOf(userId), eventId));
+        return switch (result.intValue()) {
+            case 1 -> CompensationResult.COMPENSATED;
+            case 0 -> CompensationResult.NOT_OURS;
+            case 2 -> CompensationResult.ALREADY_PERSISTED;
+            default -> throw new IllegalStateException("알 수 없는 보상 결과: " + result);
+        };
+    }
+
+    @Override
+    public boolean claimForSave(long dropId, long userId, String eventId) {
+        Long result = call(() -> redis.execute(entryClaimScript,
+                List.of(EntryRedisKeys.applicants(dropId), EntryRedisKeys.requests(dropId),
+                        EntryRedisKeys.persisted(dropId)),
+                String.valueOf(userId), eventId));
+        return result == 1L;
     }
 
     @Override
@@ -1022,10 +1162,21 @@ public class RedisEntryGate implements EntryGate {
                 String.valueOf(capacity),
                 String.valueOf(openAt.toEpochMilli()), String.valueOf(closeAt.toEpochMilli()));
     }
+
+    /** Redis 예외(연결 실패·명령 타임아웃 = QueryTimeoutException 등 DataAccessException 계열)를 포트 예외로 (v1.5, E-41) */
+    private static <T> T call(Supplier<T> redisCall) {
+        try {
+            return redisCall.get();
+        } catch (DataAccessException e) {
+            throw new GateUnavailableException("Redis 응모 게이트 호출 실패", e);
+        }
+    }
 }
 ```
+- v1.5: `tryApply`·`compensate`·`claimForSave` 만 `call()` 로 감싼다. 명령 타임아웃은 `spring.data.redis.timeout: 1s` (3.0). Lettuce 는 한 연결에서 명령 순서를 보장하므로, 타임아웃 뒤 보낸 보상 Lua 는 늦게 도착한 판정 Lua **뒤에** 실행된다 (E-41 근거, Lettuce 공유 연결 기준).
+- `claimForSave` 의 `GateUnavailableException` 은 리스너까지 전파돼 `DefaultErrorHandler` 재시도 → DLT 로 간다 (DB 장애와 같은 경로).
 - Lua 가 반환한 배열에서 문자열은 Java `String`(StringRedisTemplate 직렬화), 정수는 `Long` 으로 들어온다. queue `admit.lua`(`RedisScript<List>`, userId 문자열 배열)가 같은 방식으로 동작한다 (3단계 확인). 문자열·정수 혼합 배열은 이 단계가 처음이라 T4-11 에서 타입을 확인한다.
-- 빈 이름 주입: 같은 타입(`RedisScript<Long>`) 빈이 둘이라 필드 이름(`entryInitializeScript`, `entryCompensateScript`)으로 구분된다. queue 의 `RedisWaitingQueueRepository` 와 같은 방식.
+- 빈 이름 주입: 같은 타입(`RedisScript<Long>`) 빈이 셋이라 필드 이름(`entryInitializeScript`, `entryCompensateScript`, `entryClaimScript`)으로 구분된다. queue 의 `RedisWaitingQueueRepository` 와 같은 방식.
 
 **`KafkaEntryEventPublisher`**: `EntryEventPublisher` 구현. application DTO 를 `common` 메시지로 바꿔 보낸다.
 ```java
@@ -1065,7 +1216,7 @@ public class KafkaEntryEventPublisher implements EntryEventPublisher {
 ```
 - `send()` 가 동기로 던지는 예외는 Apache `KafkaException` 계열인지 Spring `KafkaException` 으로 감싸지는지 버전에 따라 다르다. 그래서 `RuntimeException` 으로 넓게 잡는다 (v1.2). 포트 밖으로 Kafka 예외가 새면 `EntryApplyService` 의 보상이 실행되지 않는다.
 - `get()` 의 대기 시간(3.5초)은 producer 의 `delivery.timeout.ms`(3초)보다 조금 길다. 그래서 대부분 producer 가 먼저 성공/실패를 확정하고, `TimeoutException` 은 producer 가 응답하지 않는 예외 상황에서만 난다.
-- `TimeoutException` 이어도 레코드가 나중에 기록될 수 있다. 그 경우가 5.2 의 유령 이벤트고, 저장 컨슈머의 `isApplicant` 확인과 `seq` 카운터가 처리한다.
+- `TimeoutException` 이어도 레코드가 나중에 기록될 수 있다. 그 경우가 5.2 의 유령 이벤트고, 저장 컨슈머의 claim Lua 와 3결과 보상, `seq` 카운터가 처리한다 (v1.5).
 
 #### presentation
 
@@ -1106,7 +1257,7 @@ public record EntryApplyResponse(int entrySeq) {
 | `ApplicationException(EntryErrorCode.NO_TOKEN)` | 409 | `ENTRY_NO_TOKEN` |
 | `ApplicationException(EntryErrorCode.DUPLICATE)` | 409 | `ENTRY_DUPLICATE` |
 | `ApplicationException(EntryErrorCode.SOLD_OUT)` | 409 | `ENTRY_SOLD_OUT` |
-| `ApplicationException(EntryErrorCode.TEMPORARILY_FAILED)` | 503 | `ENTRY_TEMPORARILY_FAILED` |
+| `ApplicationException(EntryErrorCode.TEMPORARILY_FAILED)` | 503 | `ENTRY_TEMPORARILY_FAILED` (발행 실패 또는 Redis 장애, v1.5) |
 | `ApplicationException(EntryErrorCode.NOT_FOUND)` | 404 | `ENTRY_NOT_FOUND` **(구현 결정)** |
 | `X-User-Id` 누락 | 400 | `COMMON_MISSING_USER_HEADER` (0단계 공통) |
 | 숫자가 아닌 `X-User-Id` | 400 | `COMMON_INVALID_INPUT` |
@@ -1120,7 +1271,7 @@ public record EntryApplyResponse(int entrySeq) {
 
 ```
 entry.created → EntryCreatedListener → EntrySaveService
-                                         ├─ EntryGate.isApplicant  (보상된 유령 이벤트 거르기)
+                                         ├─ EntryGate.claimForSave (Redis Lua: 유령 이벤트 거르기 + SADD persisted, v1.5)
                                          └─ EntryRepository.saveIfAbsent
 ```
 
@@ -1128,7 +1279,8 @@ entry.created → EntryCreatedListener → EntrySaveService
 
 **`EntrySaveCommand`**
 ```java
-public record EntrySaveCommand(long dropId, long userId, int entrySeq, Instant appliedAt) {}
+/** eventId: 메시지의 eventId = 응모 요청 ID (v1.5) */
+public record EntrySaveCommand(String eventId, long dropId, long userId, int entrySeq, Instant appliedAt) {}
 ```
 
 **`EntrySaveService`**
@@ -1144,10 +1296,10 @@ public class EntrySaveService {
     private final EntryGate entryGate;
 
     public void save(EntrySaveCommand command) {
-        // ① 보상된 응모(유령 이벤트) 거르기: Redis 응모자에 없으면 저장하지 않는다
-        if (!entryGate.isApplicant(command.dropId(), command.userId())) {
-            log.warn("보상된 응모 이벤트 무시 dropId={} userId={} seq={}",
-                    command.dropId(), command.userId(), command.entrySeq());
+        // ① 저장 확정 (v1.5): 보상된 응모 또는 이전 시도의 유령 이벤트면 false. true 이후 보상은 거절된다
+        if (!entryGate.claimForSave(command.dropId(), command.userId(), command.eventId())) {
+            log.warn("유령 응모 이벤트 무시 dropId={} userId={} seq={} eventId={}",
+                    command.dropId(), command.userId(), command.entrySeq(), command.eventId());
             return;
         }
 
@@ -1161,7 +1313,8 @@ public class EntrySaveService {
     }
 }
 ```
-- **저장 전 Redis 응모자 확인은 이 단계에서 확정한다.** 기본안이었던 항목을 그대로 채택한다 (6장 결정 ①).
+- **저장 전 Redis 확인은 이 단계에서 확정한다** (6장 결정 ①). v1.5 에서 `isApplicant`(check-then-act) 를 claim Lua 로 바꿨다 — 소비가 보상보다 먼저 오면 `isApplicant` 는 통과한 뒤 보상이 자리를 풀어 DB 응모 수 = 정원 + 1 이 될 수 있었다 (E-40, 6.1 ⑥).
+- claim 이 true 를 반환한 뒤 `saveIfAbsent` 가 실패하면 예외가 전파돼 재시도 → DLT. 재처리 시 claim 은 다시 true 다.
 - `@Transactional` 을 걸지 않는다. `saveIfAbsent` 가 자체 트랜잭션을 갖는다. 바깥에 트랜잭션을 두면, 그 안에서 제약 위반 예외가 나는 순간 트랜잭션이 rollback-only 로 표시되어 잡아도 커밋 시 `UnexpectedRollbackException` 이 난다.
 
 #### infrastructure
@@ -1291,11 +1444,12 @@ public class EntryCreatedListener {
 
     @KafkaListener(id = "entry-saver", idIsGroup = false, topics = Topics.ENTRY_CREATED)
     public void on(EntryCreated message) {
-        entrySaveService.save(new EntrySaveCommand(
+        entrySaveService.save(new EntrySaveCommand(message.eventId(),
                 message.dropId(), message.userId(), message.entrySeq(), message.appliedAt()));
     }
 }
 ```
+- v1.5: `message.eventId()` 를 넘긴다. 0단계 `EntryCreated` 에 이미 있는 필드라 메시지 형식 변경은 없다.
 - 예외를 잡지 않는다. DB 장애 등은 `DefaultErrorHandler` 가 재시도 → DLT 로 보낸다.
 - 리스너 `id` 는 4.4 유령 이벤트 테스트에서 컨테이너를 일시 정지(pause)하는 데 쓴다. `idIsGroup = false` 로 group-id 는 `entry-service` 그대로 둔다.
 - 배치 리스너 + bulk insert 는 이 단계에서 하지 않는다. 8단계 부하 테스트에서 DB 쓰기가 병목으로 확인되면 적용한다.
@@ -1411,7 +1565,7 @@ dependencies {
 ### 4.1 Fake 포트 (application 단위 테스트용)
 | Fake | 구현 대상 | 동작 |
 |------|-----------|------|
-| `FakeEntryGate` | `EntryGate` | 드로우별 정원·응모자 Set·seq 를 메모리에 둔다. `nextOutcome(...)` 으로 다음 판정 결과를 강제할 수 있다. `compensateCalls()` 로 보상 호출 기록 조회 |
+| `FakeEntryGate` | `EntryGate` | 드로우별 정원·응모자 Set·seq 를 메모리에 둔다. `nextOutcome(...)` 으로 다음 판정 결과를 강제할 수 있다. `compensateCalls()` 로 보상 호출 기록 조회. **v1.5**: Lua 와 같은 의미로 `requests`(userId → eventId)·`persisted` 를 메모리에 두고 `compensate` 는 3결과, `claimForSave` 는 Lua 와 같은 판정. `tryApplyCalls()`·`compensateCalls()` 는 eventId 까지 기록. `nextCompensation(result)` 로 보상 결과 강제, `timeoutAfterApplyNext()`(상태를 바꾼 뒤 `GateUnavailableException`) / `timeoutBeforeApplyNext()`(상태 변화 없이 던짐), `failCompensateNext()` |
 | `FakeEntryEventPublisher` | `EntryEventPublisher` | 발행된 payload 목록 저장. `failNext()` 로 다음 발행을 `EventPublishException` 으로 실패시킨다 |
 | `InMemoryEntryRepository` | `EntryRepository` | `(dropId, userId)` 키 Map. `saveIfAbsent` 는 키가 있으면 false. **seq 중복이면 예외** (실제 DB 와 같은 의미) |
 | `InMemoryDropSnapshotRepository` | `DropSnapshotRepository` | `dropId` 키 Map. `saveIfAbsent` 는 키가 있으면 false |
@@ -1428,12 +1582,12 @@ dependencies {
 |----|-----------|---------------|-------------------------------|------|
 | T4-01 | domain 단위 | `EntryTest` | G: 정상 값 / W: `Entry.apply` / T: status=APPLIED, id=null. G: entrySeq=0 / T: `DomainException` | REQ-ENTRY-01 |
 | T4-02 | domain 단위 | `DropSnapshotTest` | G: capacity < winner, winner=0, openAt ≥ closeAt, dropId·openAt·closeAt null(v1.2) / W: `register` / T: 각각 `DomainException`. 정상 값 → status=OPEN | REQ-DROP-02 |
-| T4-03 | application 단위 | `EntryApplyServiceTest` | G: Gate 가 OK(seq=7) / W: apply / T: 결과 seq=7, 발행 payload 1건(dropId, userId, seq=7, appliedAt=고정 시각), 보상 호출 0 | REQ-ENTRY-01 |
+| T4-03 | application 단위 | `EntryApplyServiceTest` | G: Gate 가 OK(seq=7) / W: apply / T: 결과 seq=7, 발행 payload 1건(dropId, userId, seq=7, appliedAt=고정 시각), 보상 호출 0. **v1.5**: payload.eventId == tryApply 에 넘긴 eventId (UUID 형식) | REQ-ENTRY-01 |
 | T4-04 | application 단위 | `EntryApplyServiceTest` (`@ParameterizedTest`) | G: Gate 가 CLOSED / NO_TOKEN / DUPLICATE / SOLD_OUT / W: apply / T: `ApplicationException` 의 `errorCode()` 가 같은 이름의 `EntryErrorCode`, 발행 0, 보상 0 | REQ-ENTRY-02, 03 |
-| T4-05 | application 단위 | `EntryApplyServiceTest` | G: Gate OK, Publisher `failNext()` / W: apply / T: `TEMPORARILY_FAILED`, 보상 호출 1 (같은 dropId, userId) | NFR-03 |
+| T4-05 | application 단위 | `EntryApplyServiceTest` | G: Gate OK, Publisher `failNext()` / W: apply / T: `TEMPORARILY_FAILED`, 보상 호출 1 (같은 dropId, userId, **v1.5: 같은 eventId**, 결과 COMPENSATED) | NFR-03 |
 | T4-06 | application 단위 | `EntryApplyServiceTest` | G: 발행 실패 + 보상도 예외 / W: apply / T: 여전히 `TEMPORARILY_FAILED` (보상 예외가 원래 예외를 가리지 않음) | NFR-03 |
-| T4-07 | application 단위 | `EntrySaveServiceTest` | G: Gate 응모자에 없음 / W: save / T: 저장소 0건 (유령 이벤트 무시) | NFR-03 |
-| T4-08 | application 단위 | `EntrySaveServiceTest` | G: 응모자에 있음 / W: save 2번 / T: 저장소 1건, 예외 없음 | NFR-02 |
+| T4-07 | application 단위 | `EntrySaveServiceTest` | G: Gate 응모자에 없음 / W: save / T: 저장소 0건 (유령 이벤트 무시). **v1.5**: `claimForSave` 가 false 인 두 경우(응모자 없음 / requests 의 eventId 다름) 모두 0건, claim 에 command.eventId 전달 | NFR-03 |
+| T4-08 | application 단위 | `EntrySaveServiceTest` | G: 응모자에 있음 (v1.5: 같은 eventId 로 판정됨) / W: save 2번 / T: 저장소 1건, 예외 없음 | NFR-02 |
 | T4-09 | application 단위 | `DropSnapshotRegisterServiceTest` | G: 이미 저장된 스냅샷 / W: register / T: 저장소 그대로, Gate.initialize 는 **저장된 스냅샷 값**으로 호출됨 (Redis 쪽 복구 기회, v1.3). G: 저장소·Gate 예외 / T: 예외 전파(스킵하지 않음), 저장 실패 시 initialize 0회. G: 잘못된 값(capacity < winner, null 필드) / W: register / T: **예외 없이 스킵** — 저장소 0건, Gate.initialize 호출 0 (v1.2, queue `QueueMetaRegisterServiceTest` 와 같은 방식) | REQ-DROP-02 |
 | T4-10 | application 단위 | `EntryQueryServiceTest` | G: DB 없음 + Gate 응모자 / T: status=APPLIED, entrySeq=null. G: 둘 다 없음 / T: `ApplicationException(EntryErrorCode.NOT_FOUND)`. G: DB 있음 / T: DB 값 | REQ-ENTRY-06 |
 | T4-11 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 초기화(정원 3), 토큰 있음 / W: tryApply / T: OK(seq=1, Java 타입 `Long` → int), `GET remaining` = `"2"`(10진 정수 문자열, queue 계약), applicants 에 userId | REQ-ENTRY-01, 02 |
@@ -1441,7 +1595,7 @@ dependencies {
 | T4-13 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 토큰 키 없음 / T: NO_TOKEN, remaining 변화 없음 | REQ-QUEUE-06 |
 | T4-14 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 이미 응모 / T: DUPLICATE, remaining·seq 변화 없음 | REQ-ENTRY-03 |
 | T4-15 | infra 통합 (Redis) | `RedisEntryGateTest` | G: remaining=0 / T: SOLD_OUT, seq 변화 없음 | REQ-ENTRY-02 |
-| T4-16 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 응모 1건 / W: compensate 2번 / T: remaining 은 한 번만 +1, applicants 에서 제거 | NFR-03 |
+| T4-16 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 응모 1건 / W: compensate 2번 / T: remaining 은 한 번만 +1, applicants 에서 제거. **v1.5**: 같은 eventId 로 호출, 1회차 COMPENSATED·2회차 NOT_OURS, requests 에서도 제거 | NFR-03 |
 | T4-17 | infra 통합 (Redis) | `RedisEntryGateTest` | G: A 응모(seq=1) → 보상 / W: B 응모 / T: **B 의 seq=2** (번호 재사용 없음) | NFR-03 |
 | T4-18 | infra 통합 (Redis) | `RedisEntryGateTest` | G: 초기화(정원 100) 후 응모 30건 / W: initialize 다시 호출(정원 100) / T: remaining=70 유지, 반환 0 | REQ-DROP-02 |
 | T4-19 | infra 통합 (PostgreSQL) | `EntryRepositoryImplTest` | G: (drop 1, user 1, seq 1) 저장 / W: 같은 (drop, user) 다른 seq 저장 / T: false, 예외 없음, 1건 | NFR-02 |
@@ -1451,16 +1605,23 @@ dependencies {
 | T4-23 | infra 통합 (Kafka) | `KafkaEntryEventPublisherTest` | W: publishCreated / T: `entry.created` 에 key=`{dropId}:{userId}`, 메시지 필드 일치 (테스트 컨슈머로 수신) | NFR-01 |
 | T4-24 | infra 통합 (Kafka) | `KafkaEntryEventPublisherTest` | G: Kafka 컨테이너 정지 / W: publishCreated / T: 5초 안에 `EventPublishException` (최악 `max.block.ms` 1초 + `get` 3.5초) | NFR-03 |
 | T4-25 | presentation 슬라이스 | `EntryControllerTest` (`@WebMvcTest`) | 202 + `{"entrySeq":7}` / `ApplicationException(EntryErrorCode.*)` 각 코드 → 409·503·404 + `code`(`ENTRY_*`)·고정 `message` / `X-User-Id` 없음 → 400 `COMMON_MISSING_USER_HEADER` / 숫자 아닌 dropId → 404 | REQ-ENTRY-01, 06 |
-| T4-26 | presentation 통합 | `EntryCreatedListenerTest` | G: 응모자 등록 / W: 같은 `EntryCreated` 2번 발행 / T: Awaitility 로 DB 1건 유지 확인 | NFR-02 |
+| T4-26 | presentation 통합 | `EntryCreatedListenerTest` | G: 응모자 등록 (v1.5: `tryApply` 로 같은 eventId 를 requests 에 기록) / W: 같은 `EntryCreated` 2번 발행 / T: Awaitility 로 DB 1건 유지 확인, persisted 에 userId | NFR-02 |
 | T4-27 | 구조 | `ArchitectureTest` | R1~R7 통과. 특히 `presentation` 이 `domain` 을 import 하지 않음, `EntryApplyService` 시그니처에 domain 타입 없음 | 설계 |
 | T4-28 | **시나리오 (동시성)** | `EntryConcurrencyTest` | G: 정원 100, 사용자 1,000명 모두 토큰 보유 / W: 동시 응모 / T: 성공 정확히 100, SOLD_OUT 900, Redis remaining=0, SCARD=100, **seq 100개 모두 다름**, 최종 DB 100건 | NFR-01 |
 | T4-29 | **시나리오 (동시성)** | `EntryConcurrencyTest` | G: 정원 100, 사용자 1명 / W: 같은 사용자 10번 동시 응모 / T: 성공 1, DUPLICATE 9, remaining=99, 최종 DB 1건 | NFR-02 |
 | T4-30 | 시나리오 (보상) | `EntryCompensationScenarioTest` | G: 발행 실패 Publisher 로 교체 / W: HTTP 응모 / T: 503 `ENTRY_TEMPORARILY_FAILED`, remaining·applicants 원상복구, 같은 사용자 재응모(정상 Publisher) → 202 | NFR-03 |
-| T4-31 | **시나리오 (유령 이벤트)** | `GhostEventScenarioTest` | 4.4 참고. T: DB 에 A 1건(seq=1), B 1건(seq=2), Redis SCARD=2 == DB 2 | NFR-03 |
+| T4-31 | **시나리오 (유령 이벤트, 보상이 먼저)** | `GhostEventScenarioTest` | 4.4 참고. T: DB 에 A 1건, B 1건(seq=2), Redis SCARD=2 == DB 2. **v1.5 기대값 변경**: A 는 **seq=3**(재응모 번호) — 유령 이벤트(seq 1)는 requests 의 eventId 불일치로 claim 0 | NFR-03 |
 | T4-32 | 시나리오 (재수신) | `DropCreatedRedeliveryTest` | G: `drop.created` 처리 후 응모 30건 / W: 같은 `drop.created` 재발행 / T: remaining=70, drop_snapshots 1행 | REQ-DROP-02 |
 | T4-33 | 시나리오 (잘못된 메시지, v1.2) | `DropCreatedRedeliveryTest` | G: capacity < winner 인 `drop.created` / W: 발행 후 정상 `drop.created`(다른 dropId) 발행 / T: 정상 건은 처리됨(drop_snapshots·meta 생성), 잘못된 건은 drop_snapshots·Redis meta 없음, `drop.created.DLT` 수신 0 (재시도·DLT 없이 스킵) | REQ-DROP-02 |
-| T4-34 | presentation 통합 (DLT, v1.2) | `EntryCreatedListenerTest` | G: (drop 1, user 1, seq 1) DB 저장, user 2 를 Redis 응모자로 등록 / W: `EntryCreated(drop 1, user 2, seq 1)` 발행 (seq 충돌 → `DataIntegrityViolationException`) / T: 재시도 후 `entry.created.DLT` 에서 같은 key 의 레코드 수신, DB 는 1건 그대로 | 6.1 ③ |
+| T4-34 | presentation 통합 (DLT, v1.2) | `EntryCreatedListenerTest` | G: (drop 1, user 1, seq 1) DB 저장, user 2 를 Redis 응모자로 등록 (v1.5: requests 에 메시지와 같은 eventId) / W: `EntryCreated(drop 1, user 2, seq 1)` 발행 (seq 충돌 → `DataIntegrityViolationException`) / T: 재시도 후 `entry.created.DLT` 에서 같은 key 의 레코드 수신, DB 는 1건 그대로 | 6.1 ③ |
 | T4-35 | application 단위 (v1.2) | `EntryErrorCodeTest` | `from(ApplyOutcome)` 4가지 매핑, `from(OK)` → `IllegalArgumentException`, 각 코드의 `code()`=`ENTRY_*`·`status()` 가 entry-apply.md 3장 표와 일치 | 설계 |
+| T4-36 | infra 통합 (Redis, v1.5) | `RedisEntryGateTest` | G: 초기화, 토큰 있음 / W: tryApply(eventId=e1) / T: OK, `HGET requests userId` = e1. 거절 4종(CLOSED·NO_TOKEN·DUPLICATE·SOLD_OUT)은 requests 변화 없음 (DUPLICATE 는 기존 값 e1 유지) | E-40 |
+| T4-37 | infra 통합 (Redis, v1.5) | `RedisEntryGateTest` | **claim Lua**. G: 응모(e1) / W: claimForSave(e1) / T: true, persisted 에 userId, 다시 호출해도 true (멱등). G: 응모자 없음 / T: false, persisted 변화 없음. G: 응모(e1) → 보상(e1) → 재응모(e2) / W: claim(e1) / T: false. claim(e2) → true | E-40 |
+| T4-38 | infra 통합 (Redis, v1.5) | `RedisEntryGateTest` | **보상 3결과**. ① 응모(e1) → compensate(e1) = COMPENSATED: remaining +1, applicants·requests 에서 제거, seq 유지. ② 응모(e1) → compensate(e2) = NOT_OURS: remaining·applicants·requests 변화 없음. ③ 판정 없이 compensate(e1) = NOT_OURS. ④ 응모(e1) → claim(e1) → compensate(e1) = ALREADY_PERSISTED: remaining·applicants·requests·persisted 변화 없음 | E-40 |
+| T4-39 | infra 통합 (Redis, v1.5) | `RedisEntryGateTest` | **타임아웃 → 포트 예외**. G: 응모 가능 상태, 별도 연결로 `CLIENT PAUSE 1500 ALL` (명령 타임아웃 1초보다 길게) / W: tryApply(e1) / T: `GateUnavailableException`(원인 `DataAccessException` 계열). pause 종료 후 Lua 는 실행돼 있음(applicants·requests=e1) → compensate(e1) = COMPENSATED, remaining 원상복구. 타이밍에 민감하면 pause 시간만 조정한다 | E-41 |
+| T4-40 | application 단위 (v1.5) | `EntryApplyServiceTest` | **발행 실패 + 보상 결과별 응답**. G: Gate OK(seq=7), Publisher `failNext()` / ① `nextCompensation(ALREADY_PERSISTED)` → 예외 없이 결과 seq=7 (202). ② COMPENSATED / NOT_OURS → `TEMPORARILY_FAILED`. 모든 경우 보상 호출 1회, eventId 는 tryApply·payload 와 같음 | E-40 |
+| T4-41 | application 단위 (v1.5) | `EntryApplyServiceTest` | **Gate 장애 → 보상 + 503**. ① `timeoutAfterApplyNext()` / W: apply / T: `TEMPORARILY_FAILED`, 발행 0, 보상 1회(tryApply 와 같은 eventId) → Fake 상태 원상복구(COMPENSATED). ② `timeoutBeforeApplyNext()` / T: `TEMPORARILY_FAILED`, 보상 1회 → NOT_OURS, 상태 변화 없음. ③ ① + `failCompensateNext()` / T: 여전히 `TEMPORARILY_FAILED` (보상 예외가 원래 예외를 가리지 않음) | E-41 |
+| T4-42 | **시나리오 (유령 이벤트, 소비가 먼저, v1.5)** | `GhostEventScenarioTest` | 4.4 순서 B 참고. G: 정원 2, A·B·C 토큰 / W: A 응모(Publisher 가 실제 send → 저장 컨슈머가 A 를 DB 에 저장할 때까지 대기 → 실패를 던짐), B 응모, C 응모 / T: A **202**, B 202, C 409 `ENTRY_SOLD_OUT`. DB 2건(A, B) == Redis SCARD 2, remaining `"0"`, persisted ⊇ {A, B} — **정원 초과 없음** (v1.4 코드에서는 A 가 503 + 보상으로 자리가 풀려 C 가 성공, DB 3건) | E-40 |
 
 ### 4.3 동시성 테스트 스케치 (T4-28, T4-29)
 application 서비스를 직접 호출한다. HTTP 를 거치면 톰캣 스레드 풀이 동시성을 제한해서 "동시" 요청이 줄어든다. HTTP 경로는 8단계 부하 테스트에서 본다.
@@ -1533,7 +1694,7 @@ class EntryConcurrencyTest {
 - 가상 스레드를 쓰는 이유: 고정 크기 풀(예: 64)에 1,000개 작업을 넣고 "전원 준비 완료" 래치를 기다리면, 64개만 실행돼서 래치가 영원히 풀리지 않는다. 가상 스레드는 작업마다 스레드가 생겨서 1,000개가 모두 `start.await()` 에서 대기한다.
 - Redis 커넥션 풀(Lettuce 는 기본적으로 커넥션 하나를 공유)이 실제 동시성을 제한할 수 있다. 그래도 **Lua 원자성 검증**이 목적이라 충분하다. 요청 순서가 섞이기만 하면 된다.
 
-### 4.4 유령 이벤트 시나리오 재현 (T4-31)
+### 4.4 유령 이벤트 시나리오 재현 (T4-31, T4-42)
 [sequence-diagram.md](../../design/08-sequence-diagram/sequence-diagram.md) 5.2 의 "브로커는 기록했는데 ack 를 못 받은" 상황은 실제 네트워크로 만들기 어렵다. 그래서 **실제로 발행한 뒤 실패를 던지는 테스트용 Publisher** 로 재현한다.
 
 ```java
@@ -1556,7 +1717,7 @@ class AckLostEntryEventPublisher implements EntryEventPublisher {
 ```
 `@TestConfiguration` 에서 `@Primary` 빈으로 등록한다.
 
-**순서 (설계 5.2 해결 후 시퀀스와 같게)**
+**순서 A — 보상이 먼저 (T4-31, 설계 5.2 재응모 시퀀스와 같게)**
 1. 드로우 초기화(정원 100), A·B 토큰 발급
 2. **저장 리스너 일시 정지**: `registry.getListenerContainer("entry-saver").pause()`. 이렇게 해야 A 가 재응모하기 전에 유령 이벤트가 처리되는 걸 막고, 설계 그림의 순서를 그대로 재현할 수 있다.
 3. `loseAckOnceFor(A)` → A 응모 → **503** (Kafka 에는 (A, seq 1) 기록, Redis 는 보상됨)
@@ -1564,12 +1725,44 @@ class AckLostEntryEventPublisher implements EntryEventPublisher {
 5. A 재응모 → 202, seq 3
 6. 리스너 재개: `resume()`
 7. Awaitility 로 확인
-   - DB 2건: A 1건(**seq 1**, 유령 이벤트가 먼저 저장되고 seq 3 은 user 충돌로 무시), B 1건(seq 2)
+   - DB 2건: A 1건(**seq 3**, v1.5 — 유령 이벤트 (A, seq 1, e1) 은 `requests[A]` = e3 ≠ e1 이라 claim 0), B 1건(seq 2)
+   - (v1.4 까지는 유령 이벤트가 `isApplicant` 를 통과해 A 가 seq 1 로 저장되고 seq 3 은 user 충돌로 무시됐다)
    - Redis `SCARD applicants` = 2 == DB 건수 → 5단계 추첨이 대기 없이 진행 가능
 
 **변형 케이스 (같은 테스트 클래스에 추가)**
-- 2번(일시 정지)을 빼면 유령 이벤트가 A 재응모 전에 처리될 수 있다. 이때는 `isApplicant(A) == false` 라 무시되고, A 는 seq 3 으로 저장된다. **어느 순서든 A·B 각 1건, 합계 2건**이어야 한다.
+- 2번(일시 정지)을 빼면 유령 이벤트가 A 재응모 전에 처리될 수 있다. 이때는 A 가 응모자에 없어 claim 0 이고, A 는 seq 3 으로 저장된다. **어느 순서든 A·B 각 1건, 합계 2건, A 는 seq 3** 이어야 한다.
 - A 가 재응모하지 않는 경우: 유령 이벤트는 무시되고 DB 는 B 1건, Redis SCARD 1 → 일치.
+
+**순서 B — 소비가 보상보다 먼저 (T4-42, v1.5, E-40 재현)**
+ack 유실형 유령 이벤트에서 더 흔한 순서다. 리스너를 멈추지 않고, **실제로 보낸 뒤 저장 컨슈머의 처리 완료를 기다린 다음** 실패를 던지는 Publisher 로 재현한다. 보상은 그 뒤에 서비스가 실행한다.
+```java
+/** 테스트 전용: 지정한 사용자의 첫 발행은 실제로 보내고, 컨슈머가 DB 에 저장할 때까지 기다린 뒤 실패를 던진다. */
+class ConsumedThenFailPublisher implements EntryEventPublisher {
+
+    private final EntryEventPublisher delegate;               // 실제 KafkaEntryEventPublisher
+    private final EntryJpaRepository entryJpaRepository;
+    private final Set<Long> consumedThenFailOnce = ConcurrentHashMap.newKeySet();
+
+    void consumeThenFailOnceFor(long userId) { consumedThenFailOnce.add(userId); }
+
+    @Override
+    public void publishCreated(EntryCreatedPayload payload) {
+        delegate.publishCreated(payload);                     // 브로커에 기록 → 저장 컨슈머가 claim + INSERT
+        if (consumedThenFailOnce.remove(payload.userId())) {
+            await().atMost(Duration.ofSeconds(10)).until(() ->
+                    entryJpaRepository.findByDropIdAndUserId(payload.dropId(), payload.userId()).isPresent());
+            throw new EventPublishException("ack 유실 시뮬레이션 (컨슈머가 먼저 처리)", null);
+        }
+    }
+}
+```
+1. 드로우 초기화(**정원 2**), A·B·C 토큰 발급. 리스너는 **실행 중** 그대로
+2. `consumeThenFailOnceFor(A)` → A 응모 → 컨슈머가 claim(1) + INSERT → Publisher 가 실패를 던짐 → 서비스 보상 = `ALREADY_PERSISTED` → **202**
+3. B 응모 → 202 (remaining 0)
+4. C 응모 → 409 `ENTRY_SOLD_OUT`
+5. Awaitility 로 확인: DB 2건(A, B), Redis `SCARD applicants` = 2, `GET remaining` = `"0"`, `SMEMBERS persisted` ⊇ {A, B}
+- v1.4 코드라면 2번에서 보상이 A 의 자리를 풀어(503) C 가 성공하고 DB 는 3건(정원 + 1)이 된다 — 이 테스트가 E-40 회귀 테스트다.
+- 기다리는 조건을 "DB 에 행이 있음"으로 둬 claim 이 보상보다 먼저임을 보장한다 (claim 은 INSERT 전에 실행).
 
 ---
 
@@ -1588,8 +1781,13 @@ class AckLostEntryEventPublisher implements EntryEventPublisher {
 | 7 | presentation API | `feat(entry): 응모·내 응모 조회 API 추가`<br>- EntryController(POST 202, GET 2종), Response | T4-25 |
 | 8 | presentation 리스너 | `feat(entry): drop.created·entry.created 리스너와 DLT 에러 핸들러 추가`<br>- DropCreatedListener, EntryCreatedListener (idIsGroup=false), KafkaConsumerConfig(3회 재시도 → DLT), application.yml: listener | T4-26, 32, 33, 34 |
 | 9 | 시나리오 | `test(entry): 응모 동시성·보상·유령 이벤트 시나리오 테스트 추가` | T4-27~31 |
-| 10 | 검증 반영 | `fix(entry): ...` (신민아·한지민 지적 중 명백한 버그가 있을 때만) | — |
+| 10a | E-40·E-41 application + 포트 (v1.5) | `fix(entry): 요청 ID 기반 보상 결과 분기와 Redis 장애 시 보상 추가`<br>- EntryGate: tryApply(eventId)·compensate → CompensationResult·claimForSave, CompensationResult, GateUnavailableException<br>- EntryApplyService: 판정 전 eventId 생성, ALREADY_PERSISTED → 202, GateUnavailable → 같은 eventId 로 보상 후 503<br>- EntrySaveCommand.eventId, EntrySaveService: isApplicant → claimForSave, EntryCreatedListener: eventId 전달<br>- FakeEntryGate 갱신 (RedisEntryGate 는 10b 전까지 컴파일만 맞춤 — 10a·10b 를 한 PR 안에서 연속 커밋) | T4-03, 05, 07, 08, 40, 41 |
+| 10b | E-40·E-41 Lua + Redis 어댑터 (v1.5) | `fix(entry): 응모 저장 확정 Lua 와 요청 ID 대조 보상 Lua 추가`<br>- entry-apply.lua: KEYS requests·ARGV eventId, HSET<br>- entry-claim.lua 신규, entry-compensate.lua 3결과<br>- EntryRedisKeys.requests/persisted, RedisScriptConfig.entryClaimScript, RedisEntryGate: DataAccessException → GateUnavailableException | T4-16, 17, 26, 34, 36~39 |
+| 10c | E-40 시나리오 (v1.5) | `test(entry): 유령 이벤트가 보상보다 먼저 소비되는 시나리오 추가`<br>- GhostEventScenarioTest: 순서 B(ConsumedThenFailPublisher), 순서 A 기대값 A seq=3 | T4-31, 42 (+ T4-27~30 전체 재실행) |
+| 10d | 검증 반영 | `fix(entry): ...` (신민아·한지민 지적 중 명백한 버그가 그 밖에 있을 때만) | — |
 | 11 | 문서 | `docs: 4단계 완료 표시` (플랜 진행 현황, 체크리스트, 백로그 처리 결과) | — |
+
+- v1.5: 10a~c 의 설계 문서 변경(D2 v1.3, entry-apply v1.6, sequence-diagram v1.3, architecture v1.5, class-diagram v2.3, 이 문서 v1.5)은 10a 앞에 `docs: 유령 이벤트·Redis 타임아웃 대응 설계 반영 (E-40, E-41)` 커밋으로 먼저 넣는다. 각 사이클은 장원영 Red → 고윤정 Green → 신민아 검증 순서 그대로.
 
 커밋 본문 예시 (#5)
 ```
@@ -1610,11 +1808,13 @@ Co-Authored-By: ...
 ### 6.1 이 단계에서 확정하는 것
 | # | 항목 | 결정 |
 |---|------|------|
-| ① | 컨슈머 저장 전 Redis 응모자 확인 | **확정 (2026-11-16 사용자 승인)**. `EntrySaveService` 에서 `isApplicant` 확인 후 없으면 저장하지 않음 |
+| ① | 컨슈머 저장 전 Redis 응모자 확인 | **확정 (2026-11-16 사용자 승인)**. `EntrySaveService` 에서 `isApplicant` 확인 후 없으면 저장하지 않음. → v1.5 에서 claim Lua 로 대체 (⑥) |
 | ② | Kafka 동기 발행 정책 | **확정 (2026-11-16)**. 애플리케이션 재시도 없음, producer 내부 재시도 + `request.timeout.ms=1000`, `delivery.timeout.ms=3000`, `get` 대기 3.5초. 쿠폰(6단계)도 같은 정책 |
 | ③ | 저장 컨슈머 실패 처리 | **확정 (2026-11-16)**. 3회 재시도 후 `{topic}.DLT`. 단, 도메인 불변식을 어긴 `drop.created` 는 재시도해도 결과가 같으므로 application 이 로그 후 스킵한다 (v1.2, queue 와 같은 방식) |
 | ④ | E-34 입장 인원과 잔여 정원 | **확정 (사용자 결정 2026-11-16)**. queue 입장은 잔여 정원과 무관하게 **주기당 N명 유지** (`admit.lua` 변경 없음). 소진 직전 초과 입장자는 이 단계 Lua 가 `SOLD_OUT` 으로 거절한다(정합성 영향 없음). 8단계 부하 테스트에서 소진 직전 `SOLD_OUT` 응답 수를 관찰한다 |
 | ⑤ | E-39 Redis Cluster 대비 키 설계 | **확정 (사용자 결정 2026-11-16)**. **단일 Redis 유지, 해시 태그 미적용**. 응모 Lua 가 queue 토큰 키를 KEYS 로 선언해 읽는 현재 형태를 유지한다. Cluster 전환 시 재설계 범위는 백로그 E-39 (해시 태그 또는 토큰 Hash + `HEXPIRE`) |
+| ⑥ | E-40 유령 이벤트가 보상보다 먼저 소비되는 경우 | **확정 (사용자 결정 2026-11-17)**. 요청 ID = eventId 를 판정 전에 만들고 `requests` Hash 에 기록. 저장 컨슈머는 `entry-claim.lua`(applicants·requests 확인 후 `SADD persisted`)로 저장 확정, 보상 Lua 는 COMPENSATED / ALREADY_PERSISTED / NOT_OURS. ALREADY_PERSISTED 면 202. ① 의 `isApplicant` 확인을 대체한다. 포기한 대안: 5단계 집합 대조(쿠폰에 적용 불가, 조회 비용), 보상 생략(유실 시 D6 정지). 키 TTL 은 E-42 와 함께 5단계 |
+| ⑦ | E-41 판정 Lua 응답 타임아웃 | **확정 (사용자 결정 2026-11-17)**. `RedisEntryGate` 가 `DataAccessException` 을 `GateUnavailableException` 으로 감싸고, `EntryApplyService` 는 같은 eventId 로 보상을 시도한 뒤 503 `ENTRY_TEMPORARILY_FAILED`. 보상도 실패하면 로그만 (6.3 리스크). 5단계 대조 여부는 5단계에서 판단 |
 
 ### 6.2 설계 수정 필요 (구현 전에 설계 문서부터 고침)
 | # | 대상 문서 | 현재 | 변경 |
@@ -1626,13 +1826,18 @@ Co-Authored-By: ...
 | ⑤ | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 3장 | `DropCreated` 에 `productId` 없음 | [architecture.md](../../design/02-architecture/architecture.md) 4장 페이로드에는 있음 → 둘 중 하나로 통일 (entry 는 쓰지 않으므로 어느 쪽이든 무방, ranking·queue 확인 필요) → 설계 반영 완료 (2026-11-16) |
 | ⑥ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 4.5 | 에러 코드 5개 | `ENTRY_NOT_FOUND`(404), `COMMON_MISSING_USER_HEADER`(400) 추가 → 설계 반영 완료 (2026-11-16, 코드 명명은 0단계 entry-apply v1.4). `InvalidDropSnapshotException` 은 ⑦ 로 대체 |
 | ⑦ | [entry-apply.md](../../design/05-features/entry-apply.md) 3장, [layered-architecture.md](../../design/02-architecture/layered-architecture.md) 4.5, [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.1·1.3 | 잘못된 `drop.created` → `InvalidDropSnapshotException` → 리스너 재시도 후 `drop.created.DLT`. 실패 응답은 `EntryApplyException` + 별도 `@RestControllerAdvice` | 잘못된 `drop.created` 는 application 이 `DomainException` 을 잡아 로그·스킵 (queue 와 같음). 실패 응답은 `ApplicationException(EntryErrorCode)` + `GlobalExceptionHandler` → 설계 반영 완료 (2026-11-16, v1.2) |
+| ⑧ | [concurrency-consistency.md](../../design/04-non-functional/concurrency-consistency.md) D2·D3, [entry-apply.md](../../design/05-features/entry-apply.md) 3장·5.2·6장, [sequence-diagram.md](../../design/08-sequence-diagram/sequence-diagram.md) 2.2 ③·5장, [architecture.md](../../design/02-architecture/architecture.md) 5장, [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.1 | 저장 전 `SISMEMBER` 확인, 보상 = `SREM`→`INCR`, Redis 장애 시 500 | 요청 ID(`requests`)·저장 확정(`persisted`)·claim Lua·보상 3결과·ALREADY_PERSISTED → 202·`GateUnavailableException` → 보상 후 503 (6.1 ⑥⑦) → 설계 반영 완료 (2026-11-17, D2 v1.3 / entry-apply v1.6 / sequence v1.3 / architecture v1.5 / class v2.3) |
 
 ### 6.3 리스크
 | 리스크 | 영향 | 대응 |
 |--------|------|------|
 | Kafka 지연이 응답 시간에 그대로 들어감 | 응모 p99 가 최대 3.5초까지 늘 수 있음 | 8단계 부하 테스트로 측정. `linger.ms`, 파티션 수 조정 |
-| `TimeoutException` 후 뒤늦은 기록 (유령 이벤트) | 보상된 응모가 Kafka 에 남음 | 저장 전 `isApplicant` 확인 + seq 카운터 (T4-31 로 검증) |
-| 보상 Lua 실패 | 정원 한 자리가 영구히 비어 있음 (언더 응모) | 로그 알림. 정합성 위반은 아님 (D2) |
+| `TimeoutException` 후 뒤늦은 기록 (유령 이벤트) | 보상된 응모가 Kafka 에 남음. 소비가 보상보다 먼저면 v1.4 까지는 DB 응모 수 = 정원 + 1 (E-40) | v1.5: claim Lua + 3결과 보상 + requests 대조 + seq 카운터. 어느 순서든 "DB 저장 ⇔ Redis 응모자 유지" (T4-31, T4-42) |
+| 보상 Lua 실패 (발행 실패 경로) | 정원 한 자리가 영구히 비어 있음 (언더 응모) | 로그 알림. 정원 초과는 아님 (D2) |
+| 판정 Lua 응답 타임아웃 + 보상도 실패 (E-41) | Redis 에만 응모(Kafka 메시지 없음) → 언더 응모 + D6 건수 불일치로 추첨 대기. 사용자는 재시도 시 409 DUPLICATE, 단건 조회는 저장 대기(APPLIED) | log.error 알림 후 운영 대응. 5단계에서 Redis ∖ DB 대조 여부 판단 (백로그 E-41 개선안 2) |
+| claim 후 DB 저장 실패 (DLT) | Redis 응모자 있음, DB 없음 → D6 대기 | v1.5 이후 남는 유일한 Redis·DB 불일치. DLT 재처리로 복구 (claim 은 재처리에도 1) |
+| 새 키 `requests`·`persisted` 메모리 | 정원 크기만큼 Hash(UUID 36B 값)·Set 이 드로우마다 추가로 남음 | 지금 규모에서는 문제없음. TTL 은 E-42 와 함께 5단계에서 결정 |
+| 6단계 쿠폰이 같은 발행·보상 패턴 | 같은 E-40·E-41 문제가 초과 발급으로 나타남 | phase-6 문서 리스크에 메모. 설계 확정은 6단계 |
 | Redis 재시작 시 데이터 유실 | 오버 응모 가능 | 0단계의 AOF everysec. 최대 1초 유실 가능성은 남음 |
 | Redis Cluster 미지원 | 키가 해시태그 없이 여러 슬롯에 흩어져 Lua 다중 키 실행 불가 | 단일 Redis 전제 유지 (6.1 ⑤ 사용자 결정). Cluster 전환 시 백로그 E-39 대로 queue·entry 키를 함께 재설계 |
 | 소진 직전 초과 입장 (E-34) | 잔여 정원보다 많은 토큰 보유자가 응모해 `SOLD_OUT` 응답이 몰림 | 정합성은 응모 Lua 가 지킴. 8단계에서 `SOLD_OUT` 응답 수 관찰 (6.1 ④) |
@@ -1653,6 +1858,8 @@ Co-Authored-By: ...
 | 동시성: 같은 사용자 10번 동시 응모 → 성공 1 | T4-29 |
 | 발행 실패 → 보상 후 잔여 정원·응모자 원상복구, 503 | T4-05, T4-16, T4-30 |
 | 유령 이벤트 시나리오 → DB 에 A, B 모두 1건씩 | T4-17, T4-31 |
+| (v1.5) 유령 이벤트가 보상보다 먼저 소비 → 202, DB == Redis, 정원 초과 없음 | T4-37, T4-38, T4-40, T4-42 |
+| (v1.5) 판정 Lua 타임아웃 → 보상 후 503 | T4-39, T4-41 |
 | 같은 이벤트 재전달 → DB 1건 유지 | T4-08, T4-19, T4-26 |
 | `drop.created` 재수신 → 잔여 정원 덮어쓰기 없음 | T4-18, T4-22, T4-32 |
 | (v1.2) 잘못된 `drop.created` → 스킵, 저장 실패 → `entry.created.DLT` | T4-09, T4-33, T4-34 |

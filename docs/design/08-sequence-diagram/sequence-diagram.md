@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 (인증, 전체 흐름, 쿠폰, 랭킹, 장애 시나리오) | 전체 |
 | v1.1 | 2026-11-16 | 5.2 응모 번호 재사용 문제 해결 반영 (별도 seq 카운터) 및 해결 후 시퀀스 추가 | NFR-03 |
 | v1.2 | 2026-11-16 | 5.1 애플리케이션 재시도 제거(producer 내부 재시도), 저장 컨슈머의 저장 전 Redis 확인·ON CONFLICT 반영 (응모·쿠폰) | D2, phase-4·6 구현 상세 6장 |
+| v1.3 | 2026-11-17 | 응모 유령 이벤트·Redis 타임아웃 대응 반영 (사용자 결정, E-40·E-41): 2.2 ③ 에 eventId·claim Lua, 5.1 보상 3결과, 5.2 를 "보상이 먼저 / 소비가 먼저" 두 순서로 재작성하고 재응모 예시를 requests 기준으로 갱신, 5.5 Redis 타임아웃 추가. 쿠폰(3장)은 6단계에서 갱신 | D2 v1.3 |
 
 ## 쉬운 설명
 > 기능 문서(`05-features/`)의 시퀀스가 "창구 하나에서 무슨 일이 일어나는지"라면,
@@ -146,12 +147,13 @@ sequenceDiagram
     Note over U,EDB: ③ 응모
     U->>GW: POST /api/entries/drops/{id}
     GW->>ES: X-User-Id
-    ES->>R: Lua: 마감·토큰·중복·잔여 검사 + DECR + SADD
+    Note over ES: eventId(UUID) 생성 — 판정 전
+    ES->>R: Lua: 마감·토큰·중복·잔여 검사 + DECR + SADD + HSET requests(userId→eventId)
     R-->>ES: OK(entrySeq)
-    ES->>K: entry.created (ack 대기)
+    ES->>K: entry.created(eventId) (ack 대기)
     ES-->>U: 202 {entrySeq}
     par
-        K->>ES: EntryCreatedConsumer → SISMEMBER applicants 확인
+        K->>ES: EntryCreatedConsumer → claim.lua (applicants·requests 확인 + SADD persisted)
         ES->>EDB: INSERT ... ON CONFLICT DO NOTHING
     and
         K->>RS: Lua: dedupe + ZINCRBY ×3
@@ -297,42 +299,71 @@ sequenceDiagram
     ES-xK: entry.created — get(3.5s)
     Note over ES,K: producer 내부 멱등 재시도만 (delivery.timeout.ms=3000)<br/>애플리케이션은 다시 send 하지 않음
     rect rgb(255, 235, 235)
-    ES->>R: compensate.lua: SREM applicants == 1 이면 INCR remaining
+    ES->>R: compensate.lua(userId, eventId)
+    Note over R: persisted 에 있음 → 2 ALREADY_PERSISTED (되돌리지 않음)<br/>requests[userId] ≠ eventId → 0 NOT_OURS (되돌리지 않음)<br/>그 외 → SREM applicants, HDEL requests, INCR remaining → 1 COMPENSATED
     end
-    ES-->>U: 503 다시 시도해 주세요
-    Note over U,R: 정원·응모자 상태가 판정 전으로 복구 → 사용자는 재응모 가능 (토큰 TTL 내)
+    alt ALREADY_PERSISTED
+        ES-->>U: 202 {entrySeq} (실제로 기록됨, 5.2-B)
+    else COMPENSATED / NOT_OURS
+        ES-->>U: 503 다시 시도해 주세요
+    end
+    Note over U,R: COMPENSATED 면 정원·응모자 상태가 판정 전으로 복구 → 사용자는 재응모 가능 (토큰 TTL 내)
 ```
-**읽는 법**: "성공 응답 = 이벤트 기록" 불변식을 지키기 위해 실패를 사용자에게 돌려준다. 토큰은 삭제하지 않았으므로 복구할 필요가 없다. 애플리케이션이 다시 send 하지 않는 이유: 다시 보낸 레코드는 Kafka 가 별개로 받아 멱등 producer 도 중복을 막지 못하고, 앞선 send 가 보상 이후 늦게 기록되는 유령 이벤트(5.2)를 늘리기 때문이다.
+**읽는 법**: "성공 응답 = 이벤트 기록" 불변식을 지키기 위해 실패를 사용자에게 돌려준다. 단, 컨슈머가 이미 저장을 확정했으면(ALREADY_PERSISTED) 기록된 것이므로 성공으로 답한다. 토큰은 삭제하지 않았으므로 복구할 필요가 없다. 애플리케이션이 다시 send 하지 않는 이유: 다시 보낸 레코드는 Kafka 가 별개로 받아 멱등 producer 도 중복을 막지 못하고, 앞선 send 가 보상 이후 늦게 기록되는 유령 이벤트(5.2)를 늘리기 때문이다.
 
-### 5.2 발행이 실제로는 성공했는데 타임아웃으로 판단한 경우
+### 5.2 발행이 실제로는 성공했는데 타임아웃으로 판단한 경우 (유령 이벤트)
+브로커가 기록했지만 ack 가 유실된 이벤트는 컨슈머 소비와 보상 중 무엇이 먼저 올지 정해지지 않는다. 소비는 수십 ms 안에, 보상은 최대 3초 뒤에 오므로 **B(소비가 먼저)** 가 오히려 흔하다. claim 과 보상이 같은 Redis 에서 원자적으로 경합하므로 두 순서 모두 "DB 저장 ⇔ Redis 응모자 유지"가 성립한다 ([D2](../04-non-functional/concurrency-consistency.md) v1.3).
+
+**A. 보상이 먼저**
 ```mermaid
 sequenceDiagram
+    actor U as 사용자
     participant ES as entry-service
     participant R as Redis
     participant K as Kafka
     participant C as EntryCreatedConsumer
     participant DB as entry_db
 
-    ES->>K: entry.created
+    ES->>K: entry.created(eventId=e1)
     Note over K: 브로커는 기록함
     K--xES: ack 유실 → 타임아웃
-    ES->>R: compensate (Redis 에서 응모자 제거)
-    K->>C: entry.created 전달됨
-    C->>R: SISMEMBER applicants userId
-    alt Redis 에 없음 (보상됨)
-        C->>C: 저장 스킵
-    else 있음
-        C->>DB: INSERT entries
-    end
+    ES->>R: compensate(userId, e1) → 1 COMPENSATED (SREM applicants, HDEL requests, INCR remaining)
+    ES-->>U: 503
+    K->>C: entry.created(e1) 전달됨
+    C->>R: claim(userId, e1) → applicants 에 없음 → 0
+    C->>C: 저장 스킵
+    Note over R,DB: Redis 응모자 없음, DB 없음 → 일치
 ```
-**읽는 법**: 컨슈머가 저장 전에 Redis 를 확인해 "보상된 응모"를 걸러낸다. 이 확인이 없으면 Redis 응모 수 < DB 응모 수가 되어 5.4 의 추첨이 영원히 대기한다. (README "확인 필요" 항목의 기본안)
+
+**B. 소비가 먼저**
+```mermaid
+sequenceDiagram
+    actor U as 사용자
+    participant ES as entry-service
+    participant R as Redis
+    participant K as Kafka
+    participant C as EntryCreatedConsumer
+    participant DB as entry_db
+
+    ES->>K: entry.created(eventId=e1)
+    Note over K: 브로커는 기록함 (ack 는 유실)
+    K->>C: entry.created(e1) 전달됨
+    C->>R: claim(userId, e1) → SADD persisted → 1
+    C->>DB: INSERT entries ... ON CONFLICT DO NOTHING
+    K--xES: 타임아웃 (delivery.timeout.ms)
+    ES->>R: compensate(userId, e1) → persisted 에 있음 → 2 ALREADY_PERSISTED
+    ES-->>U: 202 {entrySeq}
+    Note over R,DB: Redis 응모자 유지, DB 있음 → 일치. 풀린 자리 없음 → 정원 초과 없음
+```
+**읽는 법**: 예전(v1.2)의 `SISMEMBER` 확인은 B 에서 확인을 통과해 DB 에 저장한 뒤 보상이 자리를 풀어 DB 응모 수 = 정원 + 1 이 될 수 있었다 (E-40). 이제 저장 확정 표시(`persisted`)가 보상을 막는다. 남는 불일치는 claim 후 DB 저장이 실패해 DLT 로 간 경우(Redis 에 있고 DB 에 없음)뿐이며 5.4 에서 드러나고 DLT 재처리로 복구한다.
 
 > ✅ **응모 번호 재사용 문제 (v1.1 에서 해결)**
 > 번호를 잔여 정원으로 계산(`M - remaining`)하면 보상(`INCR remaining`) 후 같은 번호가 다른 사용자에게 재발급된다.
-> 보상된 사용자가 재응모하면 `SISMEMBER` 가 다시 true 가 되어 유령 이벤트가 저장되고, 같은 번호를 받은 다른 사용자의 INSERT 가
+> 보상된 사용자가 재응모하면 (v1.2 의 `SISMEMBER` 확인 기준) 다시 true 가 되어 유령 이벤트가 저장되고, 같은 번호를 받은 다른 사용자의 INSERT 가
 > `UNIQUE(drop_id, entry_seq)` 위반으로 "중복" 오인되어 **누락**될 수 있었다.
 > → `entrySeq` 를 **되돌리지 않는 별도 카운터 `INCR entry:{dropId}:seq`** 로 발급하도록 변경. 번호가 겹치지 않으므로 유령 이벤트는
 > 같은 사용자의 정상 이벤트와 `UNIQUE(drop_id, user_id)` 에서만 충돌하고, 다른 사용자의 응모에는 영향을 주지 않는다.
+> v1.3 부터는 `requests` 에 재응모의 eventId 가 기록되므로 이전 시도의 유령 이벤트는 claim 에서 걸러지고, A 는 재응모 번호로 저장된다.
 
 ```mermaid
 sequenceDiagram
@@ -343,22 +374,22 @@ sequenceDiagram
     participant C as Consumer
     participant DB as entry_db
 
-    A->>R: 응모 → seq=1, remaining 99
-    Note over K: (A, 1) 기록됐지만 ack 유실
-    R->>R: 보상: SREM A, INCR remaining → 100 (seq 는 그대로 1)
-    B->>R: 응모 → seq=2, remaining 99
-    B->>K: (B, 2)
-    A->>R: 재응모 → seq=3, remaining 98
-    A->>K: (A, 3)
-    K->>C: (A, 1) 유령 → SISMEMBER A = true
-    C->>DB: INSERT (A, 1) 성공
-    K->>C: (B, 2)
+    A->>R: 응모(e1) → seq=1, remaining 99, requests[A]=e1
+    Note over K: (A, 1, e1) 기록됐지만 ack 유실
+    R->>R: 보상(A, e1): SREM A, HDEL requests[A], INCR remaining → 100 (seq 는 그대로 1)
+    B->>R: 응모(e2) → seq=2, remaining 99
+    B->>K: (B, 2, e2)
+    A->>R: 재응모(e3) → seq=3, remaining 98, requests[A]=e3
+    A->>K: (A, 3, e3)
+    K->>C: (A, 1, e1) 유령 → claim: requests[A]=e3 ≠ e1 → 0
+    C->>C: 저장 스킵
+    K->>C: (B, 2, e2)
     C->>DB: INSERT (B, 2) 성공 ✅ 번호 충돌 없음
-    K->>C: (A, 3)
-    C->>DB: UNIQUE(drop_id, user_id) 위반 → 스킵
+    K->>C: (A, 3, e3)
+    C->>DB: claim 1 → INSERT (A, 3) 성공
     Note over R,DB: Redis 응모자 {A, B} = 2, DB = 2 → 추첨 가능
 ```
-**읽는 법**: A 는 유령 이벤트의 번호(1)로 저장되지만 응모 1건은 정확히 남는다. 번호는 추첨 정렬 기준일 뿐 당첨은 시드 셔플로 정해지므로 공정성에 영향이 없다.
+**읽는 법**: 이전 시도(e1)의 유령 이벤트는 `requests` 비교로 걸러지고 A 는 재응모 번호(3)로 정확히 1건 저장된다. (v1.2 까지는 유령 이벤트의 번호 1 로 저장됐다) 번호는 추첨 정렬 기준일 뿐 당첨은 시드 셔플로 정해지므로 공정성에 영향이 없다.
 
 ### 5.3 컨슈머 재전달 (중복 이벤트)
 ```mermaid
@@ -380,7 +411,7 @@ sequenceDiagram
     RC->>R: SADD dedupe → 0
     RC->>RC: 집계 스킵
 ```
-**읽는 법**: 저장은 **DB 유니크 제약**으로, 랭킹은 **Redis dedupe Set** 으로 각자 멱등성을 확보한다. 두 컨슈머는 서로의 처리 여부를 모른다.
+**읽는 법**: 재전달에도 claim 은 1 을 반환한다(멱등, 보상은 `persisted` 때문에 이미 막혀 있음). 저장은 **DB 유니크 제약**으로, 랭킹은 **Redis dedupe Set** 으로 각자 멱등성을 확보한다. 두 컨슈머는 서로의 처리 여부를 모른다.
 
 ### 5.4 추첨 시 응모 수 불일치 (컨슈머 지연)
 ```mermaid
@@ -407,6 +438,30 @@ sequenceDiagram
     end
 ```
 **읽는 법**: `CLOSING` 상태가 "닫혔지만 장부 정리 대기 중"을 표현한다. 불일치가 일정 시간 이상 계속되면 경고를 남기고 관리자 확정을 기다린다 ([draw.md](../05-features/draw.md) 6장).
+
+### 5.5 Redis 응답 타임아웃 (판정 Lua 실행 여부를 모름)
+```mermaid
+sequenceDiagram
+    actor U as 사용자
+    participant ES as entry-service
+    participant R as Redis
+
+    U->>ES: 응모
+    Note over ES: eventId=e1 생성
+    ES->>R: apply.lua(userId, now, e1)
+    R--xES: 명령 타임아웃 → GateUnavailableException
+    Note over R: Lua 는 실행됐을 수도, 안 됐을 수도 있음
+    ES->>R: compensate.lua(userId, e1) (같은 연결 — 늦게 온 판정 Lua 뒤에 실행)
+    alt 판정이 실행됨 (requests[userId] = e1)
+        R-->>ES: 1 COMPENSATED (정원·응모자 복구)
+    else 실행 안 됨 / 다른 요청의 응모
+        R-->>ES: 0 NOT_OURS (무변화)
+    else 보상도 실패
+        ES->>ES: log.error (Redis 에만 응모 남음 — 언더 응모 + 5.4 불일치)
+    end
+    ES-->>U: 503 다시 시도해 주세요
+```
+**읽는 법**: 판정 결과를 모르면 발행하지 않고, 같은 eventId 로 되돌려 Kafka 메시지 없이 Redis 에만 응모가 남는 상태를 막는다 (E-41). 보상까지 실패한 경우만 남는 위험이며 알림 대상이다.
 
 ---
 

@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 발행 정책을 4단계와 통일(애플리케이션 재시도 제거, producer 내부 재시도 + delivery.timeout 3000, get 3.5초), 저장 컨슈머 DLT(3회 재시도 후 `coupon.issued.DLT`) 추가, 저장 전 Redis 확인 확정, 재발급 유령 이벤트 테스트 추가, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-17 | DLT recoverer 에 목적지 리졸버 명시 (Spring Kafka 4 기본 `{topic}-dlt`, 4단계 v1.4 에서 확인) |
+| v1.3 | 2026-11-17 | 결정 필요 D6-4·리스크에 메모 추가: 4단계 E-40/E-41(유령 이벤트가 보상보다 먼저 소비, 판정 Lua 타임아웃) 과 같은 방식 적용 필요. 설계 확정은 6단계 착수 시 |
 
 ---
 
@@ -671,6 +672,7 @@ public class CouponIssuedListener {
 | D6-1 | 응모(4단계)와의 공통화 (Lua 실행·동기 발행·보상) | (a) **서비스별로 각자 구현** — 중복은 있지만 서비스 독립성 유지 (b) `common` 에 인프라 헬퍼(`LuaScriptRunner`, `SyncKafkaPublisher`) 추가 — common 이 Spring Data Redis·Spring Kafka 에 의존하게 됨 (c) 별도 `common-infra` 모듈 신설 — 순수 계약 모듈(common)과 분리, 모듈 1개 증가 | (a). 중복 대상이 두 서비스·클래스 2~3개 수준이라 추상화 비용이 더 크다. 8단계 이후 세 번째 사용처가 생기면 (c) 검토 |
 | D6-2 | 매진 후 요청 차단 | (a) 그대로 Lua 실행 (O(1)) (b) 애플리케이션 로컬 "매진" 플래그로 Redis 호출 전 차단 | (a). 8단계 부하 테스트에서 매진 구간 Redis 부하를 측정한 뒤 결정 |
 | D6-3 | `/me` 발급 직후 미반영 | (a) DB 만 조회 (잠깐 비어 보일 수 있음) (b) Redis Set 으로 "발급됨" 표시 보완 | (a). 발급 응답(202)에 이미 결과가 있으므로 사용자 영향이 작다 |
+| D6-4 | 유령 이벤트·판정 Lua 타임아웃 대응 (4단계 E-40/E-41) | **4단계 E-40/E-41 과 같은 방식 적용 필요** — 요청 ID(eventId) 기록(`coupon:{eventId}:requests` 류), 저장 컨슈머의 claim Lua(`persisted`), 보상 Lua 3결과(ALREADY_PERSISTED 면 202), Redis 예외 → 포트 예외 → 같은 요청 ID 로 보상 후 503. 현재 문서의 `isIssued` 확인(3.2 `CouponSaveService`)·`compensate.lua`(SREM→INCR)·T6-16/T6-22 는 "보상이 먼저" 순서만 가정한다 | 6단계 착수 시 확정 (4단계 [phase-4-entry-apply.md](phase-4-entry-apply.md) v1.5 6.1 ⑥⑦, [D2](../../design/04-non-functional/concurrency-consistency.md) v1.3 참고). 쿠폰 eventId(쿠폰 이벤트 ID)와 메시지 eventId 이름이 겹치므로 키·필드 이름도 그때 정한다 |
 
 ### 설계 수정 필요
 | 대상 문서 | 내용 |
@@ -686,6 +688,7 @@ public class CouponIssuedListener {
 - **Redis 초기화 실패 후 발급 시작**: 등록 시 초기화가 실패하면 발급 요청이 `EVENT_NOT_FOUND` 로 거부된다. 오버 발급 방향이 아니라 서비스 불가 방향이므로 정합성은 안전. 재초기화 API 로 복구.
 - **Redis 유실**: AOF 없이 재시작되면 잔여 수량·발급 Set 이 사라져 재초기화 시 초과 발급 가능. 0단계 AOF 설정이 전제.
 - **DLT 적재분 방치**: DLT 로 간 발급은 Redis 에만 있어 사용자 `/me` 에 영원히 안 보인다. DLT 를 ERROR 로그로 감지하고 재처리하는 절차가 필요하다 (8단계 관측 구성 시 알림 대상).
+- **유령 이벤트가 보상보다 먼저 소비 / 판정 Lua 타임아웃 (4단계 E-40/E-41)**: 현재 설계(`isIssued` 확인 + SREM→INCR 보상)로는 소비가 먼저 오면 보상이 수량을 풀어 **초과 발급**, Redis 타임아웃이면 Redis 에만 발급이 남는다. 쿠폰은 추첨 같은 사후 대조가 없어 응모보다 영향이 직접적이다 → 4단계와 같은 방식 적용 필요 (D6-4, 설계 확정은 6단계).
 - **Kafka 응답 지연**: 발급 응답 시간에 Kafka ack 왕복이 포함된다. 동시성 테스트(T6-13)에서 소요 시간을 기록해 8단계 비교 기준으로 쓴다.
 
 ---
