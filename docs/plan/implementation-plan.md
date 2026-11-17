@@ -12,6 +12,7 @@
 | v1.6 | 2026-11-16 | 3단계 완료: 진행 현황·체크리스트 갱신. 대기열 기본안 3건(마감 후 CLOSED 상태 없음, queue 키 `closeAt + 1일` 만료, 입장 게이트 유지 시간 = 주기의 90%) 4장 표에 추가 |
 | v1.7 | 2026-11-16 | 4단계 착수: 사용자 결정 2건(E-34 주기당 N명 유지, E-39 해시 태그 미적용) 4장 표에 추가 |
 | v1.8 | 2026-11-17 | 4단계 사용자 결정 2건(E-40 요청 ID·저장 확정 기반 유령 이벤트 대응, E-41 Redis 타임아웃 시 보상 후 503) 4장 표에 추가 |
+| v1.9 | 2026-11-17 | 4단계 완료: 진행 현황·체크리스트 갱신 (entry-service 테스트 223건, 전체 빌드, 로컬 compose 에서 등록 → 진입 → 입장 → 응모 202 → 내 응모 조회 확인) |
 
 ---
 
@@ -87,7 +88,7 @@ flowchart LR
 | 1. 인증 | `feat/phase-1-auth` | [phase-1-auth.md](phases/phase-1-auth.md) | ✅ 완료 (2026-11-16) |
 | 2. 드로우 | `feat/phase-2-drop` | [phase-2-drop.md](phases/phase-2-drop.md) | ✅ 완료 (2026-11-16) |
 | 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ✅ 완료 (2026-11-16) |
-| 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ⬜ 대기 |
+| 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ✅ 완료 (2026-11-17) |
 | 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ⬜ 대기 |
 | 6. 쿠폰 | `feat/phase-6-coupon` | [phase-6-coupon.md](phases/phase-6-coupon.md) | ⬜ 대기 |
 | 7. 랭킹 | `feat/phase-7-ranking` | [phase-7-ranking.md](phases/phase-7-ranking.md) | ⬜ 대기 |
@@ -206,33 +207,33 @@ flowchart LR
 
 **작업**
 - 드로우 정보 수신
-  - [ ] domain: `DropSnapshot`, `DropSnapshotRepository`(I)
-  - [ ] application: `DropSnapshotRegisterService` (DB 저장 + Redis 정원 초기화)
-  - [ ] infrastructure: JPA, `RedisEntryGate.initialize()` (`SET NX` 로 멱등 처리)
-  - [ ] presentation: `DropCreatedListener`
+  - [x] domain: `DropSnapshot`, `DropSnapshotRepository`(I)
+  - [x] application: `DropSnapshotRegisterService` (DB 저장 + Redis 정원 초기화)
+  - [x] infrastructure: JPA, `RedisEntryGate.initialize()` (`SET NX` 로 멱등 처리)
+  - [x] presentation: `DropCreatedListener`
 - 응모
-  - [ ] domain: `Entry`, `EntryStatus`, `ApplyOutcome`, `EntryRepository`(I)
-  - [ ] application: `EntryApplyService`, 포트 `EntryGate`, `EntryEventPublisher`, 에러 코드 (`CLOSED` / `NO_TOKEN` / `DUPLICATE` / `SOLD_OUT` / `TEMPORARILY_FAILED`)
-  - [ ] infrastructure: `apply.lua` (마감·토큰·중복·잔여 검사 → `DECR` + `SADD` + **`INCR seq`**), `compensate.lua`, `KafkaEntryEventPublisher` (`acks=all`, 동기 확인 3.5초, **애플리케이션 재시도 없음** — producer 내부 재시도 + `delivery.timeout.ms=3000`)
-  - [ ] presentation: `EntryController` (응모 → 202)
+  - [x] domain: `Entry`, `EntryStatus`, `ApplyOutcome`, `EntryRepository`(I)
+  - [x] application: `EntryApplyService`, 포트 `EntryGate`, `EntryEventPublisher`, 에러 코드 (`CLOSED` / `NO_TOKEN` / `DUPLICATE` / `SOLD_OUT` / `TEMPORARILY_FAILED`)
+  - [x] infrastructure: `apply.lua` (마감·토큰·중복·잔여 검사 → `DECR` + `SADD` + **`INCR seq`**), `compensate.lua`, `KafkaEntryEventPublisher` (`acks=all`, 동기 확인 3.5초, **애플리케이션 재시도 없음** — producer 내부 재시도 + `delivery.timeout.ms=3000`)
+  - [x] presentation: `EntryController` (응모 → 202)
 - 저장
-  - [ ] application: `EntrySaveService` (**저장 전 Redis 응모자 확인**, 유니크 위반 무시)
-  - [ ] infrastructure: `EntryJpaEntity`(UK 2개), Mapper, Repository 구현
-  - [ ] presentation: `EntryCreatedListener` (3회 재시도 후 `entry.created.DLT`)
+  - [x] application: `EntrySaveService` (**저장 전 Redis 응모자 확인**, 유니크 위반 무시)
+  - [x] infrastructure: `EntryJpaEntity`(UK 2개), Mapper, Repository 구현
+  - [x] presentation: `EntryCreatedListener` (3회 재시도 후 `entry.created.DLT`)
 - 조회
-  - [ ] `EntryQueryService`, 내 응모 목록 / 특정 드로우 내 응모 (DB 에 없으면 Redis 로 보완)
+  - [x] `EntryQueryService`, 내 응모 목록 / 특정 드로우 내 응모 (DB 에 없으면 Redis 로 보완)
 
 **확정 (2026-11-16)**
-- [x] 컨슈머 저장 전 Redis 응모자 확인 (없으면 저장 스킵)
+- [x] 컨슈머 저장 전 Redis 응모자 확인 (없으면 저장 스킵) → 2026-11-17 E-40 결정으로 `entry-claim.lua` 저장 확정으로 대체
 
 **완료 조건**
-- [ ] 통합(Lua): 결과 5가지(OK / CLOSED / NO_TOKEN / DUPLICATE / SOLD_OUT)가 각각 올바르게 나옴
-- [ ] **동시성: 정원 100, 서로 다른 사용자 1,000명 동시 응모 → 성공 정확히 100, Redis 잔여 0, 최종 DB 100건**
-- [ ] **동시성: 같은 사용자 10번 동시 응모 → 성공 1**
-- [ ] 발행 실패(Fake publisher 예외) → 보상 후 잔여 정원·응모자 원상복구, 503
-- [ ] 유령 이벤트 시나리오 ([sequence-diagram.md](../design/08-sequence-diagram/sequence-diagram.md) 5.2): A 보상 → B 응모 → A 재응모 → DB 에 A, B 모두 1건씩
-- [ ] 같은 이벤트 재전달 → DB 1건 유지
-- [ ] `drop.created` 재수신 → 진행 중인 잔여 정원이 덮어써지지 않음
+- [x] 통합(Lua): 결과 5가지(OK / CLOSED / NO_TOKEN / DUPLICATE / SOLD_OUT)가 각각 올바르게 나옴
+- [x] **동시성: 정원 100, 서로 다른 사용자 1,000명 동시 응모 → 성공 정확히 100, Redis 잔여 0, 최종 DB 100건**
+- [x] **동시성: 같은 사용자 10번 동시 응모 → 성공 1**
+- [x] 발행 실패(Fake publisher 예외) → 보상 후 잔여 정원·응모자 원상복구, 503
+- [x] 유령 이벤트 시나리오 ([sequence-diagram.md](../design/08-sequence-diagram/sequence-diagram.md) 5.2): A 보상 → B 응모 → A 재응모 → DB 에 A, B 모두 1건씩
+- [x] 같은 이벤트 재전달 → DB 1건 유지
+- [x] `drop.created` 재수신 → 진행 중인 잔여 정원이 덮어써지지 않음
 
 ---
 

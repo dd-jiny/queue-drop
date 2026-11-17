@@ -10,6 +10,7 @@
 | v1.4 | 2026-11-17 | 커밋 #8 구현 확인: 역직렬화 실패 레코드를 원본 바이트로 DLT 에 보내도록 `byte[]` 전용 템플릿 추가(JSON 템플릿은 Base64 문자열로 감쌈). Spring Kafka 4 의 `DeadLetterPublishingRecoverer` 기본 목적지가 `{topic}-dlt` 라서 리졸버로 `{topic}.DLT`·같은 파티션을 명시 (토픽 이름·설계 문서는 그대로). 6단계 coupon 도 같은 리졸버 사용 |
 | v1.5 | 2026-11-17 | 백로그 E-40·E-41 반영 (사용자 결정 2026-11-17, 6.1 ⑥⑦): 요청 ID = eventId 를 판정 전에 만들어 Gate 에 넘김. 새 키 `requests`(Hash)·`persisted`(Set), `entry-apply.lua` 에 `HSET requests`, 새 `entry-claim.lua`(저장 컨슈머가 `isApplicant` 대신 호출), `entry-compensate.lua` 3결과(`CompensationResult`). 발행 실패여도 ALREADY_PERSISTED 면 202. `RedisEntryGate` 가 Redis 예외를 `GateUnavailableException` 으로 감싸고 서비스는 같은 eventId 로 보상 후 503. 3.0·3.2·3.3 코드·Lua 전문, 4.1 Fake, 4.2 테스트 T4-36~42 추가·기존 테스트 기대값 변경 표시, 4.4 순서 B, 5장 커밋 #10a~c, 6장 결정·리스크 갱신 |
 | v1.6 | 2026-11-17 | 6.3 리스크에 스크립트 캐시 미적재 시 판정 타임아웃 행 추가 (#10b Red 중 확인, 동작 변경 없음). 5장: T4-31 기대값 변경을 10c → 10b 로 이동. 4.4 순서 B 구현 메모 |
+| v1.7 | 2026-11-17 | 4단계 완료: 7장 체크리스트 갱신. 10d 는 남은 명백한 버그가 없어 생략 (E-40·E-41 은 10a~c 로 반영, E-42~47 은 백로그에 남김) |
 
 > 표기
 > - **(구현 결정)**: 설계 문서에 없던 내용을 이 문서에서 정한 것
@@ -1868,9 +1869,9 @@ Co-Authored-By: ...
 | (v1.2) 잘못된 `drop.created` → 스킵, 저장 실패 → `entry.created.DLT` | T4-09, T4-33, T4-34 |
 
 ### 공통 완료 조건
-- [ ] `./gradlew :entry-service:build` 통과 (T4-27 ArchUnit 포함)
-- [ ] API 3개가 [entry-apply.md](../../design/05-features/entry-apply.md) API 표와 일치 (경로, 202, 에러 코드)
+- [x] `./gradlew :entry-service:build` 통과 (T4-27 ArchUnit 포함)
+- [x] API 3개가 [entry-apply.md](../../design/05-features/entry-apply.md) API 표와 일치 (경로, 202, 에러 코드)
 - [x] 6.2 "설계 수정 필요" ①~⑦ 설계 문서 반영 + 변경 이력 추가 (2026-11-16)
-- [ ] 단계 종료 시 로컬 compose 에서 드로우 등록 → 대기열 진입 → 입장 → 응모 202 → 내 응모 조회 확인 (queue 키 계약 실검증)
+- [x] 단계 종료 시 로컬 compose 에서 드로우 등록 → 대기열 진입 → 입장 → 응모 202 → 내 응모 조회 확인 (queue 키 계약 실검증)
 - [x] 6.1 결정 ① 을 플랜 4장 "미결정 사항" 표와 설계 README "확인 필요" 에서 확정으로 갱신 (2026-11-16)
-- [ ] 플랜 진행 현황에서 4단계 ✅
+- [x] 플랜 진행 현황에서 4단계 ✅
