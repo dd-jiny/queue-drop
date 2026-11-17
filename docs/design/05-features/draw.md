@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-ENTRY-05, 06 |
 | v1.1 | 2026-11-16 | 추첨 트랜잭션 첫 문장을 `CLOSING → DRAWN` 조건부 UPDATE 로 변경(동시 추첨 방지), `draw_results.published` 와 발행 실패 재발행 추가, 시드 생성 포트, 벌크 UPDATE 분할 | phase-5 구현 상세 6장 |
 | v1.2 | 2026-11-17 | 건수 불일치 장기화: (a) 경고 후 관리자 수동 추첨 API 확정(`POST /api/entries/admin/drops/{dropId}/draw`, DB 응모 기준). 추첨 커밋 후 응모 Redis 키 6개 EXPIRE 1일 | 사용자 결정, phase-5 v1.2 D5-1·D5-4 |
+| v1.3 | 2026-11-17 | 구현 결과 반영: 늦은 응모 LOST 저장(E-48, 사용자 결정), 드로우 단위 예외 격리, SCARD 실패 시 해당 드로우만 건너뜀, 응모 0건 추첨, 표시 실패 중복 발행, 수동 추첨 경합 409, product DLT, 결과 조회 409 범위, 관리자 API 표 | phase-5 구현 상세 v1.7~v1.13 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-ENTRY-05: 응모 마감 시각에 자동 추첨, 응모자 중 K명 무작위 (정원이 일찍 차도 마감 시각까지 대기)
@@ -30,6 +31,7 @@ OPEN ──(closeAt 도달, 조건부 UPDATE)──▶ CLOSING ──(건수 일
    - 동시에 Redis `HSET entry:{id}:meta state CLOSED` → 이후 응모 Lua 는 `CLOSED` 반환
 2. **건수 일치 확인**: `SCARD entry:{id}:applicants` == `SELECT COUNT(*) FROM entries WHERE drop_id=?`
    - 불일치 → 이번 주기는 종료, 다음 주기 재확인. `CLOSING` 상태가 일정 시간(예: 5분) 넘으면 경고 로그
+   - Redis 장애로 SCARD 실패 → 이 드로우만 건너뛰고 다음 주기 재시도
 3. **추첨 (하나의 DB 트랜잭션)**
    - **첫 문장**: `UPDATE drop_snapshots SET status='DRAWN' WHERE drop_id=? AND status='CLOSING'`
      - 영향 행 0 → 다른 인스턴스가 이미 추첨함 → 롤백하고 종료
@@ -40,22 +42,29 @@ OPEN ──(closeAt 도달, 조건부 UPDATE)──▶ CLOSING ──(건수 일
    - `INSERT draw_results (drop_id, seed, applicant_count, winner_count, drawn_at, published=false)`
 4. **결과 이벤트**: 커밋 후 `draw.completed` 발행 → 성공 시 `draw_results.published=true` → product-service 가 드로우 상태 DRAWN 반영
    - 발행 실패 → `published=false` 로 남고, 스케줄러가 다음 주기에 미발행 결과를 다시 발행한다 (product 쪽 처리는 멱등)
+   - product 는 3회 재시도 후 `draw.completed.DLT` (드로우 없음은 재시도·DLT 없이 로그 후 커밋)
+5. **드로우 단위 격리**: 마감·추첨 루프는 드로우마다 예외를 잡아 ERROR 로그 후 다음 드로우로 넘어간다. 계속 실패하는 드로우가 다른 드로우와 재발행을 막지 않는다
 
 ### 경계 케이스
 | 케이스 | 처리 |
 |--------|------|
 | 응모자 < K | 응모자 전원 당첨 |
-| 응모자 0명 | 당첨 0, draw_results 는 기록 |
+| 응모자 0명 | 당첨 0, draw_results 는 기록, DRAWN 전이·`draw.completed`(0/0) 발행 |
 | CLOSING 중 서버 재시작 | 다음 주기에 CLOSING 상태 드로우도 대상으로 2단계부터 재시도 |
 | 추첨 트랜잭션 실패 | 롤백 → CLOSING 유지 → 다음 주기 재시도 (새 시드로) |
 | 두 인스턴스가 동시에 추첨 시도 | 첫 문장(`CLOSING → DRAWN`)의 행 잠금으로 한쪽만 진행, 다른 쪽은 0행 → 종료 |
 | `draw.completed` 발행 실패 | `published=false` → 다음 주기 재발행 |
+| 발행 성공 후 `published=true` 표시 실패 | 다음 주기 재발행 (중복, 소비자 멱등) |
+| 한 드로우의 DB 예외 | 그 드로우만 ERROR 로그 후 건너뜀, 롤백되어 CLOSING 유지 → 다음 주기 재시도 |
+| 관리자 수동 추첨과 스케줄러 경합 | 첫 문장 0행 → 409 `ENTRY_DRAW_ALREADY_DRAWN` |
+| 수동 추첨 뒤 늦게 저장되는 응모 (DLT 재처리·lag) | `LOST` 로 저장 (스냅샷 행 FOR SHARE 로 추첨과 직렬화). `applicant_count` 에는 포함되지 않음 (E-48, 사용자 결정) |
 
 ### API
 | Method | Path | 설명 |
 |--------|------|------|
 | GET | `/api/entries/drops/{dropId}/me` | 내 결과 (APPLIED / WON / LOST) — 응모 단건 조회와 같은 API ([entry-apply.md](entry-apply.md)) |
-| GET | `/api/entries/drops/{dropId}/result` | 추첨 요약 (응모자 수, 당첨 수, 추첨 시각, 시드) |
+| GET | `/api/entries/drops/{dropId}/result` | 추첨 요약 (응모자 수, 당첨 수, 추첨 시각, 시드 문자열). 공개. 추첨 전·없는 드로우 → 409 `ENTRY_DRAW_NOT_COMPLETED` |
+| POST | `/api/entries/admin/drops/{dropId}/draw` | 관리자 수동 추첨 (D5-1). 403 / 404 / 409 `NOT_CLOSING`·`ALREADY_DRAWN` |
 
 ## 4. 설계 결정
 | 결정점 | 선택 | 이유 / 포기한 것 |

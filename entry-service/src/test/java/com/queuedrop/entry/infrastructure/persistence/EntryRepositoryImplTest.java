@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.queuedrop.common.test.container.PostgresContainerConfig;
 import com.queuedrop.entry.domain.model.Entry;
 import com.queuedrop.entry.domain.model.EntryStatus;
+import com.queuedrop.entry.domain.repository.EntrySaveOutcome;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -20,6 +21,8 @@ import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
 import org.springframework.boot.jdbc.test.autoconfigure.AutoConfigureTestDatabase;
@@ -47,18 +50,18 @@ class EntryRepositoryImplTest {
     // ---------------------------------------------------------------- T4-19
 
     @Test
-    @DisplayName("[T4-19] 같은 (drop, user) 로 다른 seq 를 다시 저장하면 예외 없이 false 이고 1건만 남는다")
+    @DisplayName("[T4-19] 같은 (drop, user) 로 다른 seq 를 다시 저장하면 예외 없이 ALREADY_EXISTS 이고 1건만 남는다")
     void duplicateUserIgnored() {
         // Given
-        assertThat(entryRepository.saveIfAbsent(Entry.apply(1L, 1L, 1, APPLIED_AT))).isTrue();
+        assertThat(entryRepository.saveIfAbsent(Entry.apply(1L, 1L, 1, APPLIED_AT))).isEqualTo(EntrySaveOutcome.SAVED);
 
         // When
-        boolean[] second = new boolean[1];
+        EntrySaveOutcome[] second = new EntrySaveOutcome[1];
         assertThatCode(() -> second[0] = entryRepository.saveIfAbsent(Entry.apply(1L, 1L, 2, APPLIED_AT.plusSeconds(1))))
                 .doesNotThrowAnyException();
 
         // Then: 첫 값이 유지된다
-        assertThat(second[0]).isFalse();
+        assertThat(second[0]).isEqualTo(EntrySaveOutcome.ALREADY_EXISTS);
         assertThat(countEntries(1L)).isEqualTo(1L);
         entityManager.clear();
         Entry kept = entryRepository.findByDropIdAndUserId(1L, 1L).orElseThrow();
@@ -73,10 +76,10 @@ class EntryRepositoryImplTest {
         entryRepository.saveIfAbsent(Entry.apply(1L, 1L, 1, APPLIED_AT));
 
         // When
-        boolean saved = entryRepository.saveIfAbsent(Entry.apply(2L, 1L, 1, APPLIED_AT));
+        EntrySaveOutcome saved = entryRepository.saveIfAbsent(Entry.apply(2L, 1L, 1, APPLIED_AT));
 
         // Then
-        assertThat(saved).isTrue();
+        assertThat(saved).isEqualTo(EntrySaveOutcome.SAVED);
         assertThat(countEntries(1L)).isEqualTo(1L);
         assertThat(countEntries(2L)).isEqualTo(1L);
     }
@@ -150,18 +153,18 @@ class EntryRepositoryImplTest {
     // ---------------------------------------------------------------- 경계 보강 (장원영, 커밋 #4 검증)
 
     @Test
-    @DisplayName("[T4-19] 같은 이벤트 재전달 — (drop, user, seq) 가 모두 같아도 seq 제약 예외 없이 false, 1건 유지")
+    @DisplayName("[T4-19] 같은 이벤트 재전달 — (drop, user, seq) 가 모두 같아도 seq 제약 예외 없이 ALREADY_EXISTS, 1건 유지")
     void exactRedeliveryIgnored() {
         // Given
         entryRepository.saveIfAbsent(Entry.apply(1L, 1L, 1, APPLIED_AT));
 
         // When: 두 유니크 제약에 동시에 걸리는 행. 중재 인덱스 (drop_id, user_id) 가 먼저 판정되어야 한다
-        boolean[] second = new boolean[1];
+        EntrySaveOutcome[] second = new EntrySaveOutcome[1];
         assertThatCode(() -> second[0] = entryRepository.saveIfAbsent(Entry.apply(1L, 1L, 1, APPLIED_AT)))
                 .doesNotThrowAnyException();
 
         // Then
-        assertThat(second[0]).isFalse();
+        assertThat(second[0]).isEqualTo(EntrySaveOutcome.ALREADY_EXISTS);
         assertThat(countEntries(1L)).isEqualTo(1L);
     }
 
@@ -172,10 +175,10 @@ class EntryRepositoryImplTest {
         entryRepository.saveIfAbsent(Entry.apply(1L, 1L, 1, APPLIED_AT));
 
         // When
-        boolean saved = entryRepository.saveIfAbsent(Entry.apply(2L, 2L, 1, APPLIED_AT));
+        EntrySaveOutcome saved = entryRepository.saveIfAbsent(Entry.apply(2L, 2L, 1, APPLIED_AT));
 
         // Then
-        assertThat(saved).isTrue();
+        assertThat(saved).isEqualTo(EntrySaveOutcome.SAVED);
         assertThat(countEntries(2L)).isEqualTo(1L);
     }
 
@@ -376,5 +379,117 @@ class EntryRepositoryImplTest {
         // When / Then
         assertThat(entryRepository.findUserIdsOrderBySeq(1L)).containsExactly(8L, 7L);
         assertThat(entryRepository.findUserIdsOrderBySeq(999L)).isEmpty();
+    }
+
+    // ================================================================ T5-35 — 추첨 후 늦게 저장되는 응모 (E-48)
+
+    private static final Instant OPEN_AT = Instant.parse("2026-11-17T09:00:00Z");
+    private static final Instant CLOSE_AT = Instant.parse("2026-11-17T09:30:00Z");
+
+    private void givenSnapshot(long dropId, String status) {
+        jdbcTemplate.update("""
+                insert into drop_snapshots (drop_id, entry_capacity, winner_count, open_at, close_at, status)
+                values (?, 100, 10, ?, ?, ?)
+                """, dropId, Timestamp.from(OPEN_AT), Timestamp.from(CLOSE_AT), status);
+    }
+
+    private String entryStatus(long dropId, long userId) {
+        return jdbcTemplate.queryForObject(
+                "select status from entries where drop_id = ? and user_id = ?", String.class, dropId, userId);
+    }
+
+    @Test
+    @DisplayName("[T5-35] 스냅샷이 DRAWN 이면 SAVED_AS_LOST 이고 행은 LOST 로 저장된다 (seq·appliedAt 은 그대로)")
+    void drawnSnapshotSavesAsLost() {
+        // Given
+        givenSnapshot(1L, "DRAWN");
+
+        // When
+        EntrySaveOutcome outcome = entryRepository.saveIfAbsent(Entry.apply(1L, 5L, 7, APPLIED_AT));
+
+        // Then
+        assertThat(outcome).isEqualTo(EntrySaveOutcome.SAVED_AS_LOST);
+        assertThat(entryStatus(1L, 5L)).isEqualTo("LOST");
+        entityManager.clear();
+        Entry saved = entryRepository.findByDropIdAndUserId(1L, 5L).orElseThrow();
+        assertThat(saved.getStatus()).isEqualTo(EntryStatus.LOST);
+        assertThat(saved.getEntrySeq()).isEqualTo(7);
+        assertThat(saved.getAppliedAt()).isEqualTo(APPLIED_AT);
+    }
+
+    @ParameterizedTest(name = "status={0}")
+    @ValueSource(strings = {"OPEN", "CLOSING"})
+    @DisplayName("[T5-35] 스냅샷이 OPEN·CLOSING 이면 SAVED 이고 행은 APPLIED")
+    void notDrawnSnapshotSavesApplied(String status) {
+        // Given
+        givenSnapshot(1L, status);
+
+        // When
+        EntrySaveOutcome outcome = entryRepository.saveIfAbsent(Entry.apply(1L, 5L, 1, APPLIED_AT));
+
+        // Then
+        assertThat(outcome).isEqualTo(EntrySaveOutcome.SAVED);
+        assertThat(entryStatus(1L, 5L)).isEqualTo("APPLIED");
+    }
+
+    @Test
+    @DisplayName("[T5-35] 스냅샷이 없으면(드로우 정보 수신 전) SAVED 이고 행은 APPLIED")
+    void missingSnapshotSavesApplied() {
+        // Given: drop_snapshots 비어 있음
+
+        // When
+        EntrySaveOutcome outcome = entryRepository.saveIfAbsent(Entry.apply(1L, 5L, 1, APPLIED_AT));
+
+        // Then
+        assertThat(outcome).isEqualTo(EntrySaveOutcome.SAVED);
+        assertThat(entryStatus(1L, 5L)).isEqualTo("APPLIED");
+    }
+
+    @Test
+    @DisplayName("[T5-35] 다른 드로우가 DRAWN 이어도 이 드로우 스냅샷(OPEN) 기준으로 APPLIED (판정은 drop_id 단위)")
+    void otherDropDrawnDoesNotAffect() {
+        // Given
+        givenSnapshot(1L, "OPEN");
+        givenSnapshot(2L, "DRAWN");
+
+        // When
+        EntrySaveOutcome outcome = entryRepository.saveIfAbsent(Entry.apply(1L, 5L, 1, APPLIED_AT));
+
+        // Then
+        assertThat(outcome).isEqualTo(EntrySaveOutcome.SAVED);
+        assertThat(entryStatus(1L, 5L)).isEqualTo("APPLIED");
+    }
+
+    @Test
+    @DisplayName("[T5-35] DRAWN 드로우에 이미 있는 응모를 다시 저장하면 ALREADY_EXISTS 이고 기존 상태(WON)·seq 가 유지된다")
+    void duplicateOnDrawnKeepsExisting() {
+        // Given: 추첨 전에 저장되어 WON 으로 확정된 응모
+        givenSnapshot(1L, "OPEN");
+        entryRepository.saveIfAbsent(Entry.apply(1L, 5L, 1, APPLIED_AT));
+        jdbcTemplate.update("update entries set status = 'WON' where drop_id = 1 and user_id = 5");
+        jdbcTemplate.update("update drop_snapshots set status = 'DRAWN' where drop_id = 1");
+
+        // When: 재전달 (다른 seq)
+        EntrySaveOutcome outcome = entryRepository.saveIfAbsent(Entry.apply(1L, 5L, 2, APPLIED_AT.plusSeconds(1)));
+
+        // Then
+        assertThat(outcome).isEqualTo(EntrySaveOutcome.ALREADY_EXISTS);
+        assertThat(entryStatus(1L, 5L)).isEqualTo("WON");
+        assertThat(countEntries(1L)).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("[T5-35] 스냅샷 OPEN 에서 같은 사용자 재저장은 ALREADY_EXISTS")
+    void duplicateOnOpenAlreadyExists() {
+        // Given
+        givenSnapshot(1L, "OPEN");
+        entryRepository.saveIfAbsent(Entry.apply(1L, 5L, 1, APPLIED_AT));
+
+        // When
+        EntrySaveOutcome outcome = entryRepository.saveIfAbsent(Entry.apply(1L, 5L, 1, APPLIED_AT));
+
+        // Then
+        assertThat(outcome).isEqualTo(EntrySaveOutcome.ALREADY_EXISTS);
+        assertThat(countEntries(1L)).isEqualTo(1L);
     }
 }

@@ -17,6 +17,7 @@
 | v1.11 | 2026-11-17 | `DrawScheduler` 에 `entry.draw.scheduler-enabled` 조건 추가. 스케줄러를 검증하지 않는 `@SpringBootTest` 는 끔 — 시스템 Clock 실행이 실제 시각 경과 후 4단계 테스트 드로우를 마감해 간헐 실패 (신민아 MAJOR) |
 | v1.12 | 2026-11-17 | product 컨슈머 실패 처리 구체화 (architecture.md v1.7·infrastructure.md v1.3 의 "로그 후 건너뜀"을 DLT 로 정정, 신민아 BLOCKER: DLT 토픽 사전 생성 누락): 재시도 1초×3, DROP_NOT_FOUND 는 재시도·DLT 모두 없이 로그 후 커밋 (recoverer 에서 분기), `Topics.DRAW_COMPLETED_DLT` 추가, product `ack-mode: record`, `draw.completed.DLT` 사전 생성, 리스너 groupId 하드코딩 제거 |
 | v1.13 | 2026-11-17 | E2E: product 최소 오픈 지연 프로퍼티가 없어(domain 상수 1분) openAt=now+65s 로 변경, e2e 프로필 키 명시, bootRun 대신 bootJar + `java -jar`, coupon·ranking 미기동 |
+| v1.14 | 2026-11-17 | E-48 (한지민, 명백한 버그): 수동 추첨 뒤 늦게 저장되는 응모를 `LOST` 로 저장 (사용자 결정). `saveIfAbsent` 가 스냅샷 행 FOR SHARE 로 추첨과 직렬화, 반환 `EntrySaveOutcome` |
 
 ---
 
@@ -418,6 +419,20 @@ public class DrawService {
 - `safeCount` 는 `ApplicantCounter.count` 의 `GateUnavailableException` 을 잡아 -1 을 돌려준다 (로그용).
 - 수동 추첨은 상태를 앞에서 검사하지만, 최종 방어선은 `DrawTransaction` 의 조건부 UPDATE 다 (검사와 실행 사이에 스케줄러가 먼저 추첨하면 `skipped` → 409).
 - 건수 비교를 트랜잭션 밖에서 하는 이유: 불일치 시 아무것도 쓰지 않으므로 트랜잭션이 필요 없고, Redis 호출을 DB 트랜잭션 안에 넣지 않기 위해서다.
+
+#### 추첨 후 늦게 저장되는 응모 (E-48, v1.14 — 사용자 결정: 낙첨으로 저장)
+관리자 수동 추첨은 DB 응모 기준이라, 그때 DLT 에 머물거나 lag 중이던 `entry.created` 가 추첨 **뒤에** 저장될 수 있다 (키 TTL 1일 안이면 `claimForSave` 통과). 그대로 두면 `APPLIED` 로 영구히 남으므로 **추첨이 끝난 드로우면 `LOST` 로 저장**한다.
+
+- 포트 변경: `EntryRepository.saveIfAbsent(Entry)` 반환을 `boolean` → `EntrySaveOutcome` (domain/repository enum: `SAVED`, `SAVED_AS_LOST`, `ALREADY_EXISTS`).
+- `EntryRepositoryImpl.saveIfAbsent` 한 트랜잭션 안에서:
+  1. `SELECT status FROM drop_snapshots WHERE drop_id = :dropId FOR SHARE` — 추첨 트랜잭션의 첫 문장(`CLOSING → DRAWN` UPDATE)과 같은 행을 잠가 직렬화한다.
+     - 저장이 먼저 잠그면: 추첨 UPDATE 가 저장 커밋까지 대기 → 추첨의 응모자 조회(READ COMMITTED, 문장마다 새 스냅샷)에 포함된다.
+     - 추첨이 먼저 잠그면: 저장이 추첨 커밋까지 대기 → 최신 `DRAWN` 을 읽는다.
+  2. 상태가 `DRAWN` 이면 status `LOST` 로, 아니면 `APPLIED` 로 `insertIfAbsent` (ON CONFLICT DO NOTHING 그대로).
+  3. 스냅샷 행이 없으면(드로우 정보 수신 전) 잠금 없이 `APPLIED` — 기존 동작과 같다 (추첨 전이 확실).
+- `EntrySaveService`: `SAVED_AS_LOST` 면 WARN `late entry saved as LOST after draw dropId= userId= eventId=` (운영 확인용).
+- 결과: 사용자 `/me` 는 `LOST`. `draw_results.applicant_count` 는 추첨 참여자 수라 늦은 응모를 포함하지 않는다 (의도).
+- 자동 추첨 경로는 `SCARD == COUNT` 일 때만 돌아 이 경우가 생기지 않는다.
 
 #### `DrawTransaction` — 추첨 단일 트랜잭션 (구현 결정)
 `DrawService` 안에서 `@Transactional` 메서드를 자기 호출하면 프록시가 적용되지 않으므로 별도 빈으로 분리한다.
@@ -827,6 +842,7 @@ public class DrawCompletedListener {
 | T5-32 | presentation 슬라이스 | `AdminDrawControllerTest` | G: ADMIN 헤더 / 헤더 없음 / W: `POST /api/entries/admin/drops/1/draw` / T: 200 + seed 문자열 / 400 `COMMON_MISSING_USER_HEADER` (0단계 에러 계약) | D5-1 |
 | T5-33 | domain 단위 | `DrawResultTest` | G: applicantCount=-1 / winnerCount=-1 / winnerCount > applicantCount / 정상값 / W: `DrawResult.of`, `markPublished` / T: `DomainException` ×3 / 생성 성공·published=false, markPublished 는 published=true 인 새 인스턴스(원본 불변) | REQ-ENTRY-05 |
 | T5-34 | infra 통합 (PostgreSQL) | `DrawResultRepositoryImplTest` | G: DrawResult / W: save → findByDropId, findUnpublished, markPublished(2회), 같은 drop_id 재저장 / T: 필드 왕복(음수 seed, μs Instant), 미발행만 조회, 멱등, `DataIntegrityViolationException` | REQ-ENTRY-05 |
+| T5-35 | 통합 (PostgreSQL) + 단위 | `EntryRepositoryImplTest`, `EntrySaveServiceTest`, 동시성 테스트 | G: DRAWN / CLOSING·OPEN / 스냅샷 없음 / 추첨과 동시 저장 / W: `saveIfAbsent` / T: LOST(`SAVED_AS_LOST`, WARN) / APPLIED / APPLIED / APPLIED 잔류 0 | E-48 |
 
 ---
 
@@ -863,13 +879,16 @@ public class DrawCompletedListener {
 | [draw.md](../../design/05-features/draw.md) 3장 | 추첨 트랜잭션 순서: `CLOSING → DRAWN` 조건부 UPDATE 를 **첫 문장**으로 (다중 인스턴스 동시 추첨 방지용 행 잠금). 발행 실패 시 재발행(스케줄러) 추가 → 설계 반영 완료 (2026-11-16) |
 | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 1.2 | `DrawTransaction`, `SeedGenerator`, `DrawOutcome` 추가. `DrawService` 메서드명 `drawIfReady` → `drawReadyDrops` + `republishUnpublished`. `DrawResultController.myResult` 제거 (4단계 `EntryController` 의 `/me` 재사용) → 설계 반영 완료 (2026-11-16) |
 | [architecture.md](../../design/02-architecture/architecture.md) 6장 | D5-2 가 (a) 이면 인증 제외 경로에 `GET /api/entries/drops/*/result` 추가 → 설계 반영 완료 (2026-11-16) |
+| [draw.md](../../design/05-features/draw.md) v1.3 | 구현 중 결정(v1.7~v1.13): 드로우 단위 격리, SCARD 실패 건너뜀, 응모 0건 추첨, 수동 추첨 경합 409, product DLT, 관리자 API → 설계 반영 완료 (2026-11-17) |
+| [class-diagram.md](../../design/07-class-diagram/class-diagram.md) v2.5 | `AdminGuard`, `DrawProperties`, `DropSnapshot` 판정 메서드, `DrawService` 의존 → 설계 반영 완료 (2026-11-17) |
+| [architecture.md](../../design/02-architecture/architecture.md) v1.7 · [infrastructure.md](../../design/03-infrastructure/infrastructure.md) v1.3 | product `draw.completed` 를 DLT 대상 저장 컨슈머로, `draw.completed.DLT` 사전 생성 → 설계 반영 완료 (2026-11-17) |
 
 ### 리스크
 - **응모자 수가 매우 큰 경우**: 전체 userId 를 메모리에 올려 셔플한다. M 이 수십만 이상이면 부분 셔플(K 개 인덱스만 뽑기)로 바꿔야 한다. 현재 범위(수천~수만)는 문제 없음.
 - **추첨 트랜잭션 길이**: 응모자 조회 + 벌크 UPDATE 가 한 트랜잭션이다. 응모자가 많으면 `drop_snapshots` 행 잠금 시간이 길어지지만, 이 행을 동시에 쓰는 다른 경로가 없어 영향은 추첨 중복 방지 대기뿐이다.
 - **E2E 불안정성**: 시각 기반 시나리오라 CI 환경에서 느리면 실패할 수 있다. Awaitility 타임아웃을 넉넉히(30초) 두고, 기본 빌드에서는 제외한다.
 - **추첨 후 키 만료 실패**: Redis 장애로 `expireAfterDraw` 가 실패하면 그 드로우의 키는 만료 없이 남는다 (WARN 1줄). 재시도하지 않는다 — 정합성 영향이 없고 메모리 문제는 드로우 수백 개 단위에서나 생긴다 (E-42).
-- **수동 추첨으로 빠지는 응모**: 202 를 받았지만 저장이 DLT 에 머문 사용자는 수동 추첨에서 제외된다. 그래서 운영 절차는 DLT 재처리를 먼저 하고 API 를 부르는 순서다 (3.4). 보상까지 실패한 사용자는 503 을 받았으므로 응모가 성립하지 않은 것으로 본다.
+- **수동 추첨으로 빠지는 응모**: 202 를 받았지만 저장이 DLT 에 머문 사용자는 수동 추첨에서 제외된다. 그래서 운영 절차는 DLT 재처리를 먼저 하고 API 를 부르는 순서다 (3.4). 추첨 뒤에 늦게 저장되는 응모는 `LOST` 로 저장된다 (E-48, 3.2). 보상까지 실패한 사용자는 503 을 받았으므로 응모가 성립하지 않은 것으로 본다.
 - **`draw.completed` 중복 발행**: 인스턴스 A 가 커밋 후 발행하기 전에 B 의 `republishUnpublished` 가 같은 결과를 읽어 발행할 수 있고, `markPublished` 실패 시에도 다음 주기에 다시 발행된다. product 소비자가 멱등(T5-25)이라 결과 영향 없음 (의도된 동작).
 - **스케줄러 시계**: 추첨 판단은 entry-service 인스턴스의 `Clock` 기준이다. 인스턴스 간 시계 차이가 크면 마감 잠금 시점이 몇 초 달라질 수 있으나, 응모 차단은 Redis Lua 의 시각 검사가 담당하므로 정합성에는 영향 없음.
 

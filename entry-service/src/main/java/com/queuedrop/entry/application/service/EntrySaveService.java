@@ -4,6 +4,7 @@ import com.queuedrop.entry.application.dto.EntrySaveCommand;
 import com.queuedrop.entry.application.port.EntryGate;
 import com.queuedrop.entry.domain.model.Entry;
 import com.queuedrop.entry.domain.repository.EntryRepository;
+import com.queuedrop.entry.domain.repository.EntrySaveOutcome;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -31,7 +32,12 @@ public class EntrySaveService {
         // ② 같은 사용자 응모가 이미 있으면 무시 (재전달, 또는 유령 + 재응모)
         Entry entry = Entry.apply(command.dropId(), command.userId(),
                 command.entrySeq(), command.appliedAt());
-        if (!entryRepository.saveIfAbsent(entry)) {
+        EntrySaveOutcome outcome = entryRepository.saveIfAbsent(entry);
+        if (outcome == EntrySaveOutcome.SAVED_AS_LOST) {
+            // ③ 수동 추첨 뒤 늦게 도착한 응모: 낙첨으로 저장됨 (E-48, 운영 확인용)
+            log.warn("late entry saved as LOST after draw dropId={} userId={} eventId={}",
+                    command.dropId(), command.userId(), command.eventId());
+        } else if (outcome == EntrySaveOutcome.ALREADY_EXISTS) {
             log.debug("이미 저장된 응모 dropId={} userId={}", command.dropId(), command.userId());
         }
     }

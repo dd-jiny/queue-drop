@@ -3,6 +3,7 @@ package com.queuedrop.entry.infrastructure.persistence;
 import com.queuedrop.entry.domain.model.SnapshotStatus;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -44,4 +45,8 @@ interface DropSnapshotJpaRepository extends JpaRepository<DropSnapshotJpaEntity,
     int markDrawnIfClosing(@Param("dropId") long dropId);
 
     List<DropSnapshotJpaEntity> findByStatus(SnapshotStatus status);
+
+    /** 응모 저장용 상태 조회. FOR SHARE 로 추첨의 CLOSING → DRAWN UPDATE 와 직렬화한다 (E-48). */
+    @Query(value = "SELECT status FROM drop_snapshots WHERE drop_id = :dropId FOR SHARE", nativeQuery = true)
+    Optional<String> findStatusForShare(@Param("dropId") long dropId);
 }

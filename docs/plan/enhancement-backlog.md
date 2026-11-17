@@ -719,3 +719,125 @@
   2. 503 은 warn 1줄(코드 + 원인 메시지), 스택은 샘플링하거나 debug 로. 보상 실패(`log.error`)만 스택 유지.
 - **우선순위**: 중간 — 8단계 전에 필요. 로그 정책(2)은 비용이 작아 E-41 과 함께 넣을 만하다.
 - **영향 범위**: `GlobalExceptionHandler`, `EntryApplyService`(또는 어댑터), `phase-8-load-test.md` 3.2 메트릭 표
+
+---
+
+## phase-5 (추첨: entry-service · product-service) 분석 — 2026-11-17
+
+분석 범위: `git diff dev...HEAD` (`feat/phase-5-draw`, 커밋 9개). 기준 문서 `phase-5-draw.md` v1.13 6장. **Gradle·EXPLAIN 실행 안 함**(동시 빌드 중) — 쿼리 계획은 스키마·인덱스 구조 기준 추정이다.
+- E-30(markDrawn) 은 문서대로 반영됨(`DropService.markDrawn`: SELECT 1 + UPDATE 1, 드로우당 1회라 문제없음). E-41 개선안 2 는 만들지 않음, E-42 는 개선안 2 로 반영됨(`RedisEntryGate.expireAfterDraw`, 6개 키 파이프라인 EXPIRE 1왕복) — 확인 완료.
+
+### E-48 [명백한 버그(정합성, 운영 경로)] 수동 추첨 뒤 DLT 재처리·지연 저장이 오면 DRAWN 드로우에 `APPLIED` 응모가 영구히 남음
+- **구분**: 버그 성격 (정합성 — 운영 절차 경로) (관련: E-41, D5-1)
+- **단계/위치**: phase-5, `EntrySaveService.java:25-34`, `EntryJpaRepository.insertIfAbsent`, `DrawService.drawManually`
+- **현상**: 저장 컨슈머는 `claimForSave`(Redis `applicants`·`requests` 확인)만 통과하면 드로우 상태와 무관하게 `APPLIED` 로 INSERT 한다. 수동 추첨은 건수 비교 없이 DB 기준으로 추첨하므로, 그 시점에 DLT 에 머물던(또는 lag 중인) `entry.created` 가 **추첨 후** 처리되면 — 키 TTL(1일) 안이라 claim 은 성공 — `entries` 에 `APPLIED` 행이 생긴다. 추첨은 다시 돌지 않으므로 그 행은 영영 `WON/LOST` 가 되지 않는다.
+- **문제/기회**: 사용자는 `GET /drops/{id}/me` 에서 "응모 완료, 결과 없음"을 계속 보고, `draw_results.applicant_count` 와 `COUNT(entries)` 가 어긋난다. 6장 리스크는 "수동 추첨에서 빠진다"까지만 적었고 "빠진 응모가 APPLIED 로 남는다"는 다루지 않는다. 운영 절차(DLT 먼저 재처리)를 어기거나, 수동 추첨 직후 컨슈머 lag 이 해소되면 바로 일어난다. 자동 추첨 경로는 `SCARD == COUNT` 일 때만 돌아 이 문제가 없다.
+- **근거**: 코드 분석. 키는 추첨 후 1일 유지되므로 그 안의 재처리는 claim 이 true(추정 아님, `entry-claim.lua` 가 state 를 보지 않음). 1일 뒤 재처리는 claim false → 유령 무시로 조용히 사라진다(이건 의도와 일치).
+- **개선안**:
+  1. INSERT 를 스냅샷 행과 직렬화: `INSERT ... SELECT ... WHERE EXISTS (SELECT 1 FROM drop_snapshots WHERE drop_id = :dropId AND status <> 'DRAWN' FOR SHARE)`. 추첨 트랜잭션이 첫 문장에서 같은 행을 배타 잠금하므로 READ COMMITTED 에서도 추첨 중 INSERT 는 대기 후 DRAWN 을 보고 0건이 된다. 0건이면 warn + 건너뜀(유령과 같은 처리). 대가: 저장 쿼리마다 스냅샷 행 공유 잠금(추첨 중이 아니면 경합 없음).
+  2. DRAWN 이면 `LOST` 로 넣는다 — 사용자에게 결과를 보여 주지만 "추첨에 참여하지 않았는데 낙첨"이라 의미가 틀리고 `applicant_count` 와도 맞지 않는다. 권하지 않는다.
+  3. 문서만: 6장 리스크·3.4 운영 절차에 "수동 추첨 후에는 해당 dropId 의 DLT 를 재처리하지 않는다"를 적는다. 코드 0줄이지만 lag 경로는 못 막는다.
+  - 1 + 3 권장.
+- **우선순위**: 중간 — 수동 추첨이라는 드문 경로지만 발생하면 사용자 노출 상태가 영구히 틀린다. 수정은 native 쿼리 1개 + 테스트.
+- **영향 범위**: `EntryJpaRepository.insertIfAbsent`, `EntrySaveService`, `phase-5-draw.md` 3.4·6장, `draw.md`(수동 추첨 절), `concurrency-consistency.md` D6
+- **처리 (2026-11-17, 사용자 결정)**: 개선안 2 변형 채택 — 추첨이 끝난 드로우면 `LOST` 로 저장 (APPLIED 영구 잔류 방지, 202 받은 응모의 기록 유지). 스냅샷 행 FOR SHARE 로 추첨과 직렬화. 5단계에서 반영 (phase-5-draw.md v1.14).
+  - 남은 측정 항목 (신민아 MINOR): 피크 시 저장마다 같은 스냅샷 행 FOR SHARE → MultiXact·WAL 비용, 마감 시각 `markClosingIfOpen` UPDATE 가 공유 잠금 연속으로 밀리는지. 동시 잠금 수는 컨슈머 동시성(3 × 인스턴스)으로 제한 — 8단계 부하 테스트에서 확인.
+
+### E-49 Kafka 장애 시 스케줄러 1주기가 `미발행 건수 × 3.5초` 로 늘어나 다른 드로우의 마감·추첨이 밀림
+- **구분**: 고도화 (응답 경로 아님 — 스케줄러 지연·장애 격리)
+- **단계/위치**: phase-5, `DrawService.java:140-145`(`republishUnpublished`), `publishSafely`, `DrawScheduler.run`, `KafkaDrawEventPublisher`(`get(3500ms)`)
+- **현상**: Spring 기본 TaskScheduler 는 스레드 1개이고 `fixedDelay` 라 한 주기 안에서 마감 → 추첨 → 재발행이 순차 실행된다. Kafka 가 내려가면 재발행 루프가 미발행 건마다 최대 3.5초(메타데이터 미캐시면 `max.block.ms` 1초) 대기하고 실패해도 다음 건으로 계속 간다. 추첨 직후 `afterCommit` 발행도 같은 대기를 한다.
+- **문제/기회**: 미발행 10건이면 주기가 5초 → 약 40초(계산). 그 동안 새로 마감된 드로우의 `CLOSING` 전이·추첨이 늦어진다. 응모 차단은 Lua 의 closeAt 검사라 **정합성 영향은 없고** 결과 공개만 지연된다. 현재 규모(동시 마감 드로우 수 개)에서는 수십 초 지연에 그친다.
+- **근거**: 계산(추정), 측정 안 함.
+- **개선안**:
+  1. 재발행 루프에서 첫 `EventPublishException` 이 나면 그 주기의 재발행을 중단(break) — 1건만 기다리고 다음 주기에 다시 시도. 코드 수 줄. 대가: 특정 메시지만 실패하는 경우(직렬화 등) 뒤 건이 막힌다 → 그 건을 마지막으로 돌리거나 실패 건을 건너뛰는 카운트를 둔다.
+  2. 재발행을 별도 `@Scheduled` 메서드로 분리하고 `spring.task.scheduling.pool.size: 2` — 마감·추첨이 재발행에 막히지 않는다. 대가: 스케줄러 스레드 2개, 같은 메서드 중복 실행은 여전히 없음(메서드별 fixedDelay).
+  - 1 권장(비용 최소). 2 는 다른 스케줄 작업이 늘면 함께.
+- **우선순위**: 낮음 — 정합성 무관, 장애 중 결과 공개 지연뿐.
+- **영향 범위**: `DrawService.republishUnpublished`, (2) `DrawScheduler`, `application.yml`
+
+### E-50 DLT 재발행 producer 가 `max.block.ms` 1초를 그대로 물려받아 첫 DLT 전송이 메타데이터 대기로 실패할 수 있음
+- **구분**: 고도화 (장애 경로 신뢰성) (카리나 메모 1, 관련: E-45)
+- **단계/위치**: phase-5, `entry-service .../KafkaConsumerConfig.java:40,55`, `product-service .../KafkaConsumerConfig.java:55,98`, 두 서비스 `application.yml`(`max.block.ms: 1000`)
+- **현상**: bytes 템플릿은 `producerFactory.getConfigurationProperties()` 를 복사하므로 `max.block.ms 1000`·`delivery.timeout.ms`(entry 3000, product 10000)를 그대로 쓴다. JSON 레코드의 DLT 는 서비스 공용 `KafkaTemplate` 을 쓴다. `{topic}.DLT` 는 평소 한 번도 쓰지 않는 토픽이라 producer 메타데이터 캐시에 없다 → 첫 DLT 전송이 메타데이터를 1초 안에 못 받으면 `send()` 가 동기로 실패한다. 5단계 중 테스트에서 같은 현상을 확인했다(커밋 `f6d15eb`, 테스트만 `KafkaTopicReadiness` 로 우회, 운영 설정은 그대로).
+- **문제/기회**: recoverer 가 던지면 `DefaultErrorHandler` 는 레코드를 다시 seek 하므로 **유실은 없다**(추정 — 재전달 후 재시도 소진 상태라 바로 recoverer 를 다시 부르고, 그때는 메타데이터가 캐시돼 성공). 대가는 ERROR 로그 + 1회 추가 재처리이고, 브로커가 실제로 느린 상황(DLT 가 필요한 바로 그 상황)에서는 반복될 수 있다. DLT 전송은 컨슈머 스레드에서만 일어나 응답 경로와 무관하므로 1초 상한을 둘 이유가 약하다.
+- **근거**: 코드 + 5단계 테스트 실패 이력. 재처리 동작은 Spring Kafka `DefaultErrorHandler`/`FailedRecordTracker` 동작 기준 추정.
+- **개선안**:
+  1. DLT 전용 producer factory 를 bytes·JSON 둘 다 만들고 `max.block.ms` 를 5~10초로 덮어쓴다(설정 복사 후 `put`). 응답 경로 템플릿은 그대로. 대가: 비빈 producer 1개 추가(지금 bytes 와 같은 수명 관리).
+  2. 기동 시 `ApplicationRunner` 로 DLT 토픽들에 `partitionsFor` 를 호출해 메타데이터를 미리 받는다(테스트 우회와 같은 방법). 코드 작음, 다만 메타데이터는 `metadata.max.idle.ms`(기본 5분) 동안 안 쓰면 캐시에서 빠져 장시간 운영 후에는 효과가 사라진다.
+  - 1 권장. 6단계 coupon 이 같은 설정을 복제하기 전에 넣으면 비용이 작다.
+- **우선순위**: 낮음~중간 — 유실은 없고 로그·지연뿐. 복제 전에 처리하면 한 번에 끝난다.
+- **영향 범위**: entry·product `KafkaConsumerConfig`, (6단계) coupon 동일, `architecture.md` 4장 실패 정책 표 비고
+
+### E-51 추첨 쿼리 계획과 인덱스 — 현재 규모에서는 불필요, 응모자 수십만이면 커버링·부분 인덱스
+- **구분**: 고도화 (조회 최적화, 현재 규모에서는 불필요) (관련: E-26)
+- **단계/위치**: phase-5, `DropSnapshotJpaRepository.findDueOpenIds`·`findByStatus`, `EntryJpaRepository.countByDropId`·`findUserIdsOrderBySeq`·`markWon`·`markRemainingLost`, `V1__create_entry_tables.sql`, `V2__create_draw_results.sql`
+- **현상** (EXPLAIN 미측정, 인덱스 구조 기준 추정):
+  - `findDueOpenIds`/`findByStatus(CLOSING)`: `drop_snapshots.status` 인덱스 없음 → 5초마다 Seq Scan 2회. 행 수 = 누적 드로우 수(수십~수백)라 수 µs~ms.
+  - `countByDropId`: `uk_entries_drop_user` 또는 `uk_entries_drop_seq` 로 Index Only Scan 가능하지만, 마감 직후에는 INSERT 직후라 visibility map 이 안 채워져 heap fetch 가 섞인다. CLOSING 동안 5초마다 1회.
+  - `findUserIdsOrderBySeq`: `uk_entries_drop_seq (drop_id, entry_seq)` 순서로 읽어 정렬은 없고, `user_id` 때문에 heap 을 행마다 읽는다. 드로우당 1회.
+  - `markWon`: 1,000개 IN 청크 × ⌈K/1000⌉ 문장, `uk_entries_drop_user` 사용. `markRemainingLost`: M−K 행 UPDATE. `status`·`updated_at` 은 인덱스에 없지만 INSERT 로 꽉 찬 페이지(fillfactor 100)라 HOT 갱신이 대부분 안 돼 3개 인덱스 모두에 새 항목이 생긴다(추정).
+  - `draw_results`: `findByPublishedFalse` 는 부분 인덱스, `findByDropId` 는 UK — 문제없음.
+- **문제/기회**: M=1만이면 전부 수십 ms 이하로 **현재 규모에서는 최적화 불필요**. M=10만이면 LOST 갱신 약 10만 행 + 인덱스 30만 항목 + WAL 수십 MB, 1~수 초(추정)로 추첨 트랜잭션이 길어지고 테이블·인덱스 블로트가 응모 행 수만큼 생긴다.
+- **근거**: 스키마·쿼리 대조(추정). 8단계 또는 응모자 10만 시나리오에서 `EXPLAIN (ANALYZE, BUFFERS)` 로 확인 필요.
+- **개선안**:
+  1. `uk_entries_drop_seq` 를 `(drop_id, entry_seq) INCLUDE (user_id)` 로 — `findUserIdsOrderBySeq` 가 Index Only Scan. 대가: 인덱스 크기 증가, 응모 INSERT 비용 소폭 증가.
+  2. `drop_snapshots` 부분 인덱스 `(status, close_at) WHERE status <> 'DRAWN'` — 누적 드로우가 수만 개가 되기 전에는 의미 없음.
+  3. LOST 를 저장하지 않고 "DRAWN 드로우의 APPLIED = 낙첨"으로 해석 — UPDATE M−K 행이 사라지지만 상태 의미가 바뀌어 조회·설계(`erd.md`, 응모 상태 enum)를 고쳐야 한다. 권하지 않는다.
+  4. `markWon` 을 `user_id = ANY(:ids)` 배열 파라미터 1문장으로 — 문장 수만 줄고 효과 미미.
+  - 지금은 아무것도 하지 않고 8단계 측정 후 1 정도만 검토.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요.
+- **영향 범위**: Flyway V3(선택 시), `EntryJpaRepository`, `erd.md`
+
+### E-52 응모자 전원을 메모리에 올려 셔플 — 현재 규모에서는 불필요, 알고리즘 교체는 시드 재현성과 충돌
+- **구분**: 고도화 (메모리, 현재 규모에서는 불필요) (6장 리스크 1번 구체화)
+- **단계/위치**: phase-5, `Drawer.draw`, `DrawTransaction.execute` ②③
+- **현상**: `List<Long>`(박싱) M개 + 복사본 M개 + PG 드라이버 결과 버퍼(fetchSize 미지정이라 전체 적재) + `Set.copyOf` K개.
+- **문제/기회**: 원소당 약 16B(Long)+참조 4~8B, 버퍼 포함 M=10만이면 약 5~10MB, M=100만이면 50~100MB(계산, 추정) — 수백만부터 힙 압박. 현재 규모(수천~수만)에서는 1MB 내외로 **불필요**.
+- **근거**: 계산(추정).
+- **개선안**:
+  1. 부분 Fisher–Yates(K회 스왑만) 또는 `long[]` 원시 배열로 메모리·시간을 K 비례로. **주의**: `Collections.shuffle(list, new Random(seed))` 와 결과가 달라져 기존 `draw_results.seed` 로 재현이 안 된다 → `draw_results` 에 알고리즘 버전 컬럼을 두고 버전별로 재현해야 정합성(재현 가능성)을 지킨다.
+  2. 복사본 제거(`findUserIdsOrderBySeq` 결과가 이미 새 리스트라 Drawer 에서 복사하지 않음) — 메모리 절반이지만 도메인 함수의 "입력 불변" 계약을 깬다. 권하지 않는다.
+  - 응모자 수십만 요구가 생길 때만 1 을 버전 컬럼과 함께.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요.
+- **영향 범위**: `Drawer`, `DrawTransaction`, (1) Flyway·`draw.md` 재현 절차
+
+### E-53 추첨 관측 지표 없음, 장기 CLOSING 경고가 5초마다 반복
+- **구분**: 고도화 (관측성, 8단계 준비) (관련: E-38, E-47)
+- **단계/위치**: phase-5, `DrawService.java:89`(`draw waiting too long`), `publishSafely`, `closeGateQuietly`, `afterCommit`
+- **현상**: 마감→추첨 소요, 추첨 트랜잭션 시간, 미발행 건수, 건수 불일치 지속 시간을 로그로만 본다. 임계(5분)를 넘긴 CLOSING 드로우는 이후 **매 주기 WARN** — 드로우 1개당 시간당 720줄. Kafka 장애 중에는 재발행 실패 WARN(스택 포함)도 주기마다 건수만큼 찍힌다.
+- **문제/기회**: 수동 추첨(D5-1) 판단 근거가 이 WARN 이라 사람이 보기 쉬워야 하는데, 반복 로그는 묻힌다. 8단계 "마감 후 결과 공개까지 시간" 측정에도 지표가 필요하다.
+- **근거**: 코드 확인.
+- **개선안**:
+  1. Micrometer: `draw.closing.drops`(gauge, 현재 CLOSING 수), `draw.unpublished`(gauge), `draw.execute`(Timer, outcome 태그), `draw.lag`(마감→DRAWN 소요 DistributionSummary). dropId 태그 금지.
+  2. 장기 CLOSING WARN 을 임계 최초 통과 1회 + 이후 N분마다(예: `closingTooLong` 경과 시간을 임계 배수로 나눠 경계에서만) 로그. 재발행 실패는 스택 없이 1줄.
+  - 2 는 비용이 작아 E-47 로그 정책과 함께.
+- **우선순위**: 중간 — 8단계 전에 필요, 수동 추첨 운영 판단에 직접 쓰인다.
+- **영향 범위**: `DrawService`, `phase-8-load-test.md` 메트릭 표
+
+### E-54 스케줄러 주기당 Redis·DB 호출 수 — 현재 규모에서는 불필요
+- **구분**: 고도화 (현재 규모에서는 불필요)
+- **단계/위치**: phase-5, `DrawScheduler.run`, `DrawService.closeDueDrops`·`drawReadyDrops`
+- **현상**: 주기(5초)당 고정 DB 3회(due OPEN·CLOSING·미발행 조회) + 마감 대상당 UPDATE 1 + HSET 1 + CLOSING 드로우당 SCARD 1 + COUNT 1. 인스턴스 2개면 두 배, 같은 드로우의 추첨 시도는 두 번째 인스턴스가 행 잠금에서 대기 후 0건(커넥션 1개를 추첨 트랜잭션 동안 점유).
+- **문제/기회**: CLOSING 이 수십 개 쌓여도 주기당 Redis·DB 각 수십 회라 부하 무시 가능. 대기 인스턴스의 커넥션 점유도 추첨 1건 길이(현재 규모 수십 ms)뿐. 정원 10만 이상에서 E-51 의 추첨 시간(수 초)과 겹치면 Hikari 기본 10개 중 1개를 그만큼 잡는다.
+- **근거**: 코드 분석(계산).
+- **개선안**:
+  1. 현행 유지(권장).
+  2. 필요해지면 `markDrawnIfClosing` 을 `SELECT ... FOR UPDATE SKIP LOCKED` 계열(또는 `pg_try_advisory_xact_lock(dropId)`)로 바꿔 대기 없이 즉시 건너뛰기. 정합성은 같다(조건부 UPDATE 유지 시). 대가: 쿼리 1개 추가.
+  3. CLOSING 드로우의 SCARD 를 파이프라인 1왕복으로 — 수십 개 이하에서는 효과 없음.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요.
+- **영향 범위**: `DropSnapshotJpaRepository`, `DrawTransaction`
+
+### E-55 gateway 기동 시 macOS netty 네이티브 DNS 리졸버 미로딩 ERROR 로그
+- **구분**: 고도화 (로컬 개발 로그 노이즈) (카리나 메모 2)
+- **단계/위치**: gateway, `gateway/build.gradle`
+- **현상**: macOS(특히 Apple Silicon)에서 Reactor Netty 가 `MacOSDnsServerAddressStreamProvider` 를 못 찾아 "Unable to load ... fallback to system defaults. This may result in incorrect DNS resolutions on MacOS" ERROR 를 남긴다. 기능은 시스템 기본 DNS 로 동작한다.
+- **문제/기회**: 실제 장애가 아닌 ERROR 가 기동 로그 첫머리에 남아 진짜 ERROR 를 가린다. VPN·사설 DNS 를 쓰는 macOS 에서는 실제로 이름 해석이 틀릴 수 있다(netty 경고 내용 그대로). Linux 컨테이너·CI 에서는 생기지 않는다.
+- **근거**: 로그 관찰(카리나 메모), netty 동작.
+- **개선안**:
+  1. `runtimeOnly "io.netty:netty-resolver-dns-native-macos::osx-aarch_64"`(버전은 Boot BOM 관리) — Intel Mac 이면 `osx-x86_64` 도 추가. 대가: Linux 이미지에 쓰지 않는 네이티브 jar 가 들어감(수십 KB), 클래시파이어 관리.
+  2. OS 조건부 의존성(`if (System.getProperty('os.name').toLowerCase().contains('mac'))`) — 배포물에서 제외되지만 빌드가 OS 에 따라 달라진다.
+  3. 로거 `io.netty.resolver.dns.DnsServerAddressStreamProviders` 레벨을 로컬 프로필에서 낮춘다 — 증상만 숨김.
+  - 1 권장(비용 최소).
+- **우선순위**: 낮음 — 로컬 개발 환경 노이즈.
+- **영향 범위**: `gateway/build.gradle`

@@ -1,7 +1,10 @@
 package com.queuedrop.entry.infrastructure.persistence;
 
 import com.queuedrop.entry.domain.model.Entry;
+import com.queuedrop.entry.domain.model.EntryStatus;
+import com.queuedrop.entry.domain.model.SnapshotStatus;
 import com.queuedrop.entry.domain.repository.EntryRepository;
+import com.queuedrop.entry.domain.repository.EntrySaveOutcome;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -18,13 +21,27 @@ class EntryRepositoryImpl implements EntryRepository {
     static final int WINNER_CHUNK_SIZE = 1_000;
 
     private final EntryJpaRepository jpa;
+    private final DropSnapshotJpaRepository snapshotJpa;
 
+    /**
+     * 추첨이 끝난(DRAWN) 드로우면 LOST 로 저장한다 (E-48).
+     * DRAWN 판정을 도메인이 아닌 여기서 하는 이유: 스냅샷 행 FOR SHARE 로 추첨 트랜잭션의 첫 UPDATE 와
+     * 같은 행을 잠가, 상태 확인과 INSERT 를 추첨과 원자적으로 직렬화해야 하기 때문이다.
+     * 스냅샷이 없으면(드로우 정보 수신 전) 추첨 전이 확실하므로 그대로 APPLIED.
+     */
     @Override
     @Transactional
-    public boolean saveIfAbsent(Entry entry) {
+    public EntrySaveOutcome saveIfAbsent(Entry entry) {
+        boolean drawn = snapshotJpa.findStatusForShare(entry.getDropId())
+                .map(status -> SnapshotStatus.DRAWN.name().equals(status))
+                .orElse(false);
+        String status = drawn ? EntryStatus.LOST.name() : entry.getStatus().name();
         int inserted = jpa.insertIfAbsent(entry.getDropId(), entry.getUserId(), entry.getEntrySeq(),
-                entry.getStatus().name(), entry.getAppliedAt());
-        return inserted == 1;
+                status, entry.getAppliedAt());
+        if (inserted == 0) {
+            return EntrySaveOutcome.ALREADY_EXISTS;
+        }
+        return drawn ? EntrySaveOutcome.SAVED_AS_LOST : EntrySaveOutcome.SAVED;
     }
 
     @Override
