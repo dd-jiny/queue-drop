@@ -1,6 +1,7 @@
 package com.queuedrop.entry.domain.model;
 
 import com.queuedrop.entry.domain.exception.DomainException;
+import java.time.Duration;
 import java.time.Instant;
 import lombok.Getter;
 
@@ -45,5 +46,23 @@ public final class DropSnapshot {
     public static DropSnapshot restore(Long dropId, int entryCapacity, int winnerCount,
                                        Instant openAt, Instant closeAt, SnapshotStatus status) {
         return new DropSnapshot(dropId, entryCapacity, winnerCount, openAt, closeAt, status);
+    }
+
+    /** OPEN 이고 closeAt <= now 이면 마감 대상. */
+    public boolean isDue(Instant now) {
+        return status == SnapshotStatus.OPEN && !now.isBefore(closeAt);
+    }
+
+    /** CLOSING 이 closeAt + threshold 를 넘겨 이어지면 장기화. */
+    public boolean isClosingTooLong(Instant now, Duration threshold) {
+        return status == SnapshotStatus.CLOSING && now.isAfter(closeAt.plus(threshold));
+    }
+
+    public boolean isClosing() {
+        return status == SnapshotStatus.CLOSING;
+    }
+
+    public boolean isDrawn() {
+        return status == SnapshotStatus.DRAWN;
     }
 }

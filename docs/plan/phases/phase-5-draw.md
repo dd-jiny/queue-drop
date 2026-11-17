@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 설계 반영 완료 표시 |
 | v1.2 | 2026-11-17 | 착수 전 정리. D5-1 확정(사용자 결정: 경고 후 관리자 수동 추첨 API 포함, 3.2·3.4). E-42 확정(기본안: 추첨 완료 후 응모 키 6개 EXPIRE 1일, 3.2·3.3). E-41 개선안 2(Redis∖DB 대조)는 만들지 않음 — 수동 추첨이 DB 기준이라 Redis 에만 남은 응모는 빠진다(6장). E-30 반영(3.5 를 2단계 구현에 맞춤). 에러 코드를 0단계 계약(`ApplicationException` + `{SERVICE}_{REASON}`)에 맞춤 |
+| v1.3 | 2026-11-17 | 커밋 순서 변경 #2 영속성 → #3 Redis·Kafka 어댑터 → #4 유스케이스 — 포트 확장을 구현체·Fake 와 같은 커밋에 두어 커밋마다 컴파일·전체 테스트가 통과하게. 저장소 포트 id 인자를 원시 `long` 으로 통일(4단계 포트와 동일). T5-33 추가 |
 
 ---
 
@@ -185,35 +186,37 @@ public boolean isDrawn()   { return status == SnapshotStatus.DRAWN; }
 #### Repository 포트 (수정·신규)
 ```java
 public interface DropSnapshotRepository {
-    // ... 4단계 메서드 (save, findById)
+    // ... 4단계 메서드 (saveIfAbsent, findById(long))
 
     /** status=OPEN 이고 closeAt <= now 인 드로우 id 목록 */
     List<Long> findDueOpenIds(Instant now);
 
     /** OPEN → CLOSING 조건부 전이. 이 호출이 전이시켰으면 true (다중 인스턴스 중 1곳만 true) */
-    boolean markClosingIfOpen(Long dropId, Instant now);
+    boolean markClosingIfOpen(long dropId, Instant now);
 
     List<DropSnapshot> findClosing();
 
     /** CLOSING → DRAWN 조건부 전이. 추첨 트랜잭션의 첫 문장 (행 잠금 획득) */
-    boolean markDrawnIfClosing(Long dropId);
+    boolean markDrawnIfClosing(long dropId);
 }
 
 public interface EntryRepository {
-    // ... 4단계 메서드
-    long countByDropId(Long dropId);
-    List<Long> findUserIdsOrderBySeq(Long dropId);
+    // ... 4단계 메서드 (saveIfAbsent, findByDropIdAndUserId, findAllByUserId)
+    long countByDropId(long dropId);
+    List<Long> findUserIdsOrderBySeq(long dropId);
     /** winners → WON, 나머지 APPLIED → LOST (벌크) */
-    void markResults(Long dropId, Set<Long> winnerUserIds);
+    void markResults(long dropId, Set<Long> winnerUserIds);
 }
 
 public interface DrawResultRepository {
     DrawResult save(DrawResult result);
-    Optional<DrawResult> findByDropId(Long dropId);
+    Optional<DrawResult> findByDropId(long dropId);
     List<DrawResult> findUnpublished();
-    void markPublished(Long dropId);
+    void markPublished(long dropId);
 }
 ```
+- id 인자는 4단계 포트와 같이 원시 `long` 으로 통일한다 (구현 결정, v1.3).
+- 포트 확장은 구현체(`*RepositoryImpl`)·테스트 Fake 와 같은 커밋(#2)에 넣는다. 포트만 먼저 늘리면 그 커밋에서 컴파일이 깨진다.
 
 ---
 
@@ -784,6 +787,7 @@ public class DrawCompletedListener {
 | T5-30 | application 단위 (Fake) | `DrawServiceTest` | G: 건수 일치 / W: `drawReadyDrops` / T: Fake Gate 에 `expireAfterDraw(dropId, 1d)` 기록. Gate 가 `GateUnavailableException` 을 던져도 추첨·발행은 유지 | E-42 |
 | T5-31 | infra 통합 (Redis) | `RedisEntryGateCloseTest` | G: 응모 1건 있는 드로우(6개 키) / W: `expireAfterDraw(1d)` / T: 6개 키 TTL 이 0 초과 86400 이하. 응모 0건 드로우도 예외 없음 | E-42 |
 | T5-32 | presentation 슬라이스 | `AdminDrawControllerTest` | G: ADMIN 헤더 / 헤더 없음 / W: `POST /api/entries/admin/drops/1/draw` / T: 200 + seed 문자열 / 400 `COMMON_MISSING_USER_HEADER` (0단계 에러 계약) | D5-1 |
+| T5-33 | domain 단위 | `DrawResultTest` | G: applicantCount=-1 / winnerCount=-1 / winnerCount > applicantCount / 정상값 / W: `DrawResult.of`, `markPublished` / T: `DomainException` ×3 / 생성 성공·published=false, markPublished 는 published=true 인 새 인스턴스(원본 불변) | REQ-ENTRY-05 |
 
 ---
 
@@ -792,10 +796,10 @@ public class DrawCompletedListener {
 | # | 범위 | 커밋 메시지 |
 |---|------|-------------|
 | 0 | docs | `docs: 5단계 착수 전 결정 반영`<br>- D5-1(관리자 수동 추첨), D5-4(추첨 후 키 만료), E-30, 에러 코드 계약 정렬<br>- draw.md, class-diagram.md, 플랜·백로그 갱신 |
-| 1 | domain | `feat(entry): 추첨 도메인 모델과 Drawer 추가`<br>- Drawer: entry_seq 정렬 목록 + K + 시드 셔플 추첨<br>- DrawResult, DropSnapshot.isDue / isClosingTooLong<br>- 추첨 관련 Repository 포트 확장<br>- T5-01 ~ T5-08 |
-| 2 | application | `feat(entry): 마감·추첨 유스케이스 구현`<br>- DrawService(마감 잠금, 건수 비교, 재발행, 관리자 수동 추첨, 추첨 후 키 만료), DrawTransaction<br>- 포트 ApplicantCounter, DrawEventPublisher, SeedGenerator, EntryGate.close·expireAfterDraw<br>- T5-09 ~ T5-13, T5-28 ~ T5-30 (Fake 포트) |
-| 3 | infra (DB) | `feat(entry): 추첨 영속성 구현`<br>- V3 draw_results 마이그레이션<br>- 조건부 UPDATE(OPEN→CLOSING, CLOSING→DRAWN), 벌크 WON/LOST<br>- T5-14 ~ T5-18 |
-| 4 | infra (Redis, Kafka) | `feat(entry): 마감 처리와 draw.completed 발행 구현`<br>- RedisEntryGate.close·expireAfterDraw, RedisApplicantCounter<br>- KafkaDrawEventPublisher, SecureRandomSeedGenerator<br>- T5-19, T5-20, T5-31 |
+| 1 | domain | `feat(entry): 추첨 도메인 모델과 Drawer 추가`<br>- Drawer: entry_seq 정렬 목록 + K + 시드 셔플 추첨<br>- DrawResult, DropSnapshot.isDue / isClosingTooLong / isClosing / isDrawn<br>- DrawResultRepository 포트(신규)<br>- T5-01 ~ T5-08, T5-33 |
+| 2 | infra (DB) | `feat(entry): 추첨 영속성 구현`<br>- DropSnapshotRepository·EntryRepository 포트 확장 + Impl + 테스트 Fake 갱신<br>- V3 draw_results 마이그레이션, DrawResult 영속(JpaEntity·Mapper·Impl, `DrawResult.restore`)<br>- 조건부 UPDATE(OPEN→CLOSING, CLOSING→DRAWN), 벌크 WON/LOST<br>- T5-14 ~ T5-16 |
+| 3 | infra (Redis, Kafka) | `feat(entry): 마감 처리와 draw.completed 발행 구현`<br>- 포트 ApplicantCounter, DrawEventPublisher, SeedGenerator(+ DrawCompletedPayload), EntryGate.close·expireAfterDraw 와 어댑터를 함께<br>- RedisEntryGate.close·expireAfterDraw, RedisApplicantCounter<br>- KafkaDrawEventPublisher, SecureRandomSeedGenerator<br>- T5-19, T5-20, T5-31 |
+| 4 | application | `feat(entry): 마감·추첨 유스케이스 구현`<br>- DrawService(마감 잠금, 건수 비교, 재발행, 관리자 수동 추첨, 추첨 후 키 만료), DrawTransaction<br>- Fake 포트 갱신(장원영)<br>- T5-09 ~ T5-13, T5-28 ~ T5-30 (Fake 포트), T5-17 · T5-18 (DrawTransaction + PostgreSQL) |
 | 5 | presentation | `feat(entry): 추첨 스케줄러와 결과 조회·관리자 추첨 API 추가`<br>- DrawScheduler, DrawResultController, AdminDrawController<br>- T5-21 ~ T5-24, T5-32 |
 | 6 | product | `feat(product): draw.completed 수신 시 드로우 추첨 완료 반영`<br>- DrawCompletedListener, DropService.markDrawn (멱등), KafkaConsumerConfig(DROP_NOT_FOUND 비재시도)<br>- T5-25 |
 | 7 | e2e | `test: 드로우 전체 흐름 E2E 테스트 추가`<br>- e2e-test 모듈, scripts/e2e.sh, e2e 프로필<br>- T5-27 |
