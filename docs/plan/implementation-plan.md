@@ -18,6 +18,7 @@
 | v2.2 | 2026-11-17 | 6단계 착수: D6-1~D6-4 확정 (D6-4 는 4단계 E-40·E-41 사용자 결정 적용) |
 | v2.3 | 2026-11-17 | 6단계 완료: 진행 현황·작업·완료 조건 갱신 |
 | v2.4 | 2026-11-17 | 7단계 착수: 사용자 결정 2건(인기 드로우 = 진행 중만, 동점 = member 사전순) 확정, 종료 드로우 lazy 제거 기본안 4장 표에 추가 |
+| v2.5 | 2026-11-17 | 7단계 완료: 진행 현황·작업·완료 조건 갱신 |
 
 ---
 
@@ -96,7 +97,7 @@ flowchart LR
 | 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ✅ 완료 (2026-11-17) |
 | 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ✅ 완료 (2026-11-17) |
 | 6. 쿠폰 | `feat/phase-6-coupon` | [phase-6-coupon.md](phases/phase-6-coupon.md) | ✅ 완료 (2026-11-17) |
-| 7. 랭킹 | `feat/phase-7-ranking` | [phase-7-ranking.md](phases/phase-7-ranking.md) | ⬜ 대기 |
+| 7. 랭킹 | `feat/phase-7-ranking` | [phase-7-ranking.md](phases/phase-7-ranking.md) | ✅ 완료 (2026-11-17) |
 | 8. 검증 | `test/phase-8-load-test` | [phase-8-load-test.md](phases/phase-8-load-test.md) | ⬜ 대기 |
 
 ---
@@ -299,19 +300,19 @@ flowchart LR
 **참고**: [ranking.md](../design/05-features/ranking.md), [class-diagram.md](../design/07-class-diagram/class-diagram.md) 2.5
 
 **작업**
-- [ ] domain: `WeekKey`(ISO 주차, Asia/Seoul), `RankingBoard`, `RankingRepository`(I), `DisplayNameRepository`(I)
-- [ ] application: `RankingAggregateService`, `RankingQueryService`
-- [ ] infrastructure: `rank.lua` (dedupe + `ZINCRBY` 3개), 주간 키 TTL, 표시 이름 Hash
-- [ ] presentation: `RankingController` (API 4개), Listener 3개 (`entry.created`, `drop.created`, `user.registered`)
+- [x] domain: `WeekKey`(ISO 주차, Asia/Seoul), `RankingBoard`, `RankingRepository`(I), `DisplayNameRepository`(I)
+- [x] application: `RankingAggregateService`, `RankingQueryService`
+- [x] infrastructure: `rank.lua` (dedupe + `ZINCRBY` 3개), 주간 키 TTL, 표시 이름 Hash
+- [x] presentation: `RankingController` (API 4개), Listener 3개 (`entry.created`, `drop.created`, `user.registered`)
 
 **결정 필요**
 - [x] 인기 드로우 범위: **진행 중 드로우만** (사용자 결정, 2026-11-17)
 - [x] 동점 처리 정책: **member 사전순**, 순번 1, 2, … (사용자 결정, 2026-11-17)
 
 **완료 조건**
-- [ ] 단위(`WeekKey`): 일요일 23:59:59 KST → 그 주, 월요일 00:00:00 KST → 다음 주, UTC 기준과 다른 경우
-- [ ] 통합: 같은 이벤트 3번 → 점수 1
-- [ ] 통합: Top N 조회 시 닉네임·드로우 제목 포함
+- [x] 단위(`WeekKey`): 일요일 23:59:59 KST → 그 주, 월요일 00:00:00 KST → 다음 주, UTC 기준과 다른 경우
+- [x] 통합: 같은 이벤트 3번 → 점수 1
+- [x] 통합: Top N 조회 시 닉네임·드로우 제목 포함
 
 ---
 

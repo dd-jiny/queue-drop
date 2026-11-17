@@ -9,6 +9,7 @@
 | v1.3 | 2026-11-17 | #2 검토 반영: 인기 드로우 탐색 중 이미 본 id 건너뜀(배치 사이 보드 변경 시 중복 표시 방지), 마감 시각 맵 getOrDefault 방어, `ClockConfig` 는 커밋 #2 에 포함 |
 | v1.4 | 2026-11-17 | T7-20 은 QueryService 결과로 검증(HTTP 는 #5), T7-25 장애 주입은 Redis WRONGTYPE (presentation 테스트의 domain import 금지) |
 | v1.5 | 2026-11-17 | build.gradle 테스트 의존성 추가 표시. `?week=`(빈 문자열)은 null 이 아니므로 파싱 → 400 `RANKING_INVALID_WEEK` (생략만 이번 주) |
+| v1.6 | 2026-11-17 | 3.6 에 부분 재처리 절차 추가 (한지민 E-66: 전체 재집계가 30일 이전 누적 점수까지 지우는 문제, 집계 키를 지우지 않고 오프셋만 되돌림 — 장애 후 7일 안) |
 
 ---
 
@@ -917,6 +918,13 @@ docker compose start ranking-service
 - 표시 정보까지 유실된 경우: `drop.created`/`user.registered` 보존 기간(기본 7일) 밖이면 복구되지 않는다. 드로우는 product 의 재발행 API 로 복구 가능, 닉네임은 복구 수단 없음 → 6장 리스크.
 - `KEYS` 대신 `--scan` 을 쓴다 (운영 중 Redis 블로킹 방지).
 - 재소비로 종료 드로우도 `rank:drop:popular` 에 다시 들어온다. 첫 인기 드로우 조회의 lazy 제거(3.2)가 다시 지운다.
+
+#### 부분 재처리 — 리스너가 건너뛴 응모만 메우기 (E-66, 기본안)
+전체 재집계는 `rank:user:all` 을 지우므로 30일보다 오래된 누적 점수까지 사라진다. 리스너 장애로 **일부 응모를 건너뛴 경우**에는 집계 키를 지우지 않고 오프셋만 되돌린다.
+1. ERROR 로그(`ranking 집계 실패 — 건너뜀 topic= partition= offset=`)에서 파티션별 가장 이른 offset 을 찾는다 (또는 장애 시작 시각).
+2. ranking-service 중지 → `--reset-offsets --to-offset <offset>` (파티션 지정) 또는 `--to-datetime <장애 시작 시각>` 로 `entry.created` 만 되돌린다 (dry-run 후 execute) → 재시작.
+- 안전한 이유: rank.lua 가 dedupe 로 멱등이라 이미 센 응모는 다시 세지 않는다. 건너뛴 레코드의 드로우는 그 시각에 진행 중이었으므로 dedupe Set 이 최소 closeAt + 7일 살아 있다.
+- **조건: 장애 후 7일 안에 실행한다.** 그보다 늦으면 dedupe 가 만료된 드로우가 이중 집계될 수 있으므로 전체 재집계(위 절차)로 간다.
 
 ---
 

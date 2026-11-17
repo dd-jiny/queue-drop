@@ -990,3 +990,132 @@
   2. 정원 수십만이면 배치 리스너 + 배치 claim Lua(사용자·requestId 배열) + 다중 행 `INSERT ... ON CONFLICT DO NOTHING`. E-46 개선안 1 과 같고, claim Lua 도 배치 형태로 바꿔야 한다. 대가: DLT 대상 레코드를 식별하기 복잡하다(`BatchListenerFailedException`).
 - **우선순위**: 낮음 — 현재 규모에서는 불필요하다.
 - **영향 범위**: `CouponIssuedListener`, `CouponSaveService`, `coupon-claim.lua`, `KafkaConsumerConfig`
+
+---
+
+## phase-7 (랭킹: ranking-service) 분석 — 2026-11-17
+
+분석 범위: `git log dev..HEAD` (`feat/phase-7-ranking`, 커밋 6개), ranking-service 전체, `phase-7-ranking.md` v1.5 (3.6 운영 절차, 6장 리스크). Gradle 은 실행하지 않았다(코드 읽기만). 수치는 모두 추정이다.
+
+### E-64 인기 드로우 조회 — 정상 3~4회, 최악 22회 Redis 왕복. 공개 경로라 캐시 여지가 있음 (현재 규모에서는 불필요)
+- **구분**: 고도화 (Redis 왕복·응답 경로, 현재 규모에서는 불필요) (관련: E-32, E-21)
+- **단계/위치**: phase-7, `RankingQueryService.java:48-78`(`topDrops`), `RedisRankingRepository.removeDrops`, `RedisDropWindowRepository.findAll`
+- **현상**:
+  - 배치 하나 = `ZREVRANGE WITHSCORES` 1회 + 마감 시각 `HMGET` 1회. 그 뒤 종료 드로우가 있으면 `ZREM` 1회, 제목 `HMGET` 1회.
+  - 정상(종료 드로우가 상위에 없음, size ≤ 50): 3회. lazy 제거가 있으면 4회.
+  - 최악(상위 500 이 대부분 종료 드로우거나, 진행 중 드로우가 size 보다 적은데 보드가 500개 이상): 10배치 × 2 + 2 = 22회.
+  - lazy `ZREM` 은 멱등이다. 인스턴스 여러 개가 같은 종료 드로우를 동시에 지워도 결과가 같고, 비용은 member 당 O(log N) 이다. 한 번 지우면 다음 조회부터는 보이지 않으므로 쓰기는 마감 직후 몇 번만 일어난다. **경합은 문제가 되지 않는다.**
+- **문제/기회**:
+  - 왕복 1회를 0.2~0.5ms 로 잡으면 정상은 1~2ms 다. 문제가 되는 것은 Redis 가 느릴 때다. 명령마다 타임아웃이 1초라서, 실패하지 않고 느리기만 하면(예: 명령당 800ms) 최악 경로는 요청 하나가 십수 초를 잡는다.
+  - `/api/rankings/drops` 는 인증이 없는 공개 경로다. 최악 경로가 반복되면 요청 1건이 Redis 명령 22건으로 늘어난다(증폭).
+  - 현재 규모(동시 진행 드로우 수 개~수십 개, 종료 드로우는 lazy 제거로 상위에 쌓이지 않음)에서는 거의 항상 정상 경로를 탄다. **현재 규모에서는 불필요하다.**
+- **근거**: 코드 분석, 계산(추정). 측정하지 않았다.
+- **개선안**:
+  1. 현행 유지(권장). 8단계에서 `/api/rankings/drops` p99 만 본다.
+  2. 탐색을 Lua 하나로 묶는다(`ZREVRANGE` → `HMGET closeAt` → 필터 → `HMGET title` 을 서버에서 한 번에, 왕복 1회). 대가: 진행 중 판단(`DropWindow.isClosed`)이 도메인에서 Lua 로 옮겨가 도메인 규칙이 둘로 나뉘고, 스크립트 실행 시간이 탐색 한도에 비례해 늘어난다(500개면 수백 µs, 추정).
+  3. 공개 조회 3종(`drops`, `users/weekly`, `users/all`)에 인스턴스 로컬 캐시(Caffeine, TTL 1~2초, 키 = API + size + week)를 둔다. 피크 때 Redis 부하가 인스턴스 수 × 초당 1회로 고정된다. 대가: 최대 2초 늦은 순위(랭킹은 원래 최종 일관성이라 허용 범위), 캐시 의존성 추가. `/users/me` 는 사용자별이라 캐시 효과가 없다.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다. 8단계에서 랭킹 폴링 부하를 넣는다면 3 이 가장 싸다.
+- **영향 범위**: (2) `rank.lua` 와 별도 스크립트, `RankingRepository` 포트. (3) `RankingQueryService` 또는 presentation, `build.gradle`
+
+### E-65 `drop.created` 를 받지 못한 드로우는 마감 후에도 "진행 중 인기 드로우"에 영구히 남음
+- **구분**: 장애 경로의 표시 오류 (정합성 영향 없음) (관련: E-29)
+- **단계/위치**: phase-7, `DropWindow.isInProgress`(closeAt null → 진행 중), `RankingQueryService.topDrops`, `rank.lua`(closeAt 미상 → dedupe TTL 30일)
+- **현상**: closeAt 을 모르면 진행 중으로 본다(기본안). `drop.created` 가 유실되면(E-29 경로) 그 드로우는 응모 수 점수로 인기 보드에 올라가고, 마감이 지나도 lazy 제거 대상이 아니므로 **계속 상위에 `drop-{id}` 로 표시**된다. 응모 수가 많은 드로우일수록 오래 1위에 머문다.
+- **문제/기회**: 사용자 화면에 마감된 드로우가 진행 중으로 보인다. 데이터 정합성(응모·추첨)과는 무관하다. product 재발행 API 를 누르면 closeAt 이 HSET 되어 다음 조회에서 지워지지만, 관리자가 이 상태를 알 방법이 없다(E-29 와 같은 구조).
+- **근거**: 코드 분석. 발생 빈도는 E-29 와 같다(브로커 장애·배포와 드로우 등록이 겹칠 때, 낮음).
+- **개선안**:
+  1. 감지만 추가: `topDrops` 에서 closeAt 미상 드로우를 보면 WARN 1줄(dropId). 비용 몇 줄. 복구는 재발행 API(수동).
+  2. E-29 개선안 1(오픈 전 자동 재발행)이 들어가면 이 경우도 함께 사라진다. 따로 만들 필요가 없다.
+  3. closeAt 미상 드로우를 결과에서 빼되 지우지는 않는다. 정상 경로(drop.created 가 첫 응모보다 늦게 도착)에서 진행 중 드로우가 잠깐 안 보이게 되므로 권하지 않는다.
+- **우선순위**: 낮음~중간 — 빈도는 낮지만 눈에 띄는 오표시다. E-29 를 처리하면 같이 해결되므로 E-29 쪽에서 묶어 처리한다.
+- **영향 범위**: (1) `RankingQueryService`, `phase-7-ranking.md` 6장 리스크
+
+### E-66 리스너가 실패로 건너뛴 응모를 메우는 절차가 "전체 재집계"뿐이고, 이 절차는 30일보다 오래된 누적 점수를 지움
+- **구분**: 운영·복구 절차 (관련: E-12, E-06)
+- **단계/위치**: phase-7, `KafkaConsumerConfig`(1초 × 3회 후 로그·스킵), `phase-7-ranking.md` 3.6, `create-topics.sh:22`(`entry.created` 보존 30일)
+- **현상**:
+  - Redis 장애가 길어지면 레코드마다 약 4~7초(시도 4회 × 최대 1초 타임아웃 + 대기 3초) 동안 재시도한 뒤 ERROR 로그를 남기고 건너뛴다. 로그에 topic·partition·offset 이 남는다.
+  - 3.6 절차는 집계 키를 모두 지우고 `--to-earliest` 로 다시 읽는 방식 하나다.
+- **문제/기회**:
+  - 몇 건이 빠진 경우에도 전체 재집계를 해야 한다. 이때 `rank:user:all` 을 지우므로, `entry.created` 보존 기간(30일) 밖의 누적 점수는 **원래 맞던 값까지 사라진다**. 30일이 지난 서비스에서는 "누락 몇 건 복구"가 "누적 랭킹 초기화"가 된다. 오래된 주간 키(30~35일)도 일부만 복구된다.
+  - 사실 rank.lua 는 dedupe Set 으로 멱등이다. 건너뛴 오프셋부터 다시 읽어도, 그 뒤 이미 집계된 레코드는 `SISMEMBER` 에서 0 으로 끝난다. 건너뛴 레코드의 드로우는 그 시각에 진행 중이었으므로, dedupe Set 은 장애 시점부터 최소 7일(closeAt + 7일) 살아 있다. **장애 후 7일 안이면 키를 지우지 않고 부분 재처리할 수 있다.**
+- **근거**: 코드·Lua 분석(측정 안 함). 레코드당 소요 시간은 `FixedBackOff(1000, 3)` + `timeout: 1s` 로 계산한 값이다(추정).
+- **개선안**:
+  1. **3.6 에 "부분 재처리" 절차를 추가한다(권장, 문서만)**: 서비스 중지 → ERROR 로그의 파티션별 최소 offset 으로 `--reset-offsets --to-offset`(또는 장애 시작 시각으로 `--to-datetime`), `--topic entry.created:{partition}` → 재시작. **집계 키는 지우지 않는다.** 조건: 장애 후 7일 이내(dedupe 생존). 이 조건을 넘기면 이중 집계되므로 3.6 전체 재집계로 간다. 부수 효과: 이미 lazy 제거된 종료 드로우가 인기 보드에 다시 들어오지만, 다음 조회에서 지워진다.
+  2. 랭킹 전용 DLT(`entry.created.ranking.DLT`, 6장 비고)를 둔다. 누락 레코드를 그대로 다시 넣을 수 있지만, 토픽·recoverer·재처리 도구가 늘어난다. 1 로 충분하므로 현재 규모에서는 과하다.
+  3. 30일보다 오래된 누적 점수까지 지키려면 entry_db 기반 재집계 배치가 필요하다(6장 리스크에 범위 밖으로 기록됨). 과제 범위 밖이다.
+- **우선순위**: 중간 — 코드 변경 없이 문서 한 절로 끝나고, 운영 중 가장 흔한 복구 상황(짧은 Redis 장애)에 맞는 절차다.
+- **영향 범위**: `phase-7-ranking.md` 3.6·6장 리스크, `docs/design/05-features/ranking.md` 운영 절(있으면)
+
+- **처리 (2026-11-17)**: 7단계에서 phase-7-ranking.md 3.6 에 부분 재처리 절차를 문서로 반영 (코드 변경 없음). 자동화 스크립트는 남음.
+
+### E-67 리스너 처리량 — `concurrency` 미설정(1)과 `ack-mode: record` 의 레코드마다 동기 커밋 (현재 규모에서는 불필요)
+- **구분**: 고도화 (Kafka 처리량, 현재 규모에서는 불필요) (관련: E-05, E-46, E-63)
+- **단계/위치**: phase-7, `ranking-service/src/main/resources/application.yml:27, 34`, `EntryCreatedListener`
+- **현상**:
+  - entry·coupon 과 달리 `listener.concurrency` 가 없어, 인스턴스 하나에서 스레드 1개가 `entry.created` 파티션 6개를 모두 처리한다.
+  - `ack-mode: record` 라 레코드마다 `commitSync` 를 한다. 레코드 1건 = rank.lua 1회(0.3~1ms) + 오프셋 커밋 1회(브로커 왕복 1~3ms) 다.
+  - 파티션 키는 `{dropId}:{userId}` 라 한 드로우에 응모가 몰려도 파티션이 고르게 퍼진다(핫 파티션 없음, 좋음). rank.lua 의 `rank:drop:popular`·`rank:user:all` 은 모든 응모가 쓰는 단일 키지만, Redis 가 단일 스레드라 어차피 직렬이고 명령은 µs 단위다.
+- **문제/기회**: 스레드 1개 기준 초당 약 250~750건이다. 정원 1만이 오픈 몇 초 안에 차면 랭킹 반영이 15~40초 늦어진다. 랭킹은 최종 일관성이라 기능 문제는 아니다. **현재 규모(S1 정원 1,000 → 수 초)에서는 불필요하다.**
+- **근거**: 계산(추정). 8단계에서 `ranking-service` 컨슈머 그룹 lag 을 측정하면 확인된다.
+- **개선안**:
+  1. 현행 유지(권장). 8단계에서 lag 이 문제되면 2 또는 3.
+  2. `concurrency: 3`(entry·coupon 과 같은 값, 인스턴스 2개 기준). 설정 한 줄이다. Redis 쪽 변화는 없다.
+  3. `ack-mode: batch`(Spring 기본). 커밋이 poll 단위로 줄어 처리량이 크게 오른다. 프로세스가 죽으면 마지막 poll 분량이 재전달되지만 rank.lua 가 dedupe 로 멱등이라 결과가 같다(응모·쿠폰 저장 컨슈머와 달리 안전). 대가: 테스트 `KafkaConsumption` 이 커밋 오프셋으로 완료를 판단하므로, 커밋 시점이 바뀌어도 테스트가 통과하는지 확인해야 한다.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다.
+- **영향 범위**: `ranking-service/application.yml`, (3) `phase-7-ranking.md` 3.3 설정 주석, `KafkaConsumption`
+
+### E-68 `/users/me` 가 Redis 왕복 4회 — `ZREVRANK` 와 `ZSCORE` 를 따로 호출 (현재 규모에서는 불필요)
+- **구분**: 고도화 (Redis 왕복, 현재 규모에서는 불필요)
+- **단계/위치**: phase-7, `RedisRankingRepository.java:65-78`(`rankOf`), `RankingQueryService.myRank`
+- **현상**: 보드 하나당 `ZREVRANK` + `ZSCORE` 2회, 주간·누적 두 보드라 4회다. 두 호출 사이에 member 가 지워지는 경우를 코드가 방어한다.
+- **문제/기회**: 정상이면 1~2ms 로 작다. 다만 로그인 사용자가 랭킹 화면을 열 때마다 부르는 경로라 호출 빈도는 공개 조회와 같다. Redis 7.2+ 의 `ZREVRANK key member WITHSCORE` 를 쓰면 보드당 1회(합계 2회)이고 두 값이 한 명령에서 나와 방어 코드도 필요 없다. 파이프라인이면 1회다.
+- **근거**: 코드 분석. 이 프로젝트는 Redis 7.4 를 쓴다. Spring Data Redis 의 `ZSetOperations` 에 `WITHSCORE` 지원 메서드가 있는지는 확인하지 않았다(없으면 `execute` 로 원시 명령 호출).
+- **개선안**:
+  1. 현행 유지(권장).
+  2. `ZREVRANK ... WITHSCORE` 로 바꾼다. 4회 → 2회. 원시 명령을 쓰면 응답 파싱 코드가 늘어난다.
+  3. `executePipelined` 로 4개 명령을 한 번에 보낸다. 1회. 코드가 조금 복잡해진다.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다.
+- **영향 범위**: `RedisRankingRepository.rankOf`, `RedisRankingRepositoryTest`
+
+### E-69 랭킹 Redis 메모리 — dedupe Set 은 정원 크기, 표시 정보 Hash 와 누적 보드는 TTL 없이 계속 커짐 (현재 규모에서는 불필요)
+- **구분**: 고도화 (Redis 메모리, 현재 규모에서는 불필요) (관련: E-42, E-57, E-39)
+- **단계/위치**: phase-7, `rank.lua`, `RankingKeys`, `application.yml`(`ranking.*` TTL)
+- **현상**:
+  - `rank:dedupe:{dropId}`: member 수 = 그 드로우의 성공 응모 수(최대 정원 M). member 가 512개를 넘으면 intset 이 아니라 hashtable 이 되어 member 당 약 50~60B 다. M=1만이면 드로우당 약 0.6MB, closeAt + 7일 동안 산다.
+  - `rank:user:weekly:*`: 그 주 응모자 수 × 약 70~100B, 35일 보관(최대 5~6개 주).
+  - `rank:user:all`, `rank:drop:info`, `rank:user:info`, `rank:drop:closeAt`: TTL 없음. 가입자·드로우 수에 비례해 커진다.
+- **문제/기회**: 동시에 살아 있는 드로우 50개 × M=1만이면 dedupe 가 약 30MB, 가입자 10만이면 `rank:user:all` + `rank:user:info` 가 약 15~20MB 다. **현재 규모에서는 불필요하다.** TTL 없는 표시 정보는 재집계(3.6)와 늦게 온 응모의 dedupe TTL 계산에 필요하므로, 지우는 쪽이 오히려 위험하다.
+- **근거**: Redis 인코딩 규칙 기반 계산(추정, `MEMORY USAGE` 측정 안 함).
+- **개선안**:
+  1. 현행 유지(권장). 8단계 뒤 `MEMORY USAGE rank:dedupe:{id}`, `INFO memory` 를 리포트에 남긴다.
+  2. `set-max-intset-entries` 를 정원 이상(예: 16384)으로 올려 dedupe 를 intset(member 당 4~8B)으로 유지한다. 메모리가 약 1/8 로 준다. 대가: intset 삽입이 O(n)(정렬 배열 memmove)이라 SADD 가 수십 µs 로 늘어나고, Redis 를 같이 쓰는 다른 서비스 Set 에도 적용된다(전역 설정).
+  3. `rank:drop:closeAt`·`rank:drop:info` 를 드로우 마감 + N일 뒤에 지운다. 재집계 때 드로우 정보가 없어 dedupe 가 30일 fallback TTL 로 잡히고 제목이 `drop-{id}` 가 된다. 권하지 않는다.
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다.
+- **영향 범위**: (2) `docker-compose.yml` Redis 설정, `infrastructure.md`
+
+### E-70 랭킹 관측 지표 없음 — 건너뜀·중복·lazy 제거·lag 을 로그로만 알 수 있음
+- **구분**: 운영·관측 (관련: E-13, E-38, E-47, E-60)
+- **단계/위치**: phase-7, `KafkaConsumerConfig`(ERROR 로그), `RankingAggregateService.recordEntry`(중복은 false 반환만), `RankingQueryService.removeClosed`(WARN)
+- **현상**: 메트릭이 하나도 없다. 건너뛴 레코드는 ERROR 로그와 스택, 중복 응모는 아무 흔적도 없고, lazy 제거 실패만 WARN 이다.
+- **문제/기회**: E-66 부분 재처리를 하려면 "건너뛴 레코드가 있었는가"를 바로 알아야 하는데 지금은 로그 검색뿐이다. 8단계 리포트에 "응모 수 vs 랭킹 집계 수" 대조(정합성 확인)를 넣으려면 집계 결과 카운터가 필요하다.
+- **근거**: 코드 분석.
+- **개선안**:
+  1. 최소 세트(권장): `ranking.record{result=counted|duplicate|invalid}` 카운터, `ranking.record.skipped` 카운터(recoverer 에서 증가), `ranking.drops.lazy_removed` 카운터, `rank.lua` 실행 Timer. 컨슈머 lag 은 Kafka UI(:8090) 또는 `kafka-consumer-groups.sh` 로 본다. 비용: Micrometer `MeterRegistry` 주입 몇 줄(application 에서 직접 쓰지 않도록 포트로 감싸거나 presentation/infrastructure 에서 증가).
+  2. 로그만 유지하고 8단계에서 `grep` 으로 센다. 비용 0, 실시간성 없음.
+  - 8단계 대조 방법(문서): `SUM(rank:drop:popular 의 점수)` 는 lazy 제거 때문에 응모 수와 맞지 않는다. 대신 드로우별 `SCARD rank:dedupe:{dropId}` 와 entry_db `count(*)` 를 비교한다(dedupe 생존 기간 안에서만 유효).
+- **우선순위**: 중간 — E-13 측정 지표 준비와 같은 묶음으로, 8단계 전에 넣으면 리포트 정합성 확인에 바로 쓰인다.
+- **영향 범위**: `KafkaConsumerConfig`, `RankingAggregateService` 또는 리스너, `RankingQueryService`, `phase-8-load-test.md` 지표 목록
+
+### E-71 소수 시나리오 — 보상된 응모의 랭킹 집계, lazy 제거 뒤 점수 재시작, 닉네임·제목 변경 없음
+- **구분**: 정책 메모 (정합성 영향 없음, 현재 규모에서는 불필요) (관련: E-40, E-18)
+- **단계/위치**: phase-7, `rank.lua`, `RankingQueryService.removeClosed`, `RankingAggregateService.registerUser/registerDrop`
+- **현상과 판단**:
+  1. **보상된 응모도 랭킹에 집계된다.** E-40 처리 후에도 유령 이벤트(브로커는 기록, producer 는 실패 판단 → 보상 COMPENSATED → 저장 컨슈머는 claim 실패로 저장 안 함)는 `entry.created` 에 남는다. ranking 은 별도 컨슈머 그룹이라 이 레코드를 1점으로 센다. 사용자가 다시 응모해 성공하면 dedupe 로 중복이 걸러져 결과가 맞고, 다시 응모하지 않으면 **응모하지 않은 드로우가 1점** 남는다. 브로커 장애 순간에만 생기고 랭킹은 진실의 원천이 아니므로 허용한다. 6장 리스크에 한 줄 추가를 권한다. 막으려면 `entry.cancelled` 같은 보상 이벤트를 새로 발행해야 하는데 과하다.
+  2. **lazy 제거 뒤 늦게 온 응모는 점수 1 부터 다시 쌓인다.** 마감 직전 응모가 lag 때문에 제거 뒤에 소비되면 `ZINCRBY` 가 member 를 새로 만든다. 종료 드로우라 결과에서는 다시 걸러지므로 보이지 않는다. 다만 나중에 인기 드로우 범위를 "전체 누적"으로 바꾸면(6장 비고 "필터만 제거") **이미 지운 드로우의 점수는 되살아나지 않는다**. 범위를 바꿀 때는 3.6 재집계(30일 한계)가 함께 필요하다는 점을 6장 비고에 적어 둔다.
+  3. **닉네임·제목 변경 이벤트가 없다.** 지금은 변경 API 가 없으니(user·product 확인, drop 은 등록·재발행만) 문제가 없다. 생기면 같은 HSET 덮어쓰기 경로로 받을 수 있다. 재발행 API 로 다시 받은 `drop.created` 는 제목·closeAt 을 덮어쓰지만 dedupe TTL 은 바꾸지 않는다(PTTL ≥ 0 이면 유지). closeAt 이 바뀌지 않는 한 영향이 없다.
+  4. **주간 키 TTL 은 재집계 시각 기준이다.** 3.6 재집계로 만든 지난 주차 키는 재집계 시점부터 35일 산다. 리스크에 "주차별 보관 기간이 며칠씩 다를 수 있다"로 이미 허용되어 있고, 재집계 때는 차이가 최대 30일로 커진다는 점만 덧붙이면 된다.
+- **근거**: 코드 분석.
+- **개선안**: 코드 변경 없음. 1·2·4 를 `phase-7-ranking.md` 6장 리스크/비고에 한 줄씩 추가한다(문서만).
+- **우선순위**: 낮음 — 현재 규모에서는 불필요하다. 문서 보강만 한다.
+- **영향 범위**: `phase-7-ranking.md` 6장, `docs/design/05-features/ranking.md` 리스크 절
