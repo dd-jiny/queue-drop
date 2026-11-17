@@ -10,6 +10,7 @@
 | v1.4 | 2026-11-17 | 착수 전 정리. D6-4 확정 — 4단계 E-40/E-41 사용자 결정을 그대로 적용 (요청 ID `requests`, 저장 확정 `persisted` + claim Lua, 보상 3결과, Redis 예외 → `GateUnavailableException` → 보상 후 503, ALREADY_PERSISTED 면 202). D6-1~3 확정(기본안). 4단계 계약 정렬: `ApplicationException(CouponErrorCode)`·코드명 `COUPON_*`, 포트 id 는 `long`, `isIssued` 제거 → `claimForSave`. Redis 명령 타임아웃 1s (E-03). DLT 재발행 전용 producer `max.block.ms` 5s (E-50, 쿠폰부터). 테스트 T6-16·T6-22 재작성, T6-24~T6-30 추가. 신민아 착수 전 검토 반영: Requester+AdminGuard, CouponErrorCode.from, 등록 시 remaining 재조회 제거, 발행 어댑터 RuntimeException 감싸기, DLT JSON·bytes 전용 템플릿, GlobalExceptionHandler 확인, 리스너 pause, CLIENT PAUSE 타임아웃, gateway 변경 없음 |
 | v1.5 | 2026-11-17 | Redis 장애 변환 위치 명시: `reinitialize`·`event` 는 서비스에서 `GateUnavailableException` → `ApplicationException(TEMPORARILY_FAILED)` (신민아 MAJOR — 그대로 올리면 500). `CouponQueryService.event` 는 트랜잭션 없이 |
 | v1.6 | 2026-11-17 | #4 검토 반영: DLT 적재 ERROR 로그를 recoverer 래핑으로 (#6, T6-23 단언), 내 쿠폰 정렬에 id 보조 정렬 (#5), Mapper 2개로 파일 목록 정정 |
+| v1.7 | 2026-11-17 | 리스너 id `coupon-saver`(idIsGroup=false, T6-16·T6-22 pause 용), T6-23 저장 실패 주입은 DB 트리거 (저장소 포트 대체 빈 대신) |
 
 ---
 
@@ -713,7 +714,8 @@ public class CouponController {
 public class CouponIssuedListener {
     private final CouponSaveService saveService;
 
-    @KafkaListener(topics = Topics.COUPON_ISSUED)   // groupId 는 공통 설정(${spring.application.name})
+    // id 는 테스트의 pause/resume 용 (T6-16·T6-22). idIsGroup=false 라 groupId 는 공통 설정(${spring.application.name})
+    @KafkaListener(id = "coupon-saver", idIsGroup = false, topics = Topics.COUPON_ISSUED)
     public void on(CouponIssued message) {
         saveService.save(new CouponSaveCommand(message.eventId(), message.couponEventId(), message.userId(), message.issuedAt()));
     }
@@ -748,7 +750,7 @@ public class CouponIssuedListener {
 | T6-20 | 통합 (전체 컨텍스트) | `MyCouponQueryTest` | G: 이벤트 2개에서 각각 발급 / W: `GET /me` / T: 2건, 이벤트 이름 포함, 최신순 | REQ-COUPON-04 |
 | T6-21 | 아키텍처 | `ArchitectureTest` | R1~R7 통과. `CouponIssueService` 가 `IssuedCouponRepository` 에 의존하지 않음 (추가 규칙, 구현 결정) | - |
 | T6-22 | 통합 (전체 컨텍스트) | `CouponGhostEventTest` | G: 수량 2, 저장 리스너 pause. A 발급 → 실제 발행 후 예외 주입 → 보상 → **A 재발급 성공**(새 requestId) → B 발급 성공 / W: 컨슈머 처리 완료 / T: DB 에 A 1건(재발급 requestId), B 1건 (총 2 = 수량), Redis 잔여 0. 이전 시도 유령 이벤트는 claim false | NFR-01, 03 |
-| T6-23 | 통합 (전체 컨텍스트) | `CouponIssuedListenerTest` | G: Redis `issued`·`requests` 세팅(claim true), 저장소가 항상 예외를 던지도록 주입 / W: `coupon.issued` 1건 소비 / T: 3회 재시도 후 `coupon.issued.DLT` 에 1건, DLT 적재 ERROR 로그 1줄(topic·offset·key) | NFR-03 |
+| T6-23 | 통합 (전체 컨텍스트) | `CouponIssuedListenerTest` | G: Redis `issued`·`requests` 세팅(claim true), 해당 user_id INSERT 를 거부하는 PostgreSQL 트리거로 저장 실패 주입 (저장소 포트는 domain 타입이라 presentation 테스트에서 대체 빈을 두지 않음) / W: `coupon.issued` 1건 소비 / T: 3회 재시도 후 `coupon.issued.DLT` 에 1건, DLT 적재 ERROR 로그 1줄(topic·offset·key) | NFR-03 |
 | T6-24 | infra 통합 (Redis) | `RedisCouponGateTest` | claim: 발급 후 같은 requestId → true(재호출도 true) / 다른 requestId → false / 보상 후 → false. claim 후 보상 → ALREADY_PERSISTED, 수량·Set 유지 | NFR-01, 03 (E-40) |
 | T6-25 | application 단위 (Fake) | `CouponIssueServiceTest` | G: 발행 예외 + 보상 결과 ALREADY_PERSISTED / W: `issue` / T: 성공 결과 반환(202), WARN | NFR-03 (E-40) |
 | T6-26 | application 단위 (Fake) | `CouponIssueServiceTest` | G: tryIssue 가 GateUnavailableException — ① Lua 실행 후 타임아웃(Fake 가 상태 반영 후 예외 → 보상 COMPENSATED, 수량 원복) ② 실행 전 실패(NOT_OURS, 무변화) ③ 보상도 실패 / W: `issue` / T: 셋 다 같은 requestId 로 보상 시도 후 `TEMPORARILY_FAILED`, 발행 없음, ③ 은 ERROR 로그 | NFR-03 (E-41) |
