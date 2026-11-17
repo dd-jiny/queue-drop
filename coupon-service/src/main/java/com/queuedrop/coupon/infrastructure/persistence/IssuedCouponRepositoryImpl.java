@@ -21,6 +21,6 @@ public class IssuedCouponRepositoryImpl implements IssuedCouponRepository {
     @Override
     @Transactional(readOnly = true)
     public List<IssuedCoupon> findByUserId(long userId) {
-        return jpa.findByUserIdOrderByIssuedAtDesc(userId).stream().map(IssuedCouponMapper::toDomain).toList();
+        return jpa.findByUserIdOrderByIssuedAtDescIdDesc(userId).stream().map(IssuedCouponMapper::toDomain).toList();
     }
 }

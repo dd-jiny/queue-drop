@@ -14,9 +14,11 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
  * T0-03: 컨텍스트 기동 + Flyway 실행 + ddl-auto validate 확인.
- * Redis/Kafka 는 기동 시 연결하지 않으므로(Lettuce 지연 연결, NewTopic/Listener 없음) Postgres 만 띄운다.
+ * Redis 는 Lettuce 지연 연결이라 기동 시 접속하지 않으므로 Postgres 만 띄운다.
+ * Kafka 리스너(CouponIssuedListener, 커밋 #5)는 auto-startup=false 로 시작하지 않는다 — 켜 두면 기본
+ * bootstrap(localhost:9092)인 로컬 개발 Kafka 에 실제로 붙어 소비·오프셋 커밋할 수 있다 (entry 와 같음).
  */
-@SpringBootTest
+@SpringBootTest(properties = "spring.kafka.listener.auto-startup=false")
 @Import(PostgresContainerConfig.class)
 class ApplicationContextTest {
 

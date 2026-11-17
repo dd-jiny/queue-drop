@@ -136,6 +136,23 @@ class IssuedCouponRepositoryImplTest {
     }
 
     @Test
+    @DisplayName("[T6-11 보강] 같은 issuedAt 이면 id 역순(나중 저장 먼저)으로 돌려준다 (v1.6 보조 정렬, T6-20 결정성)")
+    void sameIssuedAtOrderedByIdDesc() {
+        // Given: 같은 시각 쿠폰 3건을 A → B → C 순서로 저장 (id 오름차순)
+        repository.saveIfAbsent(IssuedCoupon.issue(eventA, 5L, ISSUED_AT));
+        repository.saveIfAbsent(IssuedCoupon.issue(eventB, 5L, ISSUED_AT));
+        repository.saveIfAbsent(IssuedCoupon.issue(eventC, 5L, ISSUED_AT));
+        entityManager.clear();
+
+        // When
+        List<IssuedCoupon> mine = repository.findByUserId(5L);
+
+        // Then
+        assertThat(mine).extracting(IssuedCoupon::getCouponEventId).containsExactly(eventC, eventB, eventA);
+        assertThat(mine).extracting(IssuedCoupon::getId).isSortedAccordingTo(java.util.Comparator.reverseOrder());
+    }
+
+    @Test
     @DisplayName("[T6-11] V2 스키마: UK uk_issued_coupons_event_user 와 내 쿠폰 조회 인덱스 idx_issued_coupons_user 가 있다")
     void schemaHasUniqueAndUserIndex() {
         // When

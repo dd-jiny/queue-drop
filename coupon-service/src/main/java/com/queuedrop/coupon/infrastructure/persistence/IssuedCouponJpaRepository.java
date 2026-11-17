@@ -24,5 +24,6 @@ interface IssuedCouponJpaRepository extends JpaRepository<IssuedCouponJpaEntity,
     int insertIfAbsent(@Param("eventId") Long eventId, @Param("userId") Long userId,
                        @Param("issuedAt") Instant issuedAt);
 
-    List<IssuedCouponJpaEntity> findByUserIdOrderByIssuedAtDesc(Long userId);
+    /** 같은 시각이면 id 역순 (T6-20 결정성) */
+    List<IssuedCouponJpaEntity> findByUserIdOrderByIssuedAtDescIdDesc(Long userId);
 }
