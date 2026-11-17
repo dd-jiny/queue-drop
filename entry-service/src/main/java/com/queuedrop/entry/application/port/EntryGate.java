@@ -1,5 +1,6 @@
 package com.queuedrop.entry.application.port;
 
+import java.time.Duration;
 import java.time.Instant;
 
 /**
@@ -30,4 +31,10 @@ public interface EntryGate {
 
     /** 응모 메타·정원 초기화. 이미 초기화돼 있으면 아무것도 하지 않는다. */
     void initialize(long dropId, int capacity, Instant openAt, Instant closeAt);
+
+    /** 마감 잠금: meta.state = CLOSED. 이후 tryApply 는 CLOSED */
+    void close(long dropId);
+
+    /** 추첨 커밋 후 응모 키 6개(meta, remaining, applicants, seq, requests, persisted)에 EXPIRE. 실패 시 GateUnavailableException (E-42) */
+    void expireAfterDraw(long dropId, Duration ttl);
 }

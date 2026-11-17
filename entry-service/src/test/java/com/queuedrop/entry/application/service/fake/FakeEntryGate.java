@@ -5,6 +5,7 @@ import com.queuedrop.entry.application.port.EntryGate;
 import com.queuedrop.entry.application.port.GateResult;
 import com.queuedrop.entry.application.port.GateUnavailableException;
 import com.queuedrop.entry.domain.model.ApplyOutcome;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -27,6 +28,8 @@ import java.util.Set;
  *       그 외 응모자·requests 제거 + remaining+1 → COMPENSATED. seq 는 되돌리지 않는다</li>
  *   <li>claimForSave (entry-claim.lua): 응모자이고 requests[userId] == eventId 일 때만 persisted 에 넣고 true (멱등)</li>
  *   <li>tryApply·compensate·claimForSave 호출은 eventId 까지 항상 기록한다 (예외를 던지는 경우 포함)</li>
+ *   <li>close: 이후 그 드로우의 tryApply 는 CLOSED (meta.state=CLOSED). expireAfterDraw: 호출만 기록 (상태는 남긴다)</li>
+ *   <li>close·expireAfterDraw 는 호출을 항상 기록하고, 실패 주입 시 한 번 GateUnavailableException 을 던진다</li>
  * </ul>
  */
 public class FakeEntryGate implements EntryGate {
@@ -35,6 +38,8 @@ public class FakeEntryGate implements EntryGate {
     public record Call(long dropId, long userId, String eventId) {}
 
     public record InitializeCall(long dropId, int capacity, Instant openAt, Instant closeAt) {}
+
+    public record ExpireCall(long dropId, Duration ttl) {}
 
     private record Key(long dropId, long userId) {}
 
@@ -59,6 +64,11 @@ public class FakeEntryGate implements EntryGate {
     private boolean failCompensateNext;
     private GateUnavailableException lastTryApplyFailure;
     private RuntimeException initializeFailure;
+    private final Set<Long> closed = new HashSet<>();
+    private final List<Long> closeCalls = new ArrayList<>();
+    private final List<ExpireCall> expireCalls = new ArrayList<>();
+    private boolean failCloseNext;
+    private boolean failExpireNext;
 
     @Override
     public GateResult tryApply(long dropId, long userId, String eventId, Instant now) {
@@ -86,6 +96,9 @@ public class FakeEntryGate implements EntryGate {
             return result;
         }
         Meta meta = metas.get(dropId);
+        if (closed.contains(dropId)) {
+            return GateResult.rejected(ApplyOutcome.CLOSED);
+        }
         if (meta == null || now.isBefore(meta.openAt()) || !now.isBefore(meta.closeAt())) {
             return GateResult.rejected(ApplyOutcome.CLOSED);
         }
@@ -175,6 +188,25 @@ public class FakeEntryGate implements EntryGate {
         seq.putIfAbsent(dropId, 0);
     }
 
+    @Override
+    public void close(long dropId) {
+        closeCalls.add(dropId);
+        if (failCloseNext) {
+            failCloseNext = false;
+            throw new GateUnavailableException("fake close 실패", new RuntimeException("simulated redis down"));
+        }
+        closed.add(dropId);
+    }
+
+    @Override
+    public void expireAfterDraw(long dropId, Duration ttl) {
+        expireCalls.add(new ExpireCall(dropId, ttl));
+        if (failExpireNext) {
+            failExpireNext = false;
+            throw new GateUnavailableException("fake expireAfterDraw 실패", new RuntimeException("simulated redis down"));
+        }
+    }
+
     private Set<Long> applicantsOf(long dropId) {
         return applicants.computeIfAbsent(dropId, k -> new LinkedHashSet<>());
     }
@@ -225,7 +257,32 @@ public class FakeEntryGate implements EntryGate {
         this.initializeFailure = failure;
     }
 
+    /** 다음 close 한 번이 GateUnavailableException 을 던진다 (호출 기록은 남고, 상태는 바뀌지 않는다). */
+    public void failCloseNext() {
+        this.failCloseNext = true;
+    }
+
+    /** 다음 expireAfterDraw 한 번이 GateUnavailableException 을 던진다 (호출 기록은 남는다). */
+    public void failExpireAfterDrawNext() {
+        this.failExpireNext = true;
+    }
+
     // ---- 상태 조회 ----
+
+    /** close 호출된 dropId (실패한 호출 포함, 호출 순서) */
+    public List<Long> closeCalls() {
+        return List.copyOf(closeCalls);
+    }
+
+    /** close 가 성공해 CLOSED 상태인지 */
+    public boolean isClosed(long dropId) {
+        return closed.contains(dropId);
+    }
+
+    /** expireAfterDraw 호출 기록 (실패한 호출 포함) */
+    public List<ExpireCall> expireCalls() {
+        return List.copyOf(expireCalls);
+    }
 
     public List<Call> tryApplyCalls() {
         return List.copyOf(tryApplyCalls);

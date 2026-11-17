@@ -8,6 +8,8 @@
 | v1.2 | 2026-11-17 | 착수 전 정리. D5-1 확정(사용자 결정: 경고 후 관리자 수동 추첨 API 포함, 3.2·3.4). E-42 확정(기본안: 추첨 완료 후 응모 키 6개 EXPIRE 1일, 3.2·3.3). E-41 개선안 2(Redis∖DB 대조)는 만들지 않음 — 수동 추첨이 DB 기준이라 Redis 에만 남은 응모는 빠진다(6장). E-30 반영(3.5 를 2단계 구현에 맞춤). 에러 코드를 0단계 계약(`ApplicationException` + `{SERVICE}_{REASON}`)에 맞춤 |
 | v1.3 | 2026-11-17 | 커밋 순서 변경 #2 영속성 → #3 Redis·Kafka 어댑터 → #4 유스케이스 — 포트 확장을 구현체·Fake 와 같은 커밋에 두어 커밋마다 컴파일·전체 테스트가 통과하게. 저장소 포트 id 인자를 원시 `long` 으로 통일(4단계 포트와 동일). T5-33 추가 |
 | v1.4 | 2026-11-17 | 마이그레이션 번호 V3 → V2 (entry 는 V1 만 있음). T5-34(DrawResult 영속) 추가. 벌크 UPDATE clearAutomatically |
+| v1.5 | 2026-11-17 | Redis·Kafka 포트 id 를 원시 `long` 으로. `RedisEntryGate.close` 도 `call()` 래퍼로 감싸 Redis 장애를 `GateUnavailableException` 으로 (`closeDueDrops` 는 이를 잡아 WARN 만 남기고 재시도하지 않는다 — 이미 CLOSING 이라 다음 주기 대상이 아니고, 응모 차단은 Lua 의 closeAt 검사가 보장) |
+| v1.6 | 2026-11-17 | `KafkaDrawEventPublisher` 대기 시간: 상수 3초 → 4단계와 같은 `entry.publish.await-timeout`(3500ms) 주입 — `delivery.timeout.ms`(3000) 와 같으면 실제 발행 후 타임아웃 판정 → 재발행 중복 (신민아 MINOR). `EntryRedisKeys.all` 추가 |
 
 ---
 
@@ -228,7 +230,7 @@ public interface DrawResultRepository {
 package com.queuedrop.entry.application.port;
 
 public interface ApplicantCounter {
-    long count(Long dropId);                 // Redis SCARD entry:{dropId}:applicants
+    long count(long dropId);                 // Redis SCARD entry:{dropId}:applicants
 }
 
 public interface DrawEventPublisher {
@@ -242,9 +244,9 @@ public interface SeedGenerator {
 
 public interface EntryGate {
     // ... 4단계: tryApply, compensate, isApplicant, initialize
-    void close(Long dropId);                 // HSET entry:{dropId}:meta state CLOSED
+    void close(long dropId);                 // HSET entry:{dropId}:meta state CLOSED. 실패 시 GateUnavailableException
     /** 추첨 커밋 후 응모 키 6개(meta, remaining, applicants, seq, requests, persisted)에 EXPIRE. 실패 시 GateUnavailableException (E-42) */
-    void expireAfterDraw(Long dropId, Duration ttl);
+    void expireAfterDraw(long dropId, Duration ttl);
 }
 ```
 > `expireAfterDraw` 는 DB 가 `DRAWN` 으로 커밋된 뒤에만 부른다. 이후 판단 근거는 DB(`entries.status`)뿐이고, 늦게 도착한 `entry.created` 는 `entry-claim.lua` 가 `applicants` 에 없어서 0 → 저장하지 않는다. queue 토큰 키는 entry 소유가 아니라 건드리지 않는다.
@@ -304,7 +306,7 @@ public class DrawService {
     public void closeDueDrops(Instant now) {
         for (Long dropId : snapshots.findDueOpenIds(now)) {
             if (snapshots.markClosingIfOpen(dropId, now)) {   // 1곳만 true
-                gate.close(dropId);
+                closeGateQuietly(dropId);                     // 실패해도 응모 차단은 Lua 의 closeAt 검사가 보장
                 log.info("drop closed dropId={}", dropId);
             }
         }
@@ -524,7 +526,7 @@ public interface EntryJpaRepository extends JpaRepository<EntryJpaEntity, Long> 
 ```java
 // EntryRepositoryImpl
 @Override
-public void markResults(Long dropId, Set<Long> winnerUserIds) {
+public void markResults(long dropId, Set<Long> winnerUserIds) {
     // IN 절 파라미터 수 제한(PostgreSQL 32767) 대비 1,000건 단위 분할 (구현 결정)
     for (List<Long> chunk : Chunks.of(winnerUserIds, 1_000)) {
         jpa.markWon(dropId, chunk);
@@ -541,8 +543,8 @@ public void markResults(Long dropId, Set<Long> winnerUserIds) {
 ```java
 // RedisEntryGate (수정)
 @Override
-public void close(Long dropId) {
-    redis.opsForHash().put(EntryKeys.meta(dropId), "state", "CLOSED");
+public void close(long dropId) {
+    call(() -> redis.opsForHash().put(EntryRedisKeys.meta(dropId), "state", "CLOSED"));   // 4단계 call() 래퍼
 }
 
 // RedisApplicantCounter (신규)
@@ -552,8 +554,8 @@ public class RedisApplicantCounter implements ApplicantCounter {
     private final StringRedisTemplate redis;
 
     @Override
-    public long count(Long dropId) {
-        Long size = redis.opsForSet().size(EntryKeys.applicants(dropId));
+    public long count(long dropId) {
+        Long size = redis.opsForSet().size(EntryRedisKeys.applicants(dropId));
         return size == null ? 0 : size;
     }
 }
@@ -561,7 +563,7 @@ public class RedisApplicantCounter implements ApplicantCounter {
 ```java
 // RedisEntryGate (수정) — 6개 키 EXPIRE. 파이프라인 1회, DataAccessException → GateUnavailableException (4단계 call() 래퍼)
 @Override
-public void expireAfterDraw(Long dropId, Duration ttl) {
+public void expireAfterDraw(long dropId, Duration ttl) {
     call(() -> redis.executePipelined((RedisCallback<Object>) c -> {
         for (String key : EntryRedisKeys.all(dropId)) c.keyCommands().expire(key.getBytes(UTF_8), ttl.toSeconds());
         return null;
@@ -583,7 +585,7 @@ public class KafkaDrawEventPublisher implements DrawEventPublisher {
     public void publishCompleted(DrawCompletedPayload p) {
         DrawCompleted message = new DrawCompleted(p.dropId(), p.applicantCount(), p.winnerCount(), p.drawnAt());
         try {
-            kafka.send(Topics.DRAW_COMPLETED, String.valueOf(p.dropId()), message).get(3, TimeUnit.SECONDS);
+            kafka.send(Topics.DRAW_COMPLETED, String.valueOf(p.dropId()), message).get(awaitTimeout.toMillis(), TimeUnit.MILLISECONDS)   // entry.publish.await-timeout (v1.6);
         } catch (Exception e) {
             throw new EventPublishException("draw.completed", e);   // infrastructure 예외 → DrawService 가 로그 후 재발행 대상
         }

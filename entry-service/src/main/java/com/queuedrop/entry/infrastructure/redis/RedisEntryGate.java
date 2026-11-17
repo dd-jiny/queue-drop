@@ -5,11 +5,14 @@ import com.queuedrop.entry.application.port.EntryGate;
 import com.queuedrop.entry.application.port.GateResult;
 import com.queuedrop.entry.application.port.GateUnavailableException;
 import com.queuedrop.entry.domain.model.ApplyOutcome;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.function.Supplier;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
@@ -76,6 +79,26 @@ public class RedisEntryGate implements EntryGate {
                 List.of(EntryRedisKeys.meta(dropId), EntryRedisKeys.remaining(dropId)),
                 String.valueOf(capacity),
                 String.valueOf(openAt.toEpochMilli()), String.valueOf(closeAt.toEpochMilli()));
+    }
+
+    @Override
+    public void close(long dropId) {
+        // meta 가 없으면 state 만 있는 meta 가 생기지만 응모는 closeAt 검사로 차단되고 추첨 후 expireAfterDraw 가 정리한다
+        call(() -> {
+            redis.opsForHash().put(EntryRedisKeys.meta(dropId), "state", "CLOSED");
+            return null;
+        });
+    }
+
+    @Override
+    public void expireAfterDraw(long dropId, Duration ttl) {
+        long seconds = ttl.toSeconds();
+        call(() -> redis.executePipelined((RedisCallback<Object>) connection -> {
+            for (String key : EntryRedisKeys.all(dropId)) {
+                connection.keyCommands().expire(key.getBytes(StandardCharsets.UTF_8), seconds);
+            }
+            return null;
+        }));
     }
 
     /** Redis 예외(연결 실패·명령 타임아웃 = QueryTimeoutException 등 DataAccessException 계열)를 포트 예외로 (v1.5, E-41) */
