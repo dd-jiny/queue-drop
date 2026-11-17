@@ -220,6 +220,23 @@ services:
       kafka: { condition: service_healthy }
       kafka-init: { condition: service_completed_successfully }
 
+  # 부하 발생기 (phase-8 3.4). 사용: docker compose --profile loadtest run --rm k6 run [-e K=V ...] /scripts/<script>.js
+  # app 프로필 서비스가 먼저 떠 있어야 한다 (scripts/loadtest-up.sh). depends_on 은 두지 않는다 (run 마다 app 을 재기동하지 않게)
+  k6:
+    image: grafana/k6:2.4.0                  # 2026-11-17 기준 최신 안정 태그 (스크립트는 로컬 k6 v2.3.0 에서도 동작 확인)
+    profiles: ["loadtest"]
+    # 이미지 기본 사용자는 k6(uid 12345). macOS Docker Desktop 은 바인드 마운트에 그대로 쓸 수 있지만,
+    # Linux 에서 /results 쓰기가 막히면 K6_USER="$(id -u):$(id -g)" 로 호스트 사용자를 지정한다
+    user: "${K6_USER:-12345:12345}"
+    environment:
+      BASE_URL: http://gateway:8080
+      RESULTS_DIR: /results
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@queuedrop.test}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin!2345}
+    volumes:
+      - ./load-test:/scripts:ro
+      - ./docs/report/results:/results         # handleSummary 결과 JSON
+
 volumes:
   postgres-data:
   redis-data:

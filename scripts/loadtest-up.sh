@@ -8,7 +8,7 @@
 # 사용: JWT_SECRET=... scripts/loadtest-up.sh [--build] [--check-only]
 #   --build      이미지 재빌드 (사전에 ./gradlew clean bootJar 필요)
 #   --check-only 기동 없이 T8-01~03 점검만
-# 종료 코드: 점검 하나라도 실패하면 1. 컨테이너는 내리지 않는다 (내리기: docker compose --profile app stop)
+# 종료 코드: 점검 하나라도 실패하면 1. 컨테이너는 내리지 않는다 (내리기: docker compose --profile app stop gateway user-service product-service queue-service coupon-service entry-service ranking-service — 서비스를 지정하지 않으면 인프라까지 멈춘다)
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
