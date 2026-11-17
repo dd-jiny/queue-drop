@@ -12,6 +12,7 @@
 | v2.5 | 2026-11-17 | 1.2 구현 결과 반영: `DrawService` 의존(`DrawResultRepository`, `DrawProperties`), `AdminGuard`, `DropSnapshot.isClosing/isDrawn/isClosingTooLong`, 드로우 단위 격리·스케줄러 토글 설명 | phase-5 구현 상세 v1.7~v1.13 |
 | v2.6 | 2026-11-17 | 2.4 `CouponGate` 를 응모와 같은 계약으로 (`requestId`, `claimForSave`, `CompensationResult`, `isIssued` 제거) | phase-6 구현 상세 v1.4 |
 | v2.7 | 2026-11-17 | 2.4 구현 결과 반영: `AdminGuard`, 리스너 id, 발행 어댑터 예외 범위, `KafkaConsumerConfig` | phase-6 구현 상세 v1.7 |
+| v2.8 | 2026-11-17 | 2.5 ranking: 응답 `DropRankingResponse`/`UserRankingResponse`/`MyRankResponse`, `RankingErrorCode`, `RankingQueryService` 503 변환·lazy 제거, `RankingRepository.removeDrops`, `DomainException`·`InvalidWeekKeyException`·`RankingStoreUnavailableException`, `RedisScriptConfig`·`ClockConfig`·`KafkaConsumerConfig` | phase-7 구현 상세 v1.2 |
 
 ## 쉬운 설명
 > 각 서비스는 창구(presentation) → 매니저(application) → 장인(domain) 순서로 일을 넘기고,
@@ -373,10 +374,10 @@ classDiagram
 ### 2.5 ranking-service (DB 없음)
 | 계층 | 클래스 |
 |------|--------|
-| presentation | `RankingController`, `RankingResponse`, `EntryCreatedListener`, `DropCreatedListener`, `UserRegisteredListener` |
-| application | `RankingAggregateService` (`recordEntry(RankingRecordCommand)`, `registerDrop(DropInfoCommand)`, `registerUser(...)`), `RankingQueryService` (`topDrops(n) → List<DropRankResult>` 등) |
-| domain | `WeekKey`(값 객체: `of(Instant)` ISO 주차, Asia/Seoul), `RankingBoard`(enum: DROP_POPULAR / USER_WEEKLY / USER_ALL), `DropWindow`(record: dropId, closeAt, `isInProgress(now)`), `RankingRepository`(I: incrementOnce, top, rankOf), `DisplayNameRepository`(I), `DropWindowRepository`(I: `save`, `findAll`) |
-| infrastructure | `RedisRankingRepository` (`rank.lua`: dedupe + ZINCRBY + TTL), `RedisDisplayNameRepository`, `RedisDropWindowRepository` (`rank:drop:closeAt`) |
+| presentation | `RankingController` (`/users/me` 는 `X-User-Id` 필수), `DropRankingResponse`, `UserRankingResponse`, `MyRankResponse`, `EntryCreatedListener`, `DropCreatedListener`, `UserRegisteredListener` (에러 응답은 공통 형태 `GlobalExceptionHandler`) |
+| application | `RankingAggregateService` (`recordEntry(RankingRecordCommand)`, `registerDrop(DropInfoCommand)`, `registerUser(UserInfoCommand)` — 필드 오류는 WARN 후 스킵), `RankingQueryService` (`topDrops(n) → List<DropRankResult>` 등, 종료 드로우 lazy 제거, `RankingStoreUnavailableException` → 503), `RankingErrorCode`(implements `ErrorCode`: INVALID_SIZE / INVALID_WEEK / TEMPORARILY_FAILED) |
+| domain | `WeekKey`(값 객체: `of(Instant)` ISO 주차, Asia/Seoul), `RankingBoard`(enum: DROP_POPULAR / USER_WEEKLY / USER_ALL), `RankEntry`, `DropWindow`(record: dropId, closeAt, `isInProgress(now)`, `isClosed(now)`), `EventFields`, `RankingRepository`(I: incrementOnce, top, rankOf, removeDrops), `DisplayNameRepository`(I), `DropWindowRepository`(I: `save`, `findAll`), `DomainException`, `InvalidWeekKeyException`(extends DomainException), `RankingStoreUnavailableException`(Redis 장애, DomainException 아님) |
+| infrastructure | `RedisRankingRepository` (`rank.lua`: dedupe + ZINCRBY + TTL), `RedisDisplayNameRepository`, `RedisDropWindowRepository` (`rank:drop:closeAt`) — 셋 다 Redis 예외 → `RankingStoreUnavailableException`, `RedisScriptConfig`, `ClockConfig`, `KafkaConsumerConfig` (1초 간격 3회 재시도 후 로그·스킵, DLT 없음) |
 
 ### 2.6 gateway
 계층 구조를 적용하지 않는다 — 도메인이 없는 라우팅·인증 필터만 존재.
