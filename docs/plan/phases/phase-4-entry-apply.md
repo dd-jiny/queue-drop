@@ -9,7 +9,7 @@
 | v1.3 | 2026-11-17 | 커밋 #3 검증 반영: `DropSnapshotRegisterService` 가 Redis 를 재수신 메시지 값이 아니라 DB 에 저장된 스냅샷 값으로 초기화 (DB·Redis 정원 불일치 방지). T4-09 에 인프라 예외 전파 케이스 추가 |
 | v1.4 | 2026-11-17 | 커밋 #8 구현 확인: 역직렬화 실패 레코드를 원본 바이트로 DLT 에 보내도록 `byte[]` 전용 템플릿 추가(JSON 템플릿은 Base64 문자열로 감쌈). Spring Kafka 4 의 `DeadLetterPublishingRecoverer` 기본 목적지가 `{topic}-dlt` 라서 리졸버로 `{topic}.DLT`·같은 파티션을 명시 (토픽 이름·설계 문서는 그대로). 6단계 coupon 도 같은 리졸버 사용 |
 | v1.5 | 2026-11-17 | 백로그 E-40·E-41 반영 (사용자 결정 2026-11-17, 6.1 ⑥⑦): 요청 ID = eventId 를 판정 전에 만들어 Gate 에 넘김. 새 키 `requests`(Hash)·`persisted`(Set), `entry-apply.lua` 에 `HSET requests`, 새 `entry-claim.lua`(저장 컨슈머가 `isApplicant` 대신 호출), `entry-compensate.lua` 3결과(`CompensationResult`). 발행 실패여도 ALREADY_PERSISTED 면 202. `RedisEntryGate` 가 Redis 예외를 `GateUnavailableException` 으로 감싸고 서비스는 같은 eventId 로 보상 후 503. 3.0·3.2·3.3 코드·Lua 전문, 4.1 Fake, 4.2 테스트 T4-36~42 추가·기존 테스트 기대값 변경 표시, 4.4 순서 B, 5장 커밋 #10a~c, 6장 결정·리스크 갱신 |
-| v1.6 | 2026-11-17 | 6.3 리스크에 스크립트 캐시 미적재 시 판정 타임아웃 행 추가 (#10b Red 중 확인, 동작 변경 없음). 5장: T4-31 기대값 변경을 10c → 10b 로 이동 |
+| v1.6 | 2026-11-17 | 6.3 리스크에 스크립트 캐시 미적재 시 판정 타임아웃 행 추가 (#10b Red 중 확인, 동작 변경 없음). 5장: T4-31 기대값 변경을 10c → 10b 로 이동. 4.4 순서 B 구현 메모 |
 
 > 표기
 > - **(구현 결정)**: 설계 문서에 없던 내용을 이 문서에서 정한 것
@@ -1736,6 +1736,7 @@ class AckLostEntryEventPublisher implements EntryEventPublisher {
 
 **순서 B — 소비가 보상보다 먼저 (T4-42, v1.5, E-40 재현)**
 ack 유실형 유령 이벤트에서 더 흔한 순서다. 리스너를 멈추지 않고, **실제로 보낸 뒤 저장 컨슈머의 처리 완료를 기다린 다음** 실패를 던지는 Publisher 로 재현한다. 보상은 그 뒤에 서비스가 실행한다.
+> v1.6 구현 메모: 아래 스케치와 달리 별도 `@Primary` 빈 대신 기존 `ControllableEntryEventPublisher` 의 `consumeThenFailOnceFor(userId)` 모드로 넣었다 (시나리오 테스트가 같은 컨텍스트를 공유). `EntryJpaRepository` 가 package-private 이라 대기 조건은 `JdbcTemplate` 로 확인한다. 동작 순서는 같다.
 ```java
 /** 테스트 전용: 지정한 사용자의 첫 발행은 실제로 보내고, 컨슈머가 DB 에 저장할 때까지 기다린 뒤 실패를 던진다. */
 class ConsumedThenFailPublisher implements EntryEventPublisher {

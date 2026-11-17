@@ -19,12 +19,14 @@ import org.springframework.test.web.servlet.ResultActions;
  * 유령 이벤트 시나리오 (단계 문서 4.4, T4-31; sequence-diagram.md 5.2).
  * "브로커는 기록했는데 ack 를 못 받은" 상황을, 실제로 보낸 뒤 실패를 던지는 Publisher 로 재현한다.
  * 모든 케이스에서 A 의 실패 응모(발행 → 보상)는 저장 리스너를 멈춘 채 실행한다 (순서 A).
+ * 순서 B (T4-42): 리스너를 멈추지 않고, 컨슈머가 A 를 저장한 뒤에 발행 실패 → 보상 (E-40 회귀).
  * v1.5: 유령 이벤트 (A, seq 1, e1) 는 claim 에서 requests[A] 와 eventId 가 달라(또는 응모자가 아니라) 저장되지 않는다.
  */
 class GhostEventScenarioTest extends ScenarioTestBase {
 
     private static final long USER_A = 1L;
     private static final long USER_B = 2L;
+    private static final long USER_C = 3L;
 
     @Autowired MockMvc mockMvc;
     @Autowired KafkaListenerEndpointRegistry registry;
@@ -128,5 +130,35 @@ class GhostEventScenarioTest extends ScenarioTestBase {
         assertThat(dbSeq(dropId, USER_B)).isEqualTo(2);
         assertThat(dbCount(dropId)).isEqualTo(1);
         assertThat(applicantCount(dropId)).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("[T4-42] 유령 이벤트가 보상보다 먼저 소비되면(정원 2) A 202, B 202, C 409 ENTRY_SOLD_OUT, DB 2건 == SCARD 2, remaining 0 — 정원 초과 없음")
+    void ghostEventConsumedBeforeCompensation() throws Exception {
+        // Given — 정원 2, A·B·C 토큰. 저장 리스너는 실행 중 그대로
+        long dropId = 604L;
+        givenOpenDrop(dropId, 2);
+        givenToken(dropId, USER_A);
+        givenToken(dropId, USER_B);
+        givenToken(dropId, USER_C);
+        publisher.consumeThenFailOnceFor(USER_A);
+
+        // When — A: 발행 → 컨슈머 claim + INSERT → 발행 실패 → 보상 = ALREADY_PERSISTED
+        apply(dropId, USER_A).andExpect(status().isAccepted()).andExpect(jsonPath("$.entrySeq").value(1));
+        apply(dropId, USER_B).andExpect(status().isAccepted()).andExpect(jsonPath("$.entrySeq").value(2));
+        apply(dropId, USER_C)
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("ENTRY_SOLD_OUT"));
+
+        // Then — DB 저장 ⇔ Redis 응모자 유지. v1.4 라면 A 의 자리가 풀려 C 가 성공하고 DB 3건(정원 + 1)
+        awaitAllEntryEventsConsumed();
+        assertThat(dbSeq(dropId, USER_A)).isEqualTo(1);
+        assertThat(dbSeq(dropId, USER_B)).isEqualTo(2);
+        assertThat(dbSeq(dropId, USER_C)).isNull();
+        assertThat(dbCount(dropId)).as("정원 초과 없음").isEqualTo(2);
+        assertThat(applicantCount(dropId)).as("Redis 응모자 수 == DB 건수").isEqualTo(dbCount(dropId));
+        assertThat(remaining(dropId)).isEqualTo("0");
+        assertThat(redis.opsForSet().members("entry:" + dropId + ":persisted"))
+                .contains(String.valueOf(USER_A), String.valueOf(USER_B));
     }
 }
