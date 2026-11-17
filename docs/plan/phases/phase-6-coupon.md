@@ -9,6 +9,7 @@
 | v1.3 | 2026-11-17 | 결정 필요 D6-4·리스크에 메모 추가: 4단계 E-40/E-41(유령 이벤트가 보상보다 먼저 소비, 판정 Lua 타임아웃) 과 같은 방식 적용 필요. 설계 확정은 6단계 착수 시 |
 | v1.4 | 2026-11-17 | 착수 전 정리. D6-4 확정 — 4단계 E-40/E-41 사용자 결정을 그대로 적용 (요청 ID `requests`, 저장 확정 `persisted` + claim Lua, 보상 3결과, Redis 예외 → `GateUnavailableException` → 보상 후 503, ALREADY_PERSISTED 면 202). D6-1~3 확정(기본안). 4단계 계약 정렬: `ApplicationException(CouponErrorCode)`·코드명 `COUPON_*`, 포트 id 는 `long`, `isIssued` 제거 → `claimForSave`. Redis 명령 타임아웃 1s (E-03). DLT 재발행 전용 producer `max.block.ms` 5s (E-50, 쿠폰부터). 테스트 T6-16·T6-22 재작성, T6-24~T6-30 추가. 신민아 착수 전 검토 반영: Requester+AdminGuard, CouponErrorCode.from, 등록 시 remaining 재조회 제거, 발행 어댑터 RuntimeException 감싸기, DLT JSON·bytes 전용 템플릿, GlobalExceptionHandler 확인, 리스너 pause, CLIENT PAUSE 타임아웃, gateway 변경 없음 |
 | v1.5 | 2026-11-17 | Redis 장애 변환 위치 명시: `reinitialize`·`event` 는 서비스에서 `GateUnavailableException` → `ApplicationException(TEMPORARILY_FAILED)` (신민아 MAJOR — 그대로 올리면 500). `CouponQueryService.event` 는 트랜잭션 없이 |
+| v1.6 | 2026-11-17 | #4 검토 반영: DLT 적재 ERROR 로그를 recoverer 래핑으로 (#6, T6-23 단언), 내 쿠폰 정렬에 id 보조 정렬 (#5), Mapper 2개로 파일 목록 정정 |
 
 ---
 
@@ -85,7 +86,8 @@ coupon-service/src/main/java/com/queuedrop/coupon/
 │   │   ├── IssuedCouponJpaRepository.java       [신규]
 │   │   ├── CouponEventRepositoryImpl.java       [신규]
 │   │   ├── IssuedCouponRepositoryImpl.java      [신규]
-│   │   └── CouponMapper.java                    [신규]
+│   │   ├── CouponEventMapper.java               [신규]
+│   │   └── IssuedCouponMapper.java              [신규] (엔티티별 Mapper, entry 와 같은 형태)
 │   ├── redis
 │   │   ├── CouponKeys.java                      [신규]
 │   │   └── RedisCouponGate.java                 [신규]
@@ -592,6 +594,7 @@ public class KafkaConsumerConfig implements DisposableBean {
 ```
 - DLT 토픽 `coupon.issued.DLT` 는 0단계 토픽 초기화에서 만든다.
 - DLT 재발행 producer 를 JSON·bytes 둘 다 전용 ProducerFactory 로 만들어 `max.block.ms: 5000` 을 준다 (E-50). 공통 producer 의 1초를 물려받으면 첫 DLT 전송이 메타데이터 대기로 실패해 재처리 루프에 들어갈 수 있다. entry·product 는 E-50 에 남긴다.
+- **DLT 적재 ERROR 로그 (v1.6)**: recoverer 를 감싸 DLT 로 보낼 때 `log.error(topic, partition, offset, key, 원인)` 를 남긴 뒤 위임한다 — Spring Kafka 가 보장하지 않으며, Redis 에만 남은 발급을 감지할 수단이 이 로그뿐이다. 커밋 #6 에서 T6-23 의 ERROR 로그 단언과 함께 반영 (신민아 #4 MAJOR).
 - DLT 로 간 발급은 Redis 에는 있고 DB 에는 없는 상태다. 응모와 달리 이를 자동으로 드러내는 단계가 없으므로 **DLT 적재를 ERROR 로그로 남기고 재처리**한다 (리스크 참고).
 
 #### Flyway
@@ -622,7 +625,7 @@ CREATE INDEX idx_issued_coupons_user ON issued_coupons (user_id, issued_at DESC)
 
 #### `IssuedCouponJpaRepository` — UK 위반 무시
 ```java
-public interface IssuedCouponJpaRepository extends JpaRepository<IssuedCouponJpaEntity, Long> {
+interface IssuedCouponJpaRepository extends JpaRepository<IssuedCouponJpaEntity, Long> {
 
     @Modifying
     @Transactional
@@ -633,7 +636,7 @@ public interface IssuedCouponJpaRepository extends JpaRepository<IssuedCouponJpa
         """, nativeQuery = true)
     int insertIfAbsent(@Param("eventId") Long eventId, @Param("userId") Long userId, @Param("issuedAt") Instant issuedAt);
 
-    List<IssuedCouponJpaEntity> findByUserIdOrderByIssuedAtDesc(Long userId);
+    List<IssuedCouponJpaEntity> findByUserIdOrderByIssuedAtDescIdDesc(Long userId);   // 같은 시각이면 id 역순 (T6-20 결정성, #5)
 }
 ```
 - `DataIntegrityViolationException` 을 잡는 대신 `ON CONFLICT DO NOTHING` 을 쓴다 (구현 결정): 예외로 트랜잭션이 rollback-only 가 되는 문제를 피하고, 영향 행 수(0/1)로 결과를 바로 안다.
@@ -745,7 +748,7 @@ public class CouponIssuedListener {
 | T6-20 | 통합 (전체 컨텍스트) | `MyCouponQueryTest` | G: 이벤트 2개에서 각각 발급 / W: `GET /me` / T: 2건, 이벤트 이름 포함, 최신순 | REQ-COUPON-04 |
 | T6-21 | 아키텍처 | `ArchitectureTest` | R1~R7 통과. `CouponIssueService` 가 `IssuedCouponRepository` 에 의존하지 않음 (추가 규칙, 구현 결정) | - |
 | T6-22 | 통합 (전체 컨텍스트) | `CouponGhostEventTest` | G: 수량 2, 저장 리스너 pause. A 발급 → 실제 발행 후 예외 주입 → 보상 → **A 재발급 성공**(새 requestId) → B 발급 성공 / W: 컨슈머 처리 완료 / T: DB 에 A 1건(재발급 requestId), B 1건 (총 2 = 수량), Redis 잔여 0. 이전 시도 유령 이벤트는 claim false | NFR-01, 03 |
-| T6-23 | 통합 (전체 컨텍스트) | `CouponIssuedListenerTest` | G: Redis `issued`·`requests` 세팅(claim true), 저장소가 항상 예외를 던지도록 주입 / W: `coupon.issued` 1건 소비 / T: 3회 재시도 후 `coupon.issued.DLT` 에 1건 | NFR-03 |
+| T6-23 | 통합 (전체 컨텍스트) | `CouponIssuedListenerTest` | G: Redis `issued`·`requests` 세팅(claim true), 저장소가 항상 예외를 던지도록 주입 / W: `coupon.issued` 1건 소비 / T: 3회 재시도 후 `coupon.issued.DLT` 에 1건, DLT 적재 ERROR 로그 1줄(topic·offset·key) | NFR-03 |
 | T6-24 | infra 통합 (Redis) | `RedisCouponGateTest` | claim: 발급 후 같은 requestId → true(재호출도 true) / 다른 requestId → false / 보상 후 → false. claim 후 보상 → ALREADY_PERSISTED, 수량·Set 유지 | NFR-01, 03 (E-40) |
 | T6-25 | application 단위 (Fake) | `CouponIssueServiceTest` | G: 발행 예외 + 보상 결과 ALREADY_PERSISTED / W: `issue` / T: 성공 결과 반환(202), WARN | NFR-03 (E-40) |
 | T6-26 | application 단위 (Fake) | `CouponIssueServiceTest` | G: tryIssue 가 GateUnavailableException — ① Lua 실행 후 타임아웃(Fake 가 상태 반영 후 예외 → 보상 COMPENSATED, 수량 원복) ② 실행 전 실패(NOT_OURS, 무변화) ③ 보상도 실패 / W: `issue` / T: 셋 다 같은 requestId 로 보상 시도 후 `TEMPORARILY_FAILED`, 발행 없음, ③ 은 ERROR 로그 | NFR-03 (E-41) |
