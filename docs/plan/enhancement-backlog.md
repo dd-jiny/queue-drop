@@ -457,6 +457,7 @@
   - E-28 개선안 2(상세 캐시)를 도입하면 이 메서드에서 무효화해야 한다.
 - **우선순위**: 낮음(성능) / 문서 수정은 5단계 착수 전 필수.
 - **영향 범위**: `phase-5-draw.md` 3.5, (2 선택 시) `DropRepository`, `DropJpaRepository`
+- **처리**: 5단계 착수 전 문서 반영 (2026-11-17) — 개선안 1. `phase-5-draw.md` v1.2 3.5 를 `drop.markDrawn(); save(drop)` + `ApplicationException(ProductErrorCode.DROP_NOT_FOUND)` 로, 비재시도는 에러 코드 `DROP_NOT_FOUND` 만.
 
 ---
 
@@ -639,6 +640,7 @@
 - **우선순위**: 높음 — 피크 시 Redis 지연이라는 현실적인 조건에서 추첨 정지로 이어지고, 수정은 서비스 한 곳 + 예외 매핑이다.
 - **영향 범위**: `EntryApplyService`, `RedisEntryGate`, `EntryGate` 포트(예외 계약), `GlobalExceptionHandler`, `EntryApplyServiceTest`(Gate 예외 케이스), `docs/design/.../entry-apply.md` 에러 표, `concurrency-consistency.md` D2 남은 리스크
 - **처리**: 4단계에서 반영 (2026-11-17 사용자 결정) — 개선안 1 채택: `RedisEntryGate` 가 `DataAccessException` 을 `GateUnavailableException`(application/port)으로 감싸고, `EntryApplyService` 가 같은 eventId 로 보상을 시도한 뒤 503 `ENTRY_TEMPORARILY_FAILED`(E-40 의 `requests` 덕분에 Lua 가 실행되지 않았으면 NOT_OURS 로 무변화). 보상까지 실패한 경우는 리스크로 남기고 개선안 2(대조)는 5단계에서 판단. 503 로그 정책(E-47)은 별도. 설계 D2 v1.3, `phase-4-entry-apply.md` v1.5 (T4-39·41, 커밋 #10a·b).
+- **처리(개선안 2)**: 만들지 않음 (2026-11-17 사용자 결정, D5-1) — 건수 불일치 장기화는 WARN 후 관리자 수동 추첨(DB 기준)으로 해소하며, Redis 에만 남은 응모는 제외된다.
 
 ### E-42 응모 Redis 키(`entry:{dropId}:meta/remaining/applicants/seq`)에 TTL 이 없음
 - **구분**: 고도화 (메모리·운영) (관련: E-39, E-36)
@@ -652,6 +654,7 @@
   - 2 + 긴 안전망 TTL 을 권장. 현재 규모(드로우 수십 개, 정원 수천~수만)에서는 수십 MB 이하라 급하지 않다.
 - **우선순위**: 낮음 — 지금 규모에서는 메모리 문제가 없다. 5단계에서 추첨 완료 처리와 함께 정하면 된다.
 - **영향 범위**: `entry-initialize.lua`, 5단계 추첨 서비스·문서, `architecture.md` 5장 키 표(TTL 열)
+- **처리**: 5단계 반영 예정 (2026-11-17, 기본안) — 개선안 2: 추첨 커밋 후 6개 키(requests·persisted 포함) EXPIRE 1일 (`phase-5-draw.md` D5-4, T5-30·31). 안전망 TTL(개선안 1)은 apply/claim Lua 마다 EXPIREAT 가 필요해 보류, 이 항목에 남긴다.
 
 ### E-43 응모 응답 경로에 Kafka 동기 대기(최대 3.5초)가 들어가 Kafka 지연 시 Tomcat 스레드가 고갈됨
 - **구분**: 고도화 (응답 경로·피크 병목) (카리나 후보 3)

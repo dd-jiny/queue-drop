@@ -5,6 +5,7 @@
 |------|------|-----------|----------------|
 | v1.0 | 2026-11-16 | 최초 작성 | REQ-ENTRY-05, 06 |
 | v1.1 | 2026-11-16 | 추첨 트랜잭션 첫 문장을 `CLOSING → DRAWN` 조건부 UPDATE 로 변경(동시 추첨 방지), `draw_results.published` 와 발행 실패 재발행 추가, 시드 생성 포트, 벌크 UPDATE 분할 | phase-5 구현 상세 6장 |
+| v1.2 | 2026-11-17 | 건수 불일치 장기화: (a) 경고 후 관리자 수동 추첨 API 확정(`POST /api/entries/admin/drops/{dropId}/draw`, DB 응모 기준). 추첨 커밋 후 응모 Redis 키 6개 EXPIRE 1일 | 사용자 결정, phase-5 v1.2 D5-1·D5-4 |
 
 ## 1. 요구사항 요약 (근거)
 - REQ-ENTRY-05: 응모 마감 시각에 자동 추첨, 응모자 중 K명 무작위 (정원이 일찍 차도 마감 시각까지 대기)
@@ -122,6 +123,7 @@ sequenceDiagram
 [erd.md](../06-erd/erd.md) 의 entry_db (`drop_snapshots`, `entries`, `draw_results`) 참고.
 
 ## 6. 잠재 리스크
-- **건수가 영원히 일치하지 않는 경우**: 발행 타임아웃 후 보상([entry-apply.md](entry-apply.md) 6장) 등으로 Redis ≠ DB. 선택지: (a) 경고 후 관리자 수동 확정 API, (b) 일정 시간 후 DB 기준으로 강제 추첨. **1차는 (a) 권장** — 공정성 문제를 자동으로 덮지 않기 위해.
+- **건수가 영원히 일치하지 않는 경우**: 발행 타임아웃 후 보상([entry-apply.md](entry-apply.md) 6장) 등으로 Redis ≠ DB. 선택지: (a) 경고 후 관리자 수동 확정 API, (b) 일정 시간 후 DB 기준으로 강제 추첨. **(a) 확정 (2026-11-17, 사용자 결정)** — 공정성 문제를 자동으로 덮지 않기 위해. `CLOSING` 이 `closeAt + 5분`을 넘기면 WARN, 운영자가 DLT 재처리로 해소되는지 확인한 뒤 관리자 API 로 DB 응모 기준 추첨. Redis 에만 남은 응모(보상 실패, 미처리 DLT)는 제외되며 별도 Redis∖DB 대조는 두지 않는다.
+- **응모 Redis 키 수명**: 추첨 커밋 후 `entry:{dropId}:*` 6개 키(meta, remaining, applicants, seq, requests, persisted)에 EXPIRE 1일. 추첨 전에는 만료시키지 않는다(건수 비교 근거). 만료 실패는 WARN 만 남기고 재시도하지 않는다.
 - **대량 응모자 메모리**: M 이 수십만 이상이면 전체 userId 를 메모리에 올려 셔플하는 비용 증가. 현재 범위(M 수천~수만)는 문제 없음. 커지면 "K개 인덱스만 뽑는 부분 셔플"로 변경.
 - **추첨 재시도 시 새 시드**: 트랜잭션 롤백 후 재시도는 새 시드를 쓴다. 커밋 전이라 외부에 결과가 노출되지 않았으므로 공정성 문제 없음.

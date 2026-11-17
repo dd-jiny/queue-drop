@@ -8,6 +8,7 @@
 | v2.1 | 2026-11-16 | 단계별 구현 상세에서 구체화된 클래스·포트·메서드 반영 (EntryRepository.saveIfAbsent, DrawTransaction·SeedGenerator·DrawOutcome, DropPage·Requester, queue 포트, CouponGate, DropWindow, user·gateway 클래스), DropCreated.productId 추가, 발행 어댑터 afterCommit 구조 | phase-0~7 구현 상세 6장 |
 | v2.2 | 2026-11-16 | 1.1 실패 응답을 `ApplicationException(EntryErrorCode)` + `GlobalExceptionHandler` 로, 1.3 잘못된 `drop.created` 는 application 이 로그 후 스킵(`InvalidDropSnapshotException` 제거) | phase-4 구현 상세 v1.2 |
 | v2.3 | 2026-11-17 | 1.1 `EntryGate` 시그니처 변경 — `tryApply(..., eventId)`, `compensate(dropId, userId, eventId) CompensationResult`, `claimForSave(dropId, userId, eventId) boolean` 추가, `GateUnavailableException`·`CompensationResult` 추가, `EntrySaveCommand.eventId` 추가, `RedisEntryGate` 에 claim.lua (사용자 결정, E-40·E-41) | concurrency-consistency.md D2 v1.3 |
+| v2.4 | 2026-11-17 | 1.2 `AdminDrawController`, `DrawService.drawManually` 추가 (관리자 수동 추첨). `EntryGate.expireAfterDraw` 는 1.1 포트 목록에 추가 | draw.md v1.2, phase-5 D5-1·D5-4 |
 
 ## 쉬운 설명
 > 각 서비스는 창구(presentation) → 매니저(application) → 장인(domain) 순서로 일을 넘기고,
@@ -79,6 +80,7 @@ classDiagram
             +isApplicant(dropId, userId) boolean
             +initialize(dropId, capacity, openAt, closeAt)
             +close(dropId)
+            +expireAfterDraw(dropId, ttl)
         }
         class EntryEventPublisher {
             <<interface>>
@@ -182,6 +184,10 @@ classDiagram
             -DrawQueryService queryService
             +summary(dropId) DrawSummaryResponse
         }
+        class AdminDrawController {
+            -DrawService drawService
+            +draw(dropId, userId, role) DrawSummaryResponse
+        }
     }
     namespace application {
         class DrawService {
@@ -194,6 +200,7 @@ classDiagram
             +closeDueDrops(now)
             +drawReadyDrops(now)
             +republishUnpublished()
+            +drawManually(ManualDrawCommand, now) DrawSummaryResult
         }
         class DrawTransaction {
             -SeedGenerator seedGenerator
@@ -262,6 +269,7 @@ classDiagram
     }
 
     DrawScheduler --> DrawService
+    AdminDrawController --> DrawService
     DrawResultController --> DrawQueryService
     DrawService --> DropSnapshotRepository
     DrawService --> EntryRepository

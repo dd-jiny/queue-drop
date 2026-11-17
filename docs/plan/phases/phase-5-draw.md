@@ -5,6 +5,7 @@
 |------|------|-----------|
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 설계 반영 완료 표시 |
+| v1.2 | 2026-11-17 | 착수 전 정리. D5-1 확정(사용자 결정: 경고 후 관리자 수동 추첨 API 포함, 3.2·3.4). E-42 확정(기본안: 추첨 완료 후 응모 키 6개 EXPIRE 1일, 3.2·3.3). E-41 개선안 2(Redis∖DB 대조)는 만들지 않음 — 수동 추첨이 DB 기준이라 Redis 에만 남은 응모는 빠진다(6장). E-30 반영(3.5 를 2단계 구현에 맞춤). 에러 코드를 0단계 계약(`ApplicationException` + `{SERVICE}_{REASON}`)에 맞춤 |
 
 ---
 
@@ -39,7 +40,7 @@ entry-service/src/main/java/com/queuedrop/entry/
 ├── domain
 │   ├── model
 │   │   ├── DrawResult.java                          [신규]
-│   │   └── DropSnapshot.java                        [수정] isDue(now), isClosingTooLong(now, threshold)
+│   │   └── DropSnapshot.java                        [수정] isDue(now), isClosingTooLong(now, threshold), isClosing(), isDrawn()
 │   ├── service
 │   │   └── Drawer.java                              [신규]
 │   └── repository
@@ -53,6 +54,8 @@ entry-service/src/main/java/com/queuedrop/entry/
 │   │   └── DrawQueryService.java                    [신규]
 │   ├── dto
 │   │   ├── DrawSummaryResult.java                   [신규]
+│   │   ├── ManualDrawCommand.java                   [신규] 관리자 수동 추첨 (D5-1)
+│   │   ├── Requester.java                           [신규] userId + role (product 와 같은 형태)
 │   │   ├── DrawCompletedPayload.java                [신규]
 │   │   └── DrawOutcome.java                         [신규] DrawTransaction 결과
 │   ├── exception
@@ -61,7 +64,7 @@ entry-service/src/main/java/com/queuedrop/entry/
 │       ├── ApplicantCounter.java                    [신규]
 │       ├── DrawEventPublisher.java                  [신규]
 │       ├── SeedGenerator.java                       [신규] (구현 결정)
-│       └── EntryGate.java                           [수정] close(dropId) 추가
+│       └── EntryGate.java                           [수정] close(dropId), expireAfterDraw(dropId, ttl) 추가
 ├── infrastructure
 │   ├── persistence
 │   │   ├── DrawResultJpaEntity.java                 [신규]
@@ -73,7 +76,7 @@ entry-service/src/main/java/com/queuedrop/entry/
 │   │   ├── EntryJpaRepository.java                  [수정] 벌크 UPDATE, 정렬 조회
 │   │   └── EntryRepositoryImpl.java                 [수정]
 │   ├── redis
-│   │   ├── RedisEntryGate.java                      [수정] close()
+│   │   ├── RedisEntryGate.java                      [수정] close(), expireAfterDraw()
 │   │   └── RedisApplicantCounter.java               [신규]
 │   ├── messaging
 │   │   └── KafkaDrawEventPublisher.java             [신규]
@@ -86,6 +89,7 @@ entry-service/src/main/java/com/queuedrop/entry/
     │   └── DrawScheduler.java                       [신규]
     └── api
         ├── DrawResultController.java                [신규]
+        ├── AdminDrawController.java                 [신규] 관리자 수동 추첨 (D5-1)
         └── response/DrawSummaryResponse.java        [신규]
 
 entry-service/src/main/resources/
@@ -94,6 +98,7 @@ entry-service/src/main/resources/
 
 product-service/src/main/java/com/queuedrop/product/
 ├── application/service/DropService.java             [수정] markDrawn(MarkDrawnCommand)
+├── infrastructure/config/KafkaConsumerConfig.java   [신규] product 첫 컨슈머. DefaultErrorHandler + DROP_NOT_FOUND 비재시도 (entry 4단계 설정과 같은 형태)
 ├── application/dto/MarkDrawnCommand.java            [신규]
 └── presentation/listener/DrawCompletedListener.java [신규]
 
@@ -171,6 +176,9 @@ public boolean isDue(Instant now) {
 public boolean isClosingTooLong(Instant now, Duration threshold) {
     return status == SnapshotStatus.CLOSING && now.isAfter(closeAt.plus(threshold));
 }
+
+public boolean isClosing() { return status == SnapshotStatus.CLOSING; }   // 수동 추첨 검사 (D5-1)
+public boolean isDrawn()   { return status == SnapshotStatus.DRAWN; }
 ```
 - CLOSING 진입 시각을 따로 저장하지 않고 `closeAt` 기준으로 장기화를 판단한다 (구현 결정, 컬럼 추가 불필요).
 
@@ -231,8 +239,11 @@ public interface SeedGenerator {
 public interface EntryGate {
     // ... 4단계: tryApply, compensate, isApplicant, initialize
     void close(Long dropId);                 // HSET entry:{dropId}:meta state CLOSED
+    /** 추첨 커밋 후 응모 키 6개(meta, remaining, applicants, seq, requests, persisted)에 EXPIRE. 실패 시 GateUnavailableException (E-42) */
+    void expireAfterDraw(Long dropId, Duration ttl);
 }
 ```
+> `expireAfterDraw` 는 DB 가 `DRAWN` 으로 커밋된 뒤에만 부른다. 이후 판단 근거는 DB(`entries.status`)뿐이고, 늦게 도착한 `entry.created` 는 `entry-claim.lua` 가 `applicants` 에 없어서 0 → 저장하지 않는다. queue 토큰 키는 entry 소유가 아니라 건드리지 않는다.
 > `SeedGenerator` 를 application 포트로 둔 이유: 시드 생성은 도메인 규칙이 아니라 "무작위 소스" 라는 외부 자원이고, 테스트에서 고정값을 넣어 결과를 검증해야 한다.
 
 #### DTO
@@ -244,6 +255,12 @@ public record DrawSummaryResult(Long dropId, int applicantCount, int winnerCount
 }
 
 /** DrawTransaction 실행 결과. domain 타입을 밖으로 내보내지 않기 위한 application DTO */
+public record ManualDrawCommand(Requester requester, Long dropId) {}
+
+public record Requester(Long userId, String role) {
+    public boolean isAdmin() { return "ADMIN".equals(role); }
+}
+
 public record DrawOutcome(boolean drawn, DrawCompletedPayload payload) {
     static DrawOutcome skipped() { return new DrawOutcome(false, null); }
 }
@@ -251,12 +268,16 @@ public record DrawOutcome(boolean drawn, DrawCompletedPayload payload) {
 
 #### 에러 코드
 ```java
-public enum DrawErrorCode implements ErrorCode {      // ErrorCode: 0단계 공통 인터페이스
-    DROP_NOT_FOUND(404, "드로우를 찾을 수 없습니다"),
-    DRAW_NOT_COMPLETED(409, "아직 추첨이 완료되지 않았습니다");
-    // ...
+/** EntryErrorCode 와 같은 형태. 던질 때는 new ApplicationException(DrawErrorCode.X) (0단계 계약) */
+public enum DrawErrorCode implements ErrorCode {
+    DROP_NOT_FOUND("ENTRY_DRAW_DROP_NOT_FOUND", 404, "드로우를 찾을 수 없습니다."),
+    NOT_COMPLETED("ENTRY_DRAW_NOT_COMPLETED", 409, "아직 추첨이 완료되지 않았습니다."),
+    NOT_CLOSING("ENTRY_DRAW_NOT_CLOSING", 409, "마감 처리 중인 드로우만 수동 추첨할 수 있습니다."),  // D5-1
+    ALREADY_DRAWN("ENTRY_DRAW_ALREADY_DRAWN", 409, "이미 추첨된 드로우입니다.");                   // D5-1
+    // code/status/message 필드·접근자는 EntryErrorCode 와 동일
 }
 ```
+- 관리자 권한 없음은 공통 `CommonErrorCode.FORBIDDEN` (product `AdminGuard` 와 같은 방식).
 
 #### `DrawService` — 마감·추첨 조율 (트랜잭션 밖)
 스케줄러가 매 주기 호출한다. 트랜잭션을 직접 열지 않고, 추첨 트랜잭션은 `DrawTransaction` 에 위임한다.
@@ -306,7 +327,37 @@ public class DrawService {
 
         DrawOutcome outcome = drawTransaction.execute(dropId, now);   // 커밋까지 완료
         if (outcome.drawn()) {
-            publishSafely(outcome.payload());                // 커밋 후 발행
+            afterCommit(outcome.payload());
+        }
+    }
+
+    /** 관리자 수동 추첨 (D5-1): 건수 비교 없이 DB 응모 기준으로 추첨. Redis 에만 있는 응모는 빠진다 */
+    public DrawSummaryResult drawManually(ManualDrawCommand command, Instant now) {
+        AdminGuard.requireAdmin(command.requester());          // 403 FORBIDDEN
+        Long dropId = command.dropId();
+        DropSnapshot snapshot = snapshots.findById(dropId)
+                .orElseThrow(() -> new ApplicationException(DrawErrorCode.DROP_NOT_FOUND));
+        if (snapshot.isDrawn()) throw new ApplicationException(DrawErrorCode.ALREADY_DRAWN);
+        if (!snapshot.isClosing()) throw new ApplicationException(DrawErrorCode.NOT_CLOSING);   // OPEN: 마감 전
+
+        long redisCount = safeCount(dropId);                    // 감사 로그용. Redis 장애여도 수동 추첨은 진행
+        long dbCount = entries.countByDropId(dropId);
+        log.warn("manual draw dropId={} by userId={} redis={} db={}",
+                dropId, command.requester().userId(), redisCount, dbCount);
+
+        DrawOutcome outcome = drawTransaction.execute(dropId, now);
+        if (!outcome.drawn()) throw new ApplicationException(DrawErrorCode.ALREADY_DRAWN);  // 스케줄러와 경합해 짐
+        afterCommit(outcome.payload());
+        return results.findByDropId(dropId).map(DrawSummaryResult::from).orElseThrow();
+    }
+
+    /** 커밋 후: 발행(실패 시 재발행 대상) → 응모 키 만료 (E-42). 둘 다 실패해도 추첨 결과는 확정 */
+    private void afterCommit(DrawCompletedPayload payload) {
+        publishSafely(payload);
+        try {
+            gate.expireAfterDraw(payload.dropId(), properties.keyTtlAfterDraw());
+        } catch (GateUnavailableException e) {
+            log.warn("entry keys expire failed dropId={}", payload.dropId(), e);   // 키만 남음. 정합성 영향 없음
         }
     }
 
@@ -328,6 +379,9 @@ public class DrawService {
 }
 ```
 - `DropSnapshot` 은 `DrawService` 내부(private)에서만 쓰이고 public 시그니처에 노출되지 않는다 (ArchUnit R6).
+- `AdminGuard` 는 entry application 에 product 와 같은 형태로 둔다 (package-private, `Requester.isAdmin()`).
+- `safeCount` 는 `ApplicantCounter.count` 의 `GateUnavailableException` 을 잡아 -1 을 돌려준다 (로그용).
+- 수동 추첨은 상태를 앞에서 검사하지만, 최종 방어선은 `DrawTransaction` 의 조건부 UPDATE 다 (검사와 실행 사이에 스케줄러가 먼저 추첨하면 `skipped` → 409).
 - 건수 비교를 트랜잭션 밖에서 하는 이유: 불일치 시 아무것도 쓰지 않으므로 트랜잭션이 필요 없고, Redis 호출을 DB 트랜잭션 안에 넣지 않기 위해서다.
 
 #### `DrawTransaction` — 추첨 단일 트랜잭션 (구현 결정)
@@ -389,7 +443,7 @@ public class DrawQueryService {
     public DrawSummaryResult summary(Long dropId) {
         return results.findByDropId(dropId)
                 .map(DrawSummaryResult::from)
-                .orElseThrow(() -> new DrawException(DrawErrorCode.DRAW_NOT_COMPLETED));
+                .orElseThrow(() -> new ApplicationException(DrawErrorCode.NOT_COMPLETED));
     }
 }
 ```
@@ -498,6 +552,18 @@ public class RedisApplicantCounter implements ApplicantCounter {
     }
 }
 ```
+```java
+// RedisEntryGate (수정) — 6개 키 EXPIRE. 파이프라인 1회, DataAccessException → GateUnavailableException (4단계 call() 래퍼)
+@Override
+public void expireAfterDraw(Long dropId, Duration ttl) {
+    call(() -> redis.executePipelined((RedisCallback<Object>) c -> {
+        for (String key : EntryRedisKeys.all(dropId)) c.keyCommands().expire(key.getBytes(UTF_8), ttl.toSeconds());
+        return null;
+    }));
+}
+```
+- `EntryRedisKeys.all(dropId)` = meta, remaining, applicants, seq, requests, persisted. 없는 키(예: 응모 0건이면 applicants·seq 없음)는 EXPIRE 가 0 을 돌려줄 뿐 오류가 아니다.
+- `RedisApplicantCounter.count` 도 `DataAccessException` → `GateUnavailableException` 으로 감싼다.
 - `apply.lua` 는 4단계에서 이미 `meta.state == OPEN` 과 `closeAt` 을 함께 검사하므로 수정하지 않는다. `close()` 이전에 장애가 나도 시각 검사로 마감 후 응모가 막힌다 ([draw.md](../../design/05-features/draw.md) 5.1 읽는 법).
 
 #### `KafkaDrawEventPublisher`
@@ -540,7 +606,8 @@ public class SchedulingConfig {
 entry:
   draw:
     interval-ms: 5000          # 추첨 스케줄러 주기
-    closing-warn-threshold: 5m # CLOSING 장기화 경고 기준
+    closing-warn-threshold: 5m # CLOSING 장기화 경고 기준 (경고 후 관리자 수동 추첨, D5-1)
+    key-ttl-after-draw: 1d     # 추첨 커밋 후 응모 Redis 키 만료 (E-42)
 ```
 
 ---
@@ -587,10 +654,31 @@ public record DrawSummaryResponse(Long dropId, int applicantCount, int winnerCou
 }
 ```
 - `seed` 를 문자열로 내보낸다 (구현 결정): JavaScript `Number` 는 2^53 을 넘는 long 을 정확히 표현하지 못한다.
-- 추첨 전 조회 → `DRAW_NOT_COMPLETED` (409).
+- 추첨 전 조회 → `ENTRY_DRAW_NOT_COMPLETED` (409).
+
+#### `AdminDrawController` (D5-1)
+```java
+@RestController
+@RequestMapping("/api/entries/admin/drops/{dropId}")
+@RequiredArgsConstructor
+public class AdminDrawController {
+    private final DrawService drawService;
+    private final Clock clock;
+
+    @PostMapping("/draw")
+    public DrawSummaryResponse draw(@PathVariable Long dropId,
+                                    @RequestHeader("X-User-Id") Long userId,
+                                    @RequestHeader("X-User-Role") String role) {
+        return DrawSummaryResponse.from(
+                drawService.drawManually(new ManualDrawCommand(new Requester(userId, role), dropId), clock.instant()));
+    }
+}
+```
+- 운영 절차: `CLOSING` 장기화 WARN → DLT 재처리로 해소되는지 먼저 확인 → 해소되지 않으면 이 API 호출. 응답은 결과 조회와 같은 `DrawSummaryResponse`.
 
 | Method | Path | 권한 | 응답 |
 |--------|------|------|------|
+| POST | `/api/entries/admin/drops/{dropId}/draw` | ADMIN | 200 추첨 요약 / 403 / 404 / 409 `NOT_CLOSING`·`ALREADY_DRAWN` |
 | GET | `/api/entries/drops/{dropId}/me` | USER | 4단계 구현 재사용 (APPLIED / WON / LOST) |
 | GET | `/api/entries/drops/{dropId}/result` | 공개 (구현 결정, 6장) | 응모자 수, 당첨 수, 시드, 추첨 시각 |
 
@@ -605,11 +693,12 @@ public record MarkDrawnCommand(Long dropId) {}
 @Transactional
 public void markDrawn(MarkDrawnCommand command) {
     Drop drop = dropRepository.findById(command.dropId())
-            .orElseThrow(() -> new DropException(DropErrorCode.DROP_NOT_FOUND));
+            .orElseThrow(() -> new ApplicationException(ProductErrorCode.DROP_NOT_FOUND));
     if (drop.isDrawn()) {
         return;                                 // 멱등: 재전달 시 무시
     }
-    dropRepository.save(drop.markDrawn());      // 변경 감지 미사용 → 명시 save
+    drop.markDrawn();                           // 2단계 구현: void
+    dropRepository.save(drop);                  // 변경 감지 미사용 → 명시 save (E-30)
 }
 ```
 
@@ -626,7 +715,7 @@ public class DrawCompletedListener {
     }
 }
 ```
-- 드로우가 없으면(`DROP_NOT_FOUND`) 재시도해도 해결되지 않으므로 에러 로그 후 커밋한다 (구현 결정: `DefaultErrorHandler` 에서 해당 예외를 not-retryable 로 등록).
+- 드로우가 없으면(`PRODUCT_DROP_NOT_FOUND`) 재시도해도 해결되지 않으므로 에러 로그 후 커밋한다 (구현 결정). `ApplicationException` 전체를 not-retryable 로 등록하지 않고, `DefaultErrorHandler` 의 분류 함수에서 **에러 코드가 `DROP_NOT_FOUND` 인 경우만** 재시도하지 않는다 (E-30). 그 밖의 예외는 재시도 후 `draw.completed.DLT`.
 
 ---
 
@@ -685,11 +774,16 @@ public class DrawCompletedListener {
 | T5-20 | infra 통합 (Kafka) | `KafkaDrawEventPublisherTest` | W: `publishCompleted` / T: `draw.completed` 토픽에 키=dropId 메시지 1건 | - |
 | T5-21 | 통합 (전체 entry 컨텍스트) | `DrawSchedulerIntegrationTest` | G: 응모 100건 저장, 마감 지남 / W: `DrawScheduler` 빈 2개(같은 컨텍스트에 두 번째 인스턴스 수동 생성)를 동시 실행 / T: `draw_results` 1건, 발행 1건 | REQ-ENTRY-05 |
 | T5-22 | 통합 (전체 entry 컨텍스트) | `DrawSchedulerIntegrationTest` | G: Redis 응모자 100, DB 90 / W: 스케줄 1회 → 나머지 10건 저장 → 스케줄 1회 / T: 1회차 추첨 없음, 2회차 추첨 | NFR-03 |
-| T5-23 | presentation 슬라이스 | `DrawResultControllerTest` | G: 추첨 전 / 후 / W: `GET /result` / T: 409 `DRAW_NOT_COMPLETED` / 200 + seed 문자열 | REQ-ENTRY-06 |
+| T5-23 | presentation 슬라이스 | `DrawResultControllerTest` | G: 추첨 전 / 후 / W: `GET /result` / T: 409 `ENTRY_DRAW_NOT_COMPLETED` / 200 + seed 문자열 | REQ-ENTRY-06 |
 | T5-24 | 통합 (entry 컨텍스트) | `EntryQueryAfterDrawTest` | G: 추첨 완료 / W: `GET /me` / T: 당첨자 WON, 낙첨자 LOST | REQ-ENTRY-06 |
 | T5-25 | product 통합 (Kafka + PostgreSQL) | `DrawCompletedListenerTest` | G: drawn=false 드로우 / W: `draw.completed` 2번 수신 / T: drawn=true, 예외 없음, 상세 상태 DRAWN | REQ-DROP-03 |
 | T5-26 | 아키텍처 | `ArchitectureTest` (entry, product) | 새 클래스 포함 R1~R7 통과 (`DrawService` public 시그니처에 domain 타입 없음) | - |
 | T5-27 | E2E | `DropFlowE2ETest` | 3.6 시나리오 | REQ-DROP-*, REQ-QUEUE-*, REQ-ENTRY-* |
+| T5-28 | application 단위 (Fake) | `DrawServiceTest` | G: CLOSING, Redis 10 / DB 9, ADMIN / W: `drawManually` / T: DB 9명 기준 추첨, 발행 1회, 결과 applicantCount=9, WARN 로그(redis·db 수) | NFR-03 (D5-1) |
+| T5-29 | application 단위 (Fake) | `DrawServiceTest` | G: USER 역할 / OPEN 드로우 / DRAWN 드로우 / 없는 dropId / W: `drawManually` / T: 403 `FORBIDDEN` / 409 `ENTRY_DRAW_NOT_CLOSING` / 409 `ENTRY_DRAW_ALREADY_DRAWN` / 404, 어느 경우도 추첨·발행 없음 | D5-1 |
+| T5-30 | application 단위 (Fake) | `DrawServiceTest` | G: 건수 일치 / W: `drawReadyDrops` / T: Fake Gate 에 `expireAfterDraw(dropId, 1d)` 기록. Gate 가 `GateUnavailableException` 을 던져도 추첨·발행은 유지 | E-42 |
+| T5-31 | infra 통합 (Redis) | `RedisEntryGateCloseTest` | G: 응모 1건 있는 드로우(6개 키) / W: `expireAfterDraw(1d)` / T: 6개 키 TTL 이 0 초과 86400 이하. 응모 0건 드로우도 예외 없음 | E-42 |
+| T5-32 | presentation 슬라이스 | `AdminDrawControllerTest` | G: ADMIN 헤더 / 헤더 없음 / W: `POST /api/entries/admin/drops/1/draw` / T: 200 + seed 문자열 / 400 `COMMON_MISSING_USER_HEADER` (0단계 에러 계약) | D5-1 |
 
 ---
 
@@ -697,12 +791,13 @@ public class DrawCompletedListener {
 
 | # | 범위 | 커밋 메시지 |
 |---|------|-------------|
+| 0 | docs | `docs: 5단계 착수 전 결정 반영`<br>- D5-1(관리자 수동 추첨), D5-4(추첨 후 키 만료), E-30, 에러 코드 계약 정렬<br>- draw.md, class-diagram.md, 플랜·백로그 갱신 |
 | 1 | domain | `feat(entry): 추첨 도메인 모델과 Drawer 추가`<br>- Drawer: entry_seq 정렬 목록 + K + 시드 셔플 추첨<br>- DrawResult, DropSnapshot.isDue / isClosingTooLong<br>- 추첨 관련 Repository 포트 확장<br>- T5-01 ~ T5-08 |
-| 2 | application | `feat(entry): 마감·추첨 유스케이스 구현`<br>- DrawService(마감 잠금, 건수 비교, 재발행), DrawTransaction<br>- 포트 ApplicantCounter, DrawEventPublisher, SeedGenerator, EntryGate.close<br>- T5-09 ~ T5-13 (Fake 포트) |
+| 2 | application | `feat(entry): 마감·추첨 유스케이스 구현`<br>- DrawService(마감 잠금, 건수 비교, 재발행, 관리자 수동 추첨, 추첨 후 키 만료), DrawTransaction<br>- 포트 ApplicantCounter, DrawEventPublisher, SeedGenerator, EntryGate.close·expireAfterDraw<br>- T5-09 ~ T5-13, T5-28 ~ T5-30 (Fake 포트) |
 | 3 | infra (DB) | `feat(entry): 추첨 영속성 구현`<br>- V3 draw_results 마이그레이션<br>- 조건부 UPDATE(OPEN→CLOSING, CLOSING→DRAWN), 벌크 WON/LOST<br>- T5-14 ~ T5-18 |
-| 4 | infra (Redis, Kafka) | `feat(entry): 마감 처리와 draw.completed 발행 구현`<br>- RedisEntryGate.close, RedisApplicantCounter<br>- KafkaDrawEventPublisher, SecureRandomSeedGenerator<br>- T5-19, T5-20 |
-| 5 | presentation | `feat(entry): 추첨 스케줄러와 결과 조회 API 추가`<br>- DrawScheduler, DrawResultController<br>- T5-21 ~ T5-24 |
-| 6 | product | `feat(product): draw.completed 수신 시 드로우 추첨 완료 반영`<br>- DrawCompletedListener, DropService.markDrawn (멱등)<br>- T5-25 |
+| 4 | infra (Redis, Kafka) | `feat(entry): 마감 처리와 draw.completed 발행 구현`<br>- RedisEntryGate.close·expireAfterDraw, RedisApplicantCounter<br>- KafkaDrawEventPublisher, SecureRandomSeedGenerator<br>- T5-19, T5-20, T5-31 |
+| 5 | presentation | `feat(entry): 추첨 스케줄러와 결과 조회·관리자 추첨 API 추가`<br>- DrawScheduler, DrawResultController, AdminDrawController<br>- T5-21 ~ T5-24, T5-32 |
+| 6 | product | `feat(product): draw.completed 수신 시 드로우 추첨 완료 반영`<br>- DrawCompletedListener, DropService.markDrawn (멱등), KafkaConsumerConfig(DROP_NOT_FOUND 비재시도)<br>- T5-25 |
 | 7 | e2e | `test: 드로우 전체 흐름 E2E 테스트 추가`<br>- e2e-test 모듈, scripts/e2e.sh, e2e 프로필<br>- T5-27 |
 | 8 | docs | `docs: 5단계 구현 결과 반영`<br>- 설계 수정 필요 항목 반영, 플랜 진행 현황 갱신 |
 
@@ -713,9 +808,10 @@ public class DrawCompletedListener {
 ### 결정 필요
 | ID | 항목 | 선택지 | 기본안 |
 |----|------|--------|--------|
-| D5-1 | 건수 불일치 장기화 시 처리 | (a) 경고 후 관리자 수동 확정 API (b) 일정 시간 후 DB 기준 강제 추첨 | (a). 포함 시 `POST /api/entries/admin/drops/{dropId}/draw` (ADMIN): 건수 비교를 건너뛰고 `DrawTransaction.execute` 호출. **이 API 를 5단계에 포함할지 결정 필요** |
+| D5-1 | 건수 불일치 장기화 시 처리 | (a) 경고 후 관리자 수동 확정 API (b) 일정 시간 후 DB 기준 강제 추첨 | **✅ 확정(사용자 결정, 2026-11-17): (a), 5단계에 포함.** `POST /api/entries/admin/drops/{dropId}/draw` (ADMIN): 건수 비교를 건너뛰고 DB 응모 기준으로 추첨 (3.2 `drawManually`, 3.4). Redis 에만 남은 응모(보상까지 실패, 저장 DLT 미처리)는 빠지며, 별도 Redis∖DB 대조 작업(E-41 개선안 2)은 만들지 않는다 |
 | D5-2 | 추첨 요약 API 공개 범위 | (a) 공개 (b) 로그인 사용자만 | (a) 공개 — 시드 공개로 결과 검증 가능성 제공. Gateway 인증 제외 경로 추가 필요 |
 | D5-3 | E2E 실행 방식 | 3.6 의 A / B / C | C (8단계 이후 B 로 전환) |
+| D5-4 | 응모 Redis 키 정리 (E-42) | (1) initialize 에서 `closeAt + N일` 만료 (2) 추첨 커밋 후 EXPIRE (3) 둘 다 | **확정(기본안, 2026-11-17): (2)** — 추첨이 끝난 드로우만 정리하므로 건수 비교 근거가 먼저 사라질 위험이 없다. 1일(`key-ttl-after-draw`). 안전망 TTL(1)은 `requests`·`persisted`·`seq` 가 apply/claim 시점에 생겨 Lua 마다 EXPIREAT 를 넣어야 해서 이번 범위에서 제외 — 백로그 E-42 에 남김 |
 
 ### 설계 수정 필요
 | 대상 문서 | 내용 |
@@ -729,6 +825,8 @@ public class DrawCompletedListener {
 - **응모자 수가 매우 큰 경우**: 전체 userId 를 메모리에 올려 셔플한다. M 이 수십만 이상이면 부분 셔플(K 개 인덱스만 뽑기)로 바꿔야 한다. 현재 범위(수천~수만)는 문제 없음.
 - **추첨 트랜잭션 길이**: 응모자 조회 + 벌크 UPDATE 가 한 트랜잭션이다. 응모자가 많으면 `drop_snapshots` 행 잠금 시간이 길어지지만, 이 행을 동시에 쓰는 다른 경로가 없어 영향은 추첨 중복 방지 대기뿐이다.
 - **E2E 불안정성**: 시각 기반 시나리오라 CI 환경에서 느리면 실패할 수 있다. Awaitility 타임아웃을 넉넉히(30초) 두고, 기본 빌드에서는 제외한다.
+- **추첨 후 키 만료 실패**: Redis 장애로 `expireAfterDraw` 가 실패하면 그 드로우의 키는 만료 없이 남는다 (WARN 1줄). 재시도하지 않는다 — 정합성 영향이 없고 메모리 문제는 드로우 수백 개 단위에서나 생긴다 (E-42).
+- **수동 추첨으로 빠지는 응모**: 202 를 받았지만 저장이 DLT 에 머문 사용자는 수동 추첨에서 제외된다. 그래서 운영 절차는 DLT 재처리를 먼저 하고 API 를 부르는 순서다 (3.4). 보상까지 실패한 사용자는 503 을 받았으므로 응모가 성립하지 않은 것으로 본다.
 - **스케줄러 시계**: 추첨 판단은 entry-service 인스턴스의 `Clock` 기준이다. 인스턴스 간 시계 차이가 크면 마감 잠금 시점이 몇 초 달라질 수 있으나, 응모 차단은 Redis Lua 의 시각 검사가 담당하므로 정합성에는 영향 없음.
 
 ---
@@ -748,4 +846,6 @@ public class DrawCompletedListener {
 | (추가) 결과 조회 API | T5-23, T5-24 |
 | 공통: `./gradlew build` 통과 (ArchUnit 포함) | T5-26 |
 | 공통: 설계 수정 필요 항목 반영 + 변경 이력 | 커밋 #8 |
-| 공통: D5-1 ~ D5-3 결정 및 문서 반영 | 커밋 #8 |
+| (추가) 관리자 수동 추첨 (D5-1) | T5-28, T5-29, T5-32 |
+| (추가) 추첨 후 응모 키 만료 (E-42) | T5-30, T5-31 |
+| 공통: D5-1 ~ D5-4 결정 및 문서 반영 | 커밋 #0 (착수 전), #8 |

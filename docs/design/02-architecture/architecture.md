@@ -9,6 +9,7 @@
 | v1.3 | 2026-11-16 | DLT 토픽·컨슈머 실패 정책, Redis 키(`queue:active-drops`, `queue:admission:gate`, `rank:drop:closeAt`) 추가, 인증 제외 경로 구체화·JWT 세부·관리자 시드 추가 | phase-1·3·4·7·8 구현 상세 6장, REQ-USER-04 |
 | v1.4 | 2026-11-16 | queue 키(`meta`·`seq`·`waiting`) 만료 시각 `closeAt + 1일` 명시 | phase-3 구현 상세 v1.2 |
 | v1.5 | 2026-11-17 | Redis 키 `entry:{dropId}:requests`(요청 ID), `entry:{dropId}:persisted`(저장 확정) 추가 — 유령 이벤트·Redis 타임아웃 대응 (사용자 결정, E-40·E-41). TTL 은 5단계(E-42) | concurrency-consistency.md D2 v1.3 |
+| v1.6 | 2026-11-17 | 응모 키 6개 TTL: 추첨 커밋 후 EXPIRE 1일 (E-42 기본안) | draw.md v1.2 |
 
 ---
 
@@ -101,8 +102,8 @@ flowchart LR
 | `entry:{dropId}:remaining` | String | entry | entry, **queue** | 잔여 응모 정원 |
 | `entry:{dropId}:applicants` | Set | entry | entry | 응모자 userId (중복 방지) |
 | `entry:{dropId}:seq` | String | entry | entry | 응모 번호 발급 카운터 (증가만, 보상 시에도 되돌리지 않음) |
-| `entry:{dropId}:requests` | Hash | entry | entry | field=userId, value=이 자리를 잡은 요청의 eventId. 응모 Lua 가 `HSET`, 보상 Lua 가 `HDEL`. 보상·저장 확정이 다른 요청의 응모를 건드리지 않게 한다 (TTL 은 5단계, E-42) |
-| `entry:{dropId}:persisted` | Set | entry | entry | 저장 컨슈머가 DB 저장 전에 확정한 userId (claim Lua 가 `SADD`). 여기 있으면 보상 Lua 가 되돌리지 않는다 (TTL 은 5단계, E-42) |
+| `entry:{dropId}:requests` | Hash | entry | entry | field=userId, value=이 자리를 잡은 요청의 eventId. 응모 Lua 가 `HSET`, 보상 Lua 가 `HDEL`. 보상·저장 확정이 다른 요청의 응모를 건드리지 않게 한다 |
+| `entry:{dropId}:persisted` | Set | entry | entry | 저장 컨슈머가 DB 저장 전에 확정한 userId (claim Lua 가 `SADD`). 여기 있으면 보상 Lua 가 되돌리지 않는다 |
 | `coupon:{eventId}:meta` | Hash | coupon | coupon | issueStartAt |
 | `coupon:{eventId}:remaining` | String | coupon | coupon | 잔여 수량 |
 | `coupon:{eventId}:issued` | Set | coupon | coupon | 발급 userId (중복 방지) |
@@ -112,6 +113,8 @@ flowchart LR
 | `rank:dedupe:{dropId}` | Set | ranking | ranking | 이미 집계한 userId (멱등 처리) |
 | `rank:drop:info` / `rank:user:info` | Hash | ranking | ranking | 표시용 드로우 제목 / 닉네임 |
 | `rank:drop:closeAt` | Hash | ranking | ranking | dropId → closeAt(epoch ms) — 진행 중 드로우 필터, dedupe TTL 계산 |
+
+- `entry:{dropId}:*` 6개 키는 추첨 커밋 후 EXPIRE 1일 (추첨 전에는 만료 없음 — 건수 비교 근거, draw.md v1.2)
 
 > **규칙**: 다른 서비스 소유 키는 **읽기만** 한다. 키 구조 변경 시 이 표와 읽는 서비스를 함께 수정한다.
 
