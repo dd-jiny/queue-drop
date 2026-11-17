@@ -6,6 +6,7 @@
 | v1.0 | 2026-11-16 | 최초 작성 |
 | v1.1 | 2026-11-16 | 리스너 실패 처리(로그·스킵) 확정 및 DLT 도입 시 토픽 이름 분리 주의 추가, 설계 반영 완료 표시 |
 | v1.2 | 2026-11-17 | 4~6단계 계약에 맞춤 (착수 전 결정 반영): 사용자 결정 2건(인기 드로우 = 진행 중만, 동점 = member 사전순) 확정. `RankingErrorCode implements ErrorCode`(`RANKING_INVALID_SIZE`·`RANKING_INVALID_WEEK` 400, `RANKING_TEMPORARILY_FAILED` 503) + `ApplicationException`, `RankingException`·`RankingExceptionHandler` 삭제(기존 `GlobalExceptionHandler` 사용). `/users/me` 는 `X-User-Id` 필수(누락 400 `COMMON_MISSING_USER_HEADER`), `UNAUTHENTICATED` 삭제. Redis `timeout: 1s`(E-03), Redis 예외 → `RankingStoreUnavailableException`(domain/exception) → 조회 503, 리스너는 전파. Command 는 박싱 타입, 필드 오류는 `DomainException` → WARN 후 스킵(저장소 호출 없음). `KafkaConsumerConfig`(1초 3회 후 로그·스킵, 역직렬화 실패는 재시도 없음). 표시 fallback `user-{id}`·`drop-{id}`. 종료 드로우 lazy ZREM(기본안). `RedisScriptConfig`·`ClockConfig` 분리, rank.lua 쓰기를 끝으로, 스캔 조기 종료. 테스트 T7-25~30 추가, T7-19·20·21·22 수정, Kafka/Redis 테스트 격리 규칙. 커밋 #0 추가 |
+| v1.3 | 2026-11-17 | #2 검토 반영: 인기 드로우 탐색 중 이미 본 id 건너뜀(배치 사이 보드 변경 시 중복 표시 방지), 마감 시각 맵 getOrDefault 방어, `ClockConfig` 는 커밋 #2 에 포함 |
 
 ---
 
@@ -493,6 +494,8 @@ public class RankingQueryService {
 ```
 - public 메서드의 파라미터·반환은 원시값·String·Result 뿐이다 (ArchUnit R6). `RankEntry`, `WeekKey` 는 내부에서만 쓴다.
 - `Clock` 주입으로 테스트에서 시각을 고정한다.
+- **배치 사이 보드 변경 (v1.3)**: 여러 배치를 offset 으로 읽는 동안 ZINCRBY 로 순서가 바뀌면 같은 dropId 가 두 배치에 다시 나올 수 있다. 탐색 중 본 id 를 Set 으로 기록해 **이미 본 id 는 건너뛴다** (중복 표시 방지). 반대로 항목이 당겨져 하나를 놓치는 경우는 순간 불일치로 허용한다.
+- **마감 시각 맵 방어**: `windows.getOrDefault(id, new DropWindow(id, null))` — 저장소가 id 를 빠뜨려도 NPE 없이 진행 중으로 본다.
 - **스캔 조기 종료**: 배치가 `SCAN_BATCH` 보다 작으면 보드 끝이므로 더 조회하지 않는다 (빈 배치 왕복 1회 절약).
 - **SCAN_LIMIT 경계**: 탐색은 상위 500개(offset 0~499)까지다. 500번째의 진행 중 드로우는 찾고, 501번째는 못 찾는다 (T7-29).
 - **종료 드로우 lazy 제거 (확정(기본안), 2026-11-17)**: 탐색 중 `closeAt` 을 알고 이미 지난 드로우를 모아 탐색이 끝난 뒤 `ZREM rank:drop:popular` 한다.
@@ -968,7 +971,7 @@ docker compose start ranking-service
 |------|-------------|------|
 | 0 | `docs: 7단계 착수 전 결정 반영`<br>- 사용자 결정 2건(인기 드로우 = 진행 중만, 동점 = member 사전순)<br>- 에러 코드·헤더·Redis 타임아웃·실패 정책·표시 fallback·lazy 제거를 4~6단계 계약에 맞춤 | 이 문서 v1.2, ranking.md, architecture.md, class-diagram.md, implementation-plan.md, enhancement-backlog.md (E-03·E-18) |
 | 1 | `feat(ranking): 주차 값 객체와 랭킹 도메인 모델 추가`<br>- WeekKey (Asia/Seoul ISO 주차, 파싱·검증)<br>- RankingBoard, RankEntry, DropWindow, EventFields<br>- DomainException, InvalidWeekKeyException, RankingStoreUnavailableException<br>- 저장소 포트 3개 | domain 전체, T7-01~07 |
-| 2 | `feat(ranking): 랭킹 집계·조회 유스케이스 추가`<br>- RankingAggregateService (필드 검증 후 스킵), RankingQueryService (진행 중 필터, lazy 제거, 503 변환)<br>- Command/Result DTO, RankingErrorCode<br>- Fake 저장소 기반 단위 테스트 | application 전체, T7-08~12, T7-27(application), T7-28, T7-29, T7-30(application) |
+| 2 | `feat(ranking): 랭킹 집계·조회 유스케이스 추가`<br>- RankingAggregateService (필드 검증 후 스킵), RankingQueryService (진행 중 필터, lazy 제거, 503 변환)<br>- Command/Result DTO, RankingErrorCode, ClockConfig<br>- Fake 저장소 기반 단위 테스트 | application 전체, T7-08~12, T7-27(application), T7-28, T7-29, T7-30(application) |
 | 3 | `feat(ranking): Redis 랭킹 저장소와 집계 Lua 스크립트 구현`<br>- rank.lua (SISMEMBER·계산 후 SADD + ZINCRBY 3개, TTL 처리)<br>- RedisRankingRepository, RedisDisplayNameRepository, RedisDropWindowRepository (`call()` 예외 변환)<br>- RankingProperties, RedisScriptConfig, ClockConfig, Redis timeout 1s | infra redis·config, `application.yml`, T7-13~18, T7-30(Redis) |
 | 4 | `feat(ranking): 랭킹 이벤트 리스너 추가`<br>- entry.created / drop.created / user.registered 소비<br>- 재시도 후 건너뛰는 에러 핸들러 (KafkaConsumerConfig), listener ack-mode record | listener, `KafkaConsumerConfig`, `support/KafkaConsumption`, `ApplicationContextTest` auto-startup=false, T7-20~22, T7-25, T7-26 |
 | 5 | `feat(ranking): 랭킹 조회 API 추가`<br>- 인기 드로우, 주간·누적 유저, 내 순위 (`X-User-Id` 필수) | controller, response, T7-19, T7-27(controller) |
