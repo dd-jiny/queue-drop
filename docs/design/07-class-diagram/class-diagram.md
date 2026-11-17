@@ -11,6 +11,7 @@
 | v2.4 | 2026-11-17 | 1.2 `AdminDrawController`, `DrawService.drawManually` 추가 (관리자 수동 추첨). `EntryGate.expireAfterDraw` 는 1.1 포트 목록에 추가 | draw.md v1.2, phase-5 D5-1·D5-4 |
 | v2.5 | 2026-11-17 | 1.2 구현 결과 반영: `DrawService` 의존(`DrawResultRepository`, `DrawProperties`), `AdminGuard`, `DropSnapshot.isClosing/isDrawn/isClosingTooLong`, 드로우 단위 격리·스케줄러 토글 설명 | phase-5 구현 상세 v1.7~v1.13 |
 | v2.6 | 2026-11-17 | 2.4 `CouponGate` 를 응모와 같은 계약으로 (`requestId`, `claimForSave`, `CompensationResult`, `isIssued` 제거) | phase-6 구현 상세 v1.4 |
+| v2.7 | 2026-11-17 | 2.4 구현 결과 반영: `AdminGuard`, 리스너 id, 발행 어댑터 예외 범위, `KafkaConsumerConfig` | phase-6 구현 상세 v1.7 |
 
 ## 쉬운 설명
 > 각 서비스는 창구(presentation) → 매니저(application) → 장인(domain) 순서로 일을 넘기고,
@@ -364,10 +365,10 @@ classDiagram
 ### 2.4 coupon-service
 | 계층 | 클래스 |
 |------|--------|
-| presentation | `CouponEventController`, `CouponController`, `CouponIssuedListener`, `*Request`, `*Response` |
-| application | `CouponEventService` (등록, 재초기화), `CouponIssueService` (`issue(CouponIssueCommand) → CouponIssueResult`), `CouponSaveService` (→ `CouponGate.claimForSave` 확정 후 저장), `CouponQueryService`, 포트 `CouponGate`(I: `initialize`, `tryIssue(couponEventId, userId, requestId, now)`, `compensate(couponEventId, userId, requestId) CompensationResult`, `claimForSave(couponEventId, userId, requestId) boolean`, `remaining`), `CouponEventPublisher`(I), `GateUnavailableException`, `EventPublishException`, `CompensationResult` |
+| presentation | `CouponEventController`, `CouponController` (헤더 → `Requester`), `CouponIssuedListener` (id `coupon-saver`), `*Request`, `*Response` |
+| application | `CouponEventService` (등록, 재초기화), `CouponIssueService` (`issue(CouponIssueCommand) → CouponIssueResult`), `CouponSaveService` (→ `CouponGate.claimForSave` 확정 후 저장), `CouponQueryService`, `AdminGuard`, 포트 `CouponGate`(I: `initialize`, `tryIssue(couponEventId, userId, requestId, now)`, `compensate(couponEventId, userId, requestId) CompensationResult`, `claimForSave(couponEventId, userId, requestId) boolean`, `remaining`), `CouponEventPublisher`(I), `GateUnavailableException`, `EventPublishException`, `CompensationResult` |
 | domain | `CouponEvent`, `IssuedCoupon`, `IssueOutcome`(enum: OK / NOT_FOUND / NOT_STARTED / DUPLICATE / SOLD_OUT), `CouponEventRepository`(I), `IssuedCouponRepository`(I: `saveIfAbsent`) |
-| infrastructure | `*JpaEntity`, `*RepositoryImpl` (`ON CONFLICT DO NOTHING`), `*Mapper`, `RedisCouponGate` → CouponGate (`coupon-issue.lua`, `coupon-compensate.lua`, `coupon-claim.lua`, Redis 예외 → `GateUnavailableException`), `KafkaCouponEventPublisher` (`send().get(3.5s)`, 재시도는 producer 내부만) |
+| infrastructure | `*JpaEntity`, `*RepositoryImpl` (`ON CONFLICT DO NOTHING`), `*Mapper`, `RedisCouponGate` → CouponGate (`coupon-issue.lua`, `coupon-compensate.lua`, `coupon-claim.lua`, Redis 예외 → `GateUnavailableException`), `KafkaCouponEventPublisher` (`send().get(3.5s)`, 재시도는 producer 내부만, 동기 send 예외도 `EventPublishException`), `KafkaConsumerConfig` (3회 재시도 후 DLT, DLT 전용 producer max.block 5s, 적재 ERROR 로그) |
 
 ### 2.5 ranking-service (DB 없음)
 | 계층 | 클래스 |

@@ -802,6 +802,7 @@ public class CouponIssuedListener {
 | [architecture.md](../../design/02-architecture/architecture.md) 6장 | 인증 제외 경로에 `GET /api/coupons/events/*` 추가 (쿠폰 이벤트 조회는 공개) → 설계 반영 완료 (2026-11-16) |
 | [class-diagram.md](../../design/07-class-diagram/class-diagram.md) 2.4 | (v1.3 시점) `CouponGate` 메서드(`initialize`, `isIssued`, `remaining`), `CouponSaveService` 의 `CouponGate` 의존 추가 → 설계 반영 완료 (2026-11-16). v1.4 에서 `isIssued` → `claimForSave` |
 | coupon-issue.md v1.2 · architecture.md v1.8 · concurrency-consistency.md v1.5 · class-diagram.md v2.6 · sequence-diagram.md v1.4 | D6-4 (요청 ID·claim·보상 3결과·Redis 예외) → 설계 반영 완료 (2026-11-17, 착수 전) |
+| class-diagram.md v2.7 | 구현 결과(`AdminGuard`, 리스너 id, 발행 어댑터 예외 범위, DLT 설정) → 설계 반영 완료 (2026-11-17) |
 
 ### 리스크
 - **대기열이 없어 피크 요청이 전부 Redis 로**: 응모와 달리 유입 조절이 없다. 같은 Redis 를 쓰는 응모·대기열·랭킹이 쿠폰 오픈 순간 영향을 받을 수 있다 → 8단계에서 쿠폰 스파이크와 드로우 응모를 동시에 걸어 측정.

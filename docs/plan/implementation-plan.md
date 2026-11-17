@@ -16,6 +16,7 @@
 | v2.0 | 2026-11-17 | 5단계 착수: 추첨 건수 불일치 정책 확정(사용자 결정, 관리자 수동 추첨) |
 | v2.1 | 2026-11-17 | 5단계 완료: 진행 현황·완료 조건 갱신 |
 | v2.2 | 2026-11-17 | 6단계 착수: D6-1~D6-4 확정 (D6-4 는 4단계 E-40·E-41 사용자 결정 적용) |
+| v2.3 | 2026-11-17 | 6단계 완료: 진행 현황·작업·완료 조건 갱신 |
 
 ---
 
@@ -93,7 +94,7 @@ flowchart LR
 | 3. 대기열 | `feat/phase-3-queue` | [phase-3-queue.md](phases/phase-3-queue.md) | ✅ 완료 (2026-11-16) |
 | 4. 응모 | `feat/phase-4-entry-apply` | [phase-4-entry-apply.md](phases/phase-4-entry-apply.md) | ✅ 완료 (2026-11-17) |
 | 5. 추첨 | `feat/phase-5-draw` | [phase-5-draw.md](phases/phase-5-draw.md) | ✅ 완료 (2026-11-17) |
-| 6. 쿠폰 | `feat/phase-6-coupon` | [phase-6-coupon.md](phases/phase-6-coupon.md) | ⬜ 대기 |
+| 6. 쿠폰 | `feat/phase-6-coupon` | [phase-6-coupon.md](phases/phase-6-coupon.md) | ✅ 완료 (2026-11-17) |
 | 7. 랭킹 | `feat/phase-7-ranking` | [phase-7-ranking.md](phases/phase-7-ranking.md) | ⬜ 대기 |
 | 8. 검증 | `test/phase-8-load-test` | [phase-8-load-test.md](phases/phase-8-load-test.md) | ⬜ 대기 |
 
@@ -274,20 +275,20 @@ flowchart LR
 **참고**: [coupon-issue.md](../design/05-features/coupon-issue.md), [class-diagram.md](../design/07-class-diagram/class-diagram.md) 2.4
 
 **작업**
-- [ ] domain: `CouponEvent`, `IssuedCoupon`, `IssueOutcome`, Repository(I) 2개
-- [ ] application: `CouponEventService`, `CouponIssueService`(요청 ID, 보상 3결과), `CouponSaveService`(**저장 전 claim 필수**), `CouponQueryService`, 포트 `CouponGate`, `CouponEventPublisher`
-- [ ] infrastructure: `coupon-issue.lua`, `coupon-compensate.lua`, `coupon-claim.lua`, JPA, `coupon.issued` 발행 (4단계와 같은 동기 발행 정책)
-- [ ] presentation: `CouponEventController`, `CouponController`, `CouponIssuedListener` (3회 재시도 후 `coupon.issued.DLT`)
+- [x] domain: `CouponEvent`, `IssuedCoupon`, `IssueOutcome`, Repository(I) 2개
+- [x] application: `CouponEventService`, `CouponIssueService`(요청 ID, 보상 3결과), `CouponSaveService`(**저장 전 claim 필수**), `CouponQueryService`, 포트 `CouponGate`, `CouponEventPublisher`
+- [x] infrastructure: `coupon-issue.lua`, `coupon-compensate.lua`, `coupon-claim.lua`, JPA, `coupon.issued` 발행 (4단계와 같은 동기 발행 정책)
+- [x] presentation: `CouponEventController`, `CouponController`, `CouponIssuedListener` (3회 재시도 후 `coupon.issued.DLT`)
 
 > 응모(4단계)와 판정 패턴이 같다. 공통 컴포넌트로 뽑지 않고 서비스별로 구현한다 (D6-1 확정(기본안), 2026-11-17). 유령 이벤트·타임아웃 대응도 4단계와 같다 (D6-4).
 
 **완료 조건**
-- [ ] **동시성: 수량 100, 1,000명 동시 요청 → 발급 정확히 100**
-- [ ] 동시성: 같은 사용자 10번 동시 요청 → 1매
-- [ ] 발급 시작 전 요청 → `NOT_STARTED`
-- [ ] 발행 실패 → 보상 후 원상복구
-- [ ] 유령 이벤트(보상 후 실제로 기록된 발급) → DB 에 남지 않음, 초과 발급 없음
-- [ ] 유령 이벤트 소비가 보상보다 먼저 / 판정 Lua 타임아웃 → 초과 발급 없음 (D6-4)
+- [x] **동시성: 수량 100, 1,000명 동시 요청 → 발급 정확히 100**
+- [x] 동시성: 같은 사용자 10번 동시 요청 → 1매
+- [x] 발급 시작 전 요청 → `NOT_STARTED`
+- [x] 발행 실패 → 보상 후 원상복구
+- [x] 유령 이벤트(보상 후 실제로 기록된 발급) → DB 에 남지 않음, 초과 발급 없음
+- [x] 유령 이벤트 소비가 보상보다 먼저 / 판정 Lua 타임아웃 → 초과 발급 없음 (D6-4)
 
 ---
 
